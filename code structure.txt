@@ -1,0 +1,22 @@
+每个数据由 时间戳与值构成
+时间戳:    VarBucket -> src   -->   SourceBucket -> timestamp
+值:       VarBucket -> value
+Data model 维护两个Bucket
+    SourceBucket:
+        存储数据时间戳相关变量
+    VarBucket：
+        存储数据值和来源
+Flowchart:
+While received a date:
+add_data()  |-> update_source_timestamp()   |-> add_timestamp()
+            |-> add_value()
+When GUI want to get a data:
+get_series
+get_series_fast
+
+Function:
+ensure_source: Make sure the source has been initialized. If not, initialize it. Return SourceBucket.
+ensure_var: Make sure the variable has been initialized and been bound correctly. Return VarBucket.
+add_timestamp: append timestamps and session to corresponding SourceBucket
+add_value:  append variable value to corresponding VarBucket
+update_source_timestamp: update offsets dictionary and timestamps, then add_timestamp()
