@@ -562,10 +562,20 @@ class PlotWindow(QWidget):
 
     def refresh_serial_ports(self):
         """扫描可用串口"""
+        current = self.serial_combo.currentText()
+        ports = [port.device for port in serial.tools.list_ports.comports()]
+        existing = [self.serial_combo.itemText(i) for i in range(self.serial_combo.count())]
+        if ports == existing:
+            return
+        self.serial_combo.blockSignals(True)
         self.serial_combo.clear()
-        ports = serial.tools.list_ports.comports()
         for port in ports:
-            self.serial_combo.addItem(port.device)
+            self.serial_combo.addItem(port)
+        if current:
+            idx = self.serial_combo.findText(current)
+            if idx >= 0:
+                self.serial_combo.setCurrentIndex(idx)
+        self.serial_combo.blockSignals(False)
 
     def toggle_bota_connection(self):
         if self.toggle_bota_btn.isChecked():
