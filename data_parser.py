@@ -82,9 +82,9 @@ class DataParser:
         i = 4  # 起始位置
         items = []
         items.append(("pwm1", self._to_value(d[i + 1], d[i], 1.0)));i += 2
-        items.append(("ang1", self._to_value(d[i + 1], d[i], 1.0)));i += 2
+        items.append(("ang1", self._to_value(d[i + 1], d[i])));i += 2
         items.append(("pwm2", self._to_value(d[i + 1], d[i], 1.0)));i += 2
-        items.append(("ang2", self._to_value(d[i + 1], d[i], 1.0)));i += 2
+        items.append(("ang2", self._to_value(d[i + 1], d[i])));i += 2
         items.append(("adc", self._to_value(d[i + 1], d[i], 1.0)));i += 2
         items.append(("freq", self._to_value(d[i + 1], d[i])));i += 2
         items.append(("alt", self._to_value(d[i + 1], d[i])));i += 2

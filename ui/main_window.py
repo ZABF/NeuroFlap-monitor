@@ -1,7 +1,7 @@
-from PyQt5.QtGui import QPen
+﻿from PyQt5.QtGui import QPen
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QCheckBox, QLabel, QSpinBox, QGridLayout, QMessageBox, QLineEdit, QComboBox, QFrame
+    QCheckBox, QLabel, QSpinBox, QGridLayout, QMessageBox, QLineEdit, QComboBox, QFrame, QTabWidget
 )
 from PyQt5.QtCore import QTimer, Qt
 from pyqtgraph.exporters import CSVExporter
@@ -32,11 +32,11 @@ CLEARING -> (clear all points) -> IDLE
 
 
 class PlotState(Enum):
-    IDLE = 0  # 初始未接收
-    RUNNING = 1  # 正在接收
-    STOPPING = 2  # 正在暂停
-    STOPPED = 3  # 接收暂停
-    CLEARING = 4  # 正在清除数据
+    IDLE = 0  # 鍒濆鏈帴鏀?
+    RUNNING = 1  # 姝ｅ湪鎺ユ敹
+    STOPPING = 2  # 姝ｅ湪鏆傚仠
+    STOPPED = 3  # 鎺ユ敹鏆傚仠
+    CLEARING = 4  # 姝ｅ湪娓呴櫎鏁版嵁
 
 
 class PlotWindow(QWidget):
@@ -44,133 +44,78 @@ class PlotWindow(QWidget):
         super().__init__()
         self.setWindowTitle("Monitor v2.2.0")
 
-        # 所有固定变量列表
-        self.variable_groups = {
-            "PID": [
-                ("Target_posx", True), ("Target_posy", True), ("Target_posz", True),
-                ("Target_pitch", True), ("Target_roll", True),
-                ("RLS_posx", True), ("RLS_posy", True), ("RLS_posz", True),
-                ("RLS_pitch", True), ("RLS_roll", True),
-                ("Pitch_offset", True), ("Roll_offset", True),
-                ("Pitch_p", True), ("Roll_p", True), ("Left_A", True), ("Right_A", True),
-            ],
-            "Attitude_ESP": [
-                ("pitch", True), ("roll", True), ("yaw", True),
-                ("pitch_6", True), ("roll_6", True), ("yaw_6", True),
-                ("pitch_Mocap", True), ("roll_Mocap", True), ("yaw_Mocap", True),
-                ("alt", True),
-            ],
-            "Servo": [
-                ("pwm1", True), ("pwm2", True), ("ang1", True), ("ang2", True),
-            ],
-            "ADC": [
-                ("adc", True), ("vol", True), ("freq", True),
-            ],
-            "IMU": [
-                ("q0", False), ("q1", False), ("q2", False), ("q3", False),
-                ("mx", True), ("my", True), ("mz", True),
-                ("acc.x", True), ("acc.y", True), ("acc.z", True),
-                ("gyro.x", True), ("gyro.y", True), ("gyro.z", True),
-                ("vx", True), ("vy", True), ("vz", True),
-            ],
-            "Force": [
-                ("F_X", True), ("F_Y", True), ("F_Z", True),
-                ("T_X", True), ("T_Y", True), ("T_Z", True),
-            ],
-            "Attitude_Mocap": [
-                ("Mocap_pitch", True), ("Mocap_roll", True), ("Mocap_yaw", True),
-                ("Mocap_X", True), ("Mocap_Y", True), ("Mocap_Z", True),
-                ("Mocap_AVX", False), ("Mocap_AVY", False), ("Mocap_AVZ", False),
-                ("Mocap_AAX", False), ("Mocap_AAY", False), ("Mocap_AAZ", False),
-                ("Mocap_SpeedX", True), ("Mocap_SpeedY", True), ("Mocap_SpeedZ", True),
-                ("Mocap_AccX", True), ("Mocap_AccY", True), ("Mocap_AccZ", True),
-                ("Mocap_Speed", True), ("Mocap_Acc", True),
-                ("Mocap_qx", False), ("Mocap_qy", False), ("Mocap_qz", False), ("Mocap_qw", False),
-                ("Mocap_Quality", False),
+        self.tf_variables = ["F_X", "F_Y", "F_Z", "T_X", "T_Y", "T_Z"]
+        self.mocap_variable_templates = [
+            ("Mocap_pitch", True), ("Mocap_roll", True), ("Mocap_yaw", True),
+            ("Mocap_X", True), ("Mocap_Y", True), ("Mocap_Z", True),
+            ("Mocap_AVX", False), ("Mocap_AVY", False), ("Mocap_AVZ", False),
+            ("Mocap_AAX", False), ("Mocap_AAY", False), ("Mocap_AAZ", False),
+            ("Mocap_SpeedX", True), ("Mocap_SpeedY", True), ("Mocap_SpeedZ", True),
+            ("Mocap_AccX", True), ("Mocap_AccY", True), ("Mocap_AccZ", True),
+            ("Mocap_Speed", True), ("Mocap_Acc", True),
+            ("Mocap_qx", False), ("Mocap_qy", False), ("Mocap_qz", False), ("Mocap_qw", False),
+            ("Mocap_Quality", False),
+            ("Wing1_pitch", True), ("Wing1_roll", True), ("Wing1_yaw", True),
+            ("Wing1_X", True), ("Wing1_Y", True), ("Wing1_Z", True),
+            ("Wing1_AVX", False), ("Wing1_AVY", False), ("Wing1_AVZ", False),
+            ("Wing1_AAX", False), ("Wing1_AAY", False), ("Wing1_AAZ", False),
+            ("Wing1_SpeedX", True), ("Wing1_SpeedY", True), ("Wing1_SpeedZ", True),
+            ("Wing1_AccX", True), ("Wing1_AccY", True), ("Wing1_AccZ", True),
+            ("Wing1_Speed", True), ("Wing1_Acc", True),
+            ("Wing1_qx", False), ("Wing1_qy", False), ("Wing1_qz", False), ("Wing1_qw", False),
+            ("Wing1_Quality", False),
+            ("Wing2_pitch", True), ("Wing2_roll", True), ("Wing2_yaw", True),
+            ("Wing2_X", True), ("Wing2_Y", True), ("Wing2_Z", True),
+            ("Wing2_AVX", False), ("Wing2_AVY", False), ("Wing2_AVZ", False),
+            ("Wing2_AAX", False), ("Wing2_AAY", False), ("Wing2_AAZ", False),
+            ("Wing2_SpeedX", True), ("Wing2_SpeedY", True), ("Wing2_SpeedZ", True),
+            ("Wing2_AccX", True), ("Wing2_AccY", True), ("Wing2_AccZ", True),
+            ("Wing2_Speed", True), ("Wing2_Acc", True),
+            ("Wing2_qx", False), ("Wing2_qy", False), ("Wing2_qz", False), ("Wing2_qw", False),
+            ("Wing2_Quality", False),
+            ("Marker_Id", False), ("Marker_Group", False),
+            ("Marker_X", False), ("Marker_Y", False), ("Marker_Z", False),
+        ]
 
-                ("Wing1_pitch", True), ("Wing1_roll", True), ("Wing1_yaw", True),
-                ("Wing1_X", True), ("Wing1_Y", True), ("Wing1_Z", True),
-                ("Wing1_AVX", False), ("Wing1_AVY", False), ("Wing1_AVZ", False),
-                ("Wing1_AAX", False), ("Wing1_AAY", False), ("Wing1_AAZ", False),
-                ("Wing1_SpeedX", True), ("Wing1_SpeedY", True), ("Wing1_SpeedZ", True),
-                ("Wing1_AccX", True), ("Wing1_AccY", True), ("Wing1_AccZ", True),
-                ("Wing1_Speed", True), ("Wing1_Acc", True),
-                ("Wing1_qx", False), ("Wing1_qy", False), ("Wing1_qz", False), ("Wing1_qw", False),
-                ("Wing1_Quality", False),
+        # All plotted variables: TF fixed + MoCap fixed + ESP32 dynamic.
+        self.signal_variables = []
+        self.dynamic_signal_variables = []
+        self.default_visible_count = 8
 
-                ("Wing2_pitch", True), ("Wing2_roll", True), ("Wing2_yaw", True),
-                ("Wing2_X", True), ("Wing2_Y", True), ("Wing2_Z", True),
-                ("Wing2_AVX", False), ("Wing2_AVY", False), ("Wing2_AVZ", False),
-                ("Wing2_AAX", False), ("Wing2_AAY", False), ("Wing2_AAZ", False),
-                ("Wing2_SpeedX", True), ("Wing2_SpeedY", True), ("Wing2_SpeedZ", True),
-                ("Wing2_AccX", True), ("Wing2_AccY", True), ("Wing2_AccZ", True),
-                ("Wing2_Speed", True), ("Wing2_Acc", True),
-                ("Wing2_qx", False), ("Wing2_qy", False), ("Wing2_qz", False), ("Wing2_qw", False),
-                ("Wing2_Quality", False),
-
-                ("Marker_Id", False), ("Marker_Group", False),
-                ("Marker_X", False), ("Marker_Y", False), ("Marker_Z", False),
-            ],
-        }
-        # 全部变量（决定数据模型/导出顺序）
-        self.fixed_variables = [name for group in self.variable_groups.values() for (name, _) in group]
-
-        # 模板层面的“可见/不可见”定义（决定是否出现在 GUI，有没有复选框）
-        self.visible_template = {name for group in self.variable_groups.values() for (name, vis) in group if vis}
-        self.hidden_variables = set(self.fixed_variables) - self.visible_template
-
-        # 初始显示的变量
-        self.default_visible_vars = ["roll", "pitch", "yaw", "pwm1", "pwm2", "F_X", "F_Y", "F_Z"]
-
-        # 绘图窗口
+        # 缁樺浘绐楀彛
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.showGrid(x=True, y=True)
         self.view_box = self.plot_widget.getViewBox()
         self.view_box.sigRangeChangedManually.connect(self.manual_scroll)
-        self.curves = {}  # 变量名 -> 曲线
-        self.colors = {}  # 当前颜色
-        self.default_colors = {}  # 默认颜色
+        self.curves = {}  # 鍙橀噺鍚?-> 鏇茬嚎
+        self.colors = {}  # 褰撳墠棰滆壊
+        self.default_colors = {}  # 榛樿棰滆壊
         self.fully_plotted = False
         self.auto_scroll_enabled = True
         self.auto_y_enabled = True
 
-        # 时间轴变量
+        # 鏃堕棿杞村彉閲?
         self.reception_start_time = time.time() * 1000  # ms
-        self.window_start = time.time() * 1000  # ms 初始为程序启动时
+        self.window_start = time.time() * 1000  # ms 鍒濆涓虹▼搴忓惎鍔ㄦ椂
         self.window_now = time.time() * 1000
-        # 数据模型与收发器
+        # 鏁版嵁妯″瀷涓庢敹鍙戝櫒
         self.sdk_ip = "172.16.23.64"
         self.esp32_ip = "172.16.23.13"
         self.esp32_port = 28090
         self.rigid_id = "Rigid_Body"
         self.rigid_wing1_id = "Rigid_Wing_L"
         self.rigid_wing2_id = "Rigid_Wing_R"
-        self.data_model = DataModel(self.fixed_variables)
+        static_variables = self.tf_variables + [name for name, _ in self.mocap_variable_templates]
+        self.data_model = DataModel(static_variables)
         # self.data_transporter = None
         self.data_transporter = DataTransporter(self.esp32_ip, self.esp32_port)
         self.data_receiver = DataReceiver(self.data_model, self)
-        # 子窗口
+        # 瀛愮獥鍙?
         self.waveform_capture_window = None
-
-        # 初始化所有变量的曲线
-        for var in self.fixed_variables:
-            color = self.get_default_color(var)
-            curve = self.plot_widget.plot(pen=pg.mkPen(color=color, width=2), name=var)
-
-            if var in self.hidden_variables:
-                # 模板隐藏：GUI 不出现、运行期不绘，但会存数据；暂停/导出时绘全量
-                curve.setVisible(False)
-            else:
-                # 模板可见：是否初始显示由 default_visible_vars 决定
-                curve.setVisible(var in self.default_visible_vars)
-
-            self.curves[var] = curve
-            self.colors[var] = color
-            self.default_colors[var] = color
 
         # csv filename edit
         self.export_filename_edit = QLineEdit(self)
-        self.export_filename_edit.setFixedWidth(130)  # 单位是像素
+        self.export_filename_edit.setFixedWidth(130)  # 鍗曚綅鏄儚绱?
         self.export_filename_edit.setPlaceholderText("filename")
 
         # CSV export button
@@ -192,7 +137,7 @@ class PlotWindow(QWidget):
         self.auto_y.setChecked(True)
         self.auto_y.stateChanged.connect(self.set_auto_y_enabled)
 
-        # ===== 下部接收控制区 =====
+        # ===== 涓嬮儴鎺ユ敹鎺у埗鍖?=====
 
         self.toggle_reception_btn = QPushButton("Start Receive")
         self.toggle_reception_btn.setStyleSheet("background-color: orange")
@@ -208,17 +153,23 @@ class PlotWindow(QWidget):
         self.open_capture_btn = QPushButton("Waveform Capture")
         self.open_capture_btn.clicked.connect(self.open_waveform_capture)
 
-        # ===== 变量勾选区域 =====
+        # ===== 鍙橀噺鍕鹃€夊尯鍩?=====
         self.var_controls = {}
+        self.signal_export_grid = None
+        self.signal_export_count = 0
+        self.tf_signal_grid = None
+        self.tf_signal_count = 0
+        self.mocap_signal_grid = None
+        self.mocap_signal_count = 0
 
-        # 整体水平布局（左边 + 中线 + 右边）
+        # Variable area: split by tabs.
         variable_layout = QHBoxLayout()
 
-        # === 左边 ESP32变量===
+        # === 宸﹁竟 ESP32鍙橀噺===
 
-        # === 右边 其它变量===
+        # === 鍙宠竟 鍏跺畠鍙橀噺===
 
-        # 串口选择与连接力传感器按钮
+        # 涓插彛閫夋嫨涓庤繛鎺ュ姏浼犳劅鍣ㄦ寜閽?
         port_label = QLabel("Bota Port:")
 
         self.serial_combo = QComboBox()
@@ -230,58 +181,55 @@ class PlotWindow(QWidget):
         self.toggle_bota_btn.setCheckable(True)
         self.toggle_bota_btn.clicked.connect(self.toggle_bota_connection)
 
-        # Bias 设置按钮
+        # Bias 璁剧疆鎸夐挳
         self.bias_button = QPushButton("Bias")
         self.bias_button.setStyleSheet("background-color: lightblue")
         self.bias_button.clicked.connect(self.data_receiver.set_ft_bias)
-        # self.bias_button.clicked.connect(self.data_receiver.set_ft_bias)  # 假设你在 data_receiver 中定义了 set_ft_bias 方法
+        # self.bias_button.clicked.connect(self.data_receiver.set_ft_bias)  # 鍋囪浣犲湪 data_receiver 涓畾涔変簡 set_ft_bias 鏂规硶
 
-        # 力传感器状态显示
+        # 鍔涗紶鎰熷櫒鐘舵€佹樉绀?
         self.bota_status_label = QLabel("state:" + self.data_receiver.bota_state)
         self.bota_status_label.setFixedHeight(24)
         self.bota_status_label.setAlignment(Qt.AlignCenter)
 
-        # 右边上变量：Force
-        PID_grid = QGridLayout()
-        mcu_grid = QGridLayout()
-        force_grid = QGridLayout()
-        mocap_grid = QGridLayout()
+        # TF fixed variables + ESP32 dynamic variables.
+        tf_signal_grid = QGridLayout()
+        self.tf_signal_grid = tf_signal_grid
 
-        hline_2 = QFrame()
-        hline_2.setFrameShape(QFrame.HLine)
-        hline_2.setFrameShadow(QFrame.Sunken)
-        hline_2.setLineWidth(1)
+        # Dynamic signal controls from ESP32 schema response.
+        signal_export_grid = QGridLayout()
+        self.signal_export_grid = signal_export_grid
 
-        hline_3 = QFrame()
-        hline_3.setFrameShape(QFrame.HLine)
-        hline_3.setFrameShadow(QFrame.Sunken)
-        hline_3.setLineWidth(1)
-        # 接收mocap行
+        # MoCap fixed variables.
+        mocap_signal_grid = QGridLayout()
+        self.mocap_signal_grid = mocap_signal_grid
+
+        # 鎺ユ敹mocap琛?
         mocap_rx_layout = QHBoxLayout()
         mocap_rx_layout.addWidget(QLabel("MoCap SDK IP:"))
 
-        # 添加 IP 输入框，设置默认值
+        # 娣诲姞 IP 杈撳叆妗嗭紝璁剧疆榛樿鍊?
         self.mocap_ip_input = QLineEdit()
         self.mocap_ip_input.setText(self.sdk_ip)
-        self.mocap_ip_input.setFixedWidth(130)  # 可选：限制宽度
+        self.mocap_ip_input.setFixedWidth(130)  # 鍙€夛細闄愬埗瀹藉害
         mocap_rx_layout.addWidget(self.mocap_ip_input)
 
         mocap_rx_layout.addWidget(QLabel("Rigid:"))
         self.mocap_rigid_input = QLineEdit()
         self.mocap_rigid_input.setText(self.rigid_id)
-        self.mocap_rigid_input.setFixedWidth(130)  # 可选：限制宽度
+        self.mocap_rigid_input.setFixedWidth(130)  # 鍙€夛細闄愬埗瀹藉害
         mocap_rx_layout.addWidget(self.mocap_rigid_input)
 
         mocap_rx_layout.addWidget(QLabel("Wing1:"))
         self.mocap_rigid_wing1_input = QLineEdit()
         self.mocap_rigid_wing1_input.setText(self.rigid_wing1_id)
-        self.mocap_rigid_wing1_input.setFixedWidth(130)  # 可选：限制宽度
+        self.mocap_rigid_wing1_input.setFixedWidth(130)  # 鍙€夛細闄愬埗瀹藉害
         mocap_rx_layout.addWidget(self.mocap_rigid_wing1_input)
 
         mocap_rx_layout.addWidget(QLabel("Wing2:"))
         self.mocap_rigid_wing2_input = QLineEdit()
         self.mocap_rigid_wing2_input.setText(self.rigid_wing2_id)
-        self.mocap_rigid_wing2_input.setFixedWidth(130)  # 可选：限制宽度
+        self.mocap_rigid_wing2_input.setFixedWidth(130)  # 鍙€夛細闄愬埗瀹藉害
         mocap_rx_layout.addWidget(self.mocap_rigid_wing2_input)
 
         mocap_rx_layout.addStretch()
@@ -292,14 +240,14 @@ class PlotWindow(QWidget):
         self.R_MoCap_button.clicked.connect(self.toggle_mocap)
         mocap_rx_layout.addWidget(self.R_MoCap_button)
 
-        # 回传esp行
+        # 鍥炰紶esp琛?
         mocap_tx_layout = QHBoxLayout()
         mocap_tx_layout.addWidget(QLabel("ESP32 UDP IP:"))
 
-        # 添加 IP 输入框，设置默认值
+        # 娣诲姞 IP 杈撳叆妗嗭紝璁剧疆榛樿鍊?
         self.esp32_rx_ip_input = QLineEdit()
         self.esp32_rx_ip_input.setText("172.16.23.13")
-        self.esp32_rx_ip_input.setFixedWidth(130)  # 可选：限制宽度
+        self.esp32_rx_ip_input.setFixedWidth(130)  # 鍙€夛細闄愬埗瀹藉害
 
         mocap_tx_layout.addWidget(self.esp32_rx_ip_input)
 
@@ -307,7 +255,7 @@ class PlotWindow(QWidget):
 
         self.esp32_rx_port_input = QLineEdit()
         self.esp32_rx_port_input.setText("28090")
-        self.esp32_rx_port_input.setFixedWidth(100)  # 可选：限制宽度
+        self.esp32_rx_port_input.setFixedWidth(100)  # 鍙€夛細闄愬埗瀹藉害
         mocap_tx_layout.addWidget(self.esp32_rx_port_input)
 
         mocap_tx_layout.addStretch()
@@ -318,51 +266,25 @@ class PlotWindow(QWidget):
         self.T_Esp32_button.clicked.connect(self.toggle_transport)
         mocap_tx_layout.addWidget(self.T_Esp32_button)
 
-        # 右边下变量 MoCap
-        # 填充各分组
-        group_layout_map = {
-            "PID": PID_grid,
-            "Attitude_ESP": mcu_grid,
-            "Servo": mcu_grid,
-            "ADC": mcu_grid,
-            "IMU": mcu_grid,
-            "Force": force_grid,
-            "Attitude_Mocap": mocap_grid,
-        }
+        for var_name in self.tf_variables:
+            self._register_static_variable(
+                var_name=var_name,
+                checked=False,
+                grid=self.tf_signal_grid,
+                columns=3,
+                count_attr="tf_signal_count",
+                show_control=True,
+            )
 
-        # 每个小区域内部计数排布
-        layout_counters = {layout: 0 for layout in [PID_grid, mcu_grid, force_grid, mocap_grid]}
-        layout_column_count_map = {
-            PID_grid: 5,
-            mcu_grid: 6,  # 左侧：6列
-            force_grid: 6,  # 右上（力传感器）：6列
-            mocap_grid: 7  # 右下（Mocap）：7列
-        }
-
-        for group, var_list in self.variable_groups.items():
-            layout = group_layout_map[group]
-            column_count = layout_column_count_map.get(layout, 6)
-            for (var, vis) in var_list:
-                if not vis:
-                    continue  # 模板隐藏：不给控件
-
-                color = self.get_default_color(var)
-                ctrl = VariableControlItem(var, color, color, checked=(var in self.default_visible_vars))
-                ctrl.visibility_changed.connect(self.set_curve_visibility)
-                ctrl.color_changed.connect(self.set_curve_color)
-                self.var_controls[var] = ctrl
-
-                idx = layout_counters[layout]
-                row = idx // column_count
-                col = idx % column_count
-                layout.addWidget(ctrl, row, col)
-                layout_counters[layout] += 1
-
-        vline = QFrame()
-        vline.setFrameShape(QFrame.VLine)
-        vline.setFrameShadow(QFrame.Sunken)
-        vline.setLineWidth(1)
-        vline.setMidLineWidth(0)
+        for var_name, visible in self.mocap_variable_templates:
+            self._register_static_variable(
+                var_name=var_name,
+                checked=False,
+                grid=self.mocap_signal_grid,
+                columns=6,
+                count_attr="mocap_signal_count",
+                show_control=visible,
+            )
 
         port_layout = QHBoxLayout()
         port_layout.addWidget(port_label)
@@ -372,28 +294,28 @@ class PlotWindow(QWidget):
         port_layout.addStretch()
         port_layout.addWidget(self.bias_button)
 
-        # 三级布局
-        left_vlayout = QVBoxLayout()
+        main_page = QWidget()
+        main_page_layout = QVBoxLayout(main_page)
+        main_page_layout.addLayout(port_layout)
+        main_page_layout.addWidget(QLabel("TF Serial (Fixed 6):"))
+        main_page_layout.addLayout(tf_signal_grid)
+        main_page_layout.addWidget(QLabel("ESP32 Signal Export (Dynamic):"))
+        main_page_layout.addLayout(signal_export_grid)
+        main_page_layout.addStretch()
 
-        left_vlayout.addWidget(QLabel("PID:"))
-        left_vlayout.addLayout(PID_grid)
+        mocap_page = QWidget()
+        mocap_page_layout = QVBoxLayout(mocap_page)
+        mocap_page_layout.addLayout(mocap_rx_layout)
+        mocap_page_layout.addLayout(mocap_tx_layout)
+        mocap_page_layout.addWidget(QLabel("MoCap Variables:"))
+        mocap_page_layout.addLayout(mocap_signal_grid)
+        mocap_page_layout.addStretch()
 
-        left_vlayout.addWidget(hline_3)
-        left_vlayout.addStretch()
-        left_vlayout.addWidget(QLabel("MCU:"))
-        left_vlayout.addLayout(mcu_grid)
-        left_vlayout.addStretch()
+        tab_widget = QTabWidget()
+        tab_widget.addTab(main_page, "Main")
+        tab_widget.addTab(mocap_page, "MoCap")
 
-        right_vlayout = QVBoxLayout()
-        right_vlayout.addLayout(port_layout)
-        # right_vlayout.addWidget(self.bota_status_label)
-        right_vlayout.addLayout(force_grid)
-        right_vlayout.addWidget(hline_2)  # ← 插入水平分隔线
-        right_vlayout.addLayout(mocap_rx_layout)
-        right_vlayout.addLayout(mocap_tx_layout)
-        right_vlayout.addLayout(mocap_grid)
-
-        # 二级布局
+        # 浜岀骇甯冨眬
         setting_layout = QHBoxLayout()
         setting_layout.addWidget(QLabel("CSV Filename:"))
         setting_layout.addWidget(self.export_filename_edit)
@@ -416,20 +338,18 @@ class PlotWindow(QWidget):
         hline_1.setFrameShadow(QFrame.Sunken)
         hline_1.setLineWidth(1)
 
-        variable_layout.addLayout(left_vlayout, 1)
-        variable_layout.addWidget(vline)
-        variable_layout.addLayout(right_vlayout, 1)
+        variable_layout.addWidget(tab_widget, 1)
 
-        # 一级布局
+        # 涓€绾у竷灞€
         main_layout = QVBoxLayout()
         main_layout.addLayout(setting_layout)
         main_layout.addWidget(self.plot_widget, 1)
         main_layout.addLayout(control_layout)
-        main_layout.addWidget(hline_1)  # ← 插入水平分隔线
+        main_layout.addWidget(hline_1)  # 鈫?鎻掑叆姘村钩鍒嗛殧绾?
         main_layout.addLayout(variable_layout)
         self.setLayout(main_layout)
 
-        # 画布内画光标显示数字等
+        # 鐢诲竷鍐呯敾鍏夋爣鏄剧ず鏁板瓧绛?
         self.now_line = pg.InfiniteLine(angle=90, movable=False,
                                         pen=pg.mkPen('y', width=2, style=Qt.CustomDashLine, dash=[5, 5, 1, 5]))
         self.begin_line = pg.InfiniteLine(angle=90, movable=False,
@@ -444,45 +364,45 @@ class PlotWindow(QWidget):
         self.x_axis.setStyle(showValues=True)
         self.x_axis.setTextPen(QPen(Qt.yellow))
 
-        # 定时器用于刷新曲线
+        # 瀹氭椂鍣ㄧ敤浜庡埛鏂版洸绾?
         self.plot_timer = QTimer()
         self.plot_timer.timeout.connect(self.update_plot)
         self.plot_timer.start(20)
 
-        # 定时器用于刷新光标
+        # 瀹氭椂鍣ㄧ敤浜庡埛鏂板厜鏍?
         self.axis_timer = QTimer()
         self.axis_timer.timeout.connect(self.update_cursor)
         self.axis_timer.start(5)
 
-        # 定时器用于定时处理数据
+        # 瀹氭椂鍣ㄧ敤浜庡畾鏃跺鐞嗘暟鎹?
         self.data_timer = QTimer()
         self.data_timer.timeout.connect(self.data_receiver.process_data)
         self.data_timer.start(20)
 
-        # 定时器用于定时在capture window画图
+        # 瀹氭椂鍣ㄧ敤浜庡畾鏃跺湪capture window鐢诲浘
         self.capture_timer = QTimer()
         self.capture_timer.timeout.connect(self.update_capture_plot)
         self.capture_timer.start(50)
 
-        # 通用功能定时器
+        # 閫氱敤鍔熻兘瀹氭椂鍣?
         self.misc_timer = QTimer()
         self.misc_timer.timeout.connect(self.update_misc_tasks)
-        self.misc_timer.start(200)  # 200ms 或根据你实际需求调整
+        self.misc_timer.start(200)  # 200ms 鎴栨牴鎹綘瀹為檯闇€姹傝皟鏁?
 
         self.plot_state = PlotState.IDLE
         self.last_plot_state = PlotState.IDLE
 
     def toggle_mocap(self):
         # HACK: multi rigid
-        self.data_receiver.sdk_ip = self.mocap_ip_input.text().strip()  # 获取用户输入 IP
-        self.data_receiver.rigid_id = self.mocap_rigid_input.text().strip()  # 获取用户输入 Rigid
-        self.data_receiver.wing1_id = self.mocap_rigid_wing1_input.text().strip()  # 获取用户输入 Rigid
-        self.data_receiver.wing2_id = self.mocap_rigid_wing2_input.text().strip()  # 获取用户输入 Rigid
+        self.data_receiver.sdk_ip = self.mocap_ip_input.text().strip()  # 鑾峰彇鐢ㄦ埛杈撳叆 IP
+        self.data_receiver.rigid_id = self.mocap_rigid_input.text().strip()  # 鑾峰彇鐢ㄦ埛杈撳叆 Rigid
+        self.data_receiver.wing1_id = self.mocap_rigid_wing1_input.text().strip()  # 鑾峰彇鐢ㄦ埛杈撳叆 Rigid
+        self.data_receiver.wing2_id = self.mocap_rigid_wing2_input.text().strip()  # 鑾峰彇鐢ㄦ埛杈撳叆 Rigid
         if self.R_MoCap_button.isChecked():
             # Start
             self.R_MoCap_button.setText("Receiving...")
             self.R_MoCap_button.setStyleSheet("background-color: lightgreen")
-            # 发起连接并在连接成功后启动接收线程
+            # 鍙戣捣杩炴帴骞跺湪杩炴帴鎴愬姛鍚庡惎鍔ㄦ帴鏀剁嚎绋?
             self.data_receiver.connect_mocap()
         else:
             # Stop
@@ -492,7 +412,7 @@ class PlotWindow(QWidget):
 
     def toggle_transport(self):
         # try:
-        #     ip = self.esp32_rx_ip_input.text().strip()  # 获取用户输入 IP
+        #     ip = self.esp32_rx_ip_input.text().strip()  # 鑾峰彇鐢ㄦ埛杈撳叆 IP
         #     port = int(self.esp32_rx_port_input.text().strip())
         # except ValueError:
         #     QMessageBox.warning(self, "Input Error", "Port must be an integer")
@@ -503,28 +423,28 @@ class PlotWindow(QWidget):
         #     self.T_Esp32_button.setText("Transporting...")
         #     self.T_Esp32_button.setStyleSheet("background-color: lightgreen")
         #
-        #     # 如果已存在旧线程且已停止，创建新线程实例
+        #     # 濡傛灉宸插瓨鍦ㄦ棫绾跨▼涓斿凡鍋滄锛屽垱寤烘柊绾跨▼瀹炰緥
         #     if self.data_transporter is None or not self.data_transporter.is_alive():
         #         self.data_transporter = DataTransporterThread(ip, port)
         #         self.data_transporter.start()
         #         print("Transport thread built ")
-        #     # 开启发送开关（由 DataReceiver 使用）
+        #     # 寮€鍚彂閫佸紑鍏筹紙鐢?DataReceiver 浣跨敤锛?
         #     self.data_receiver.transport_enabled = True
         #     print("Transport enable ")
         # else:
         #     # Stop Transport
         #     self.T_Esp32_button.setText("Transport to ESP32")
         #     self.T_Esp32_button.setStyleSheet("background-color: orange")
-        #     # 关闭发送开关，必要时也停线程
+        #     # 鍏抽棴鍙戦€佸紑鍏筹紝蹇呰鏃朵篃鍋滅嚎绋?
         #     self.data_receiver.transport_enabled = False
         #     print("Transport disenable ")
         #
         #     if self.data_transporter:
         #         self.data_transporter.stop()
         #         self.data_transporter.join(timeout=1.0)
-        #         self.data_transporter = None  # 必须重置以允许下次重新创建
+        #         self.data_transporter = None  # 蹇呴』閲嶇疆浠ュ厑璁镐笅娆￠噸鏂板垱寤?
         try:
-            self.data_transporter.ip = self.esp32_rx_ip_input.text().strip()  # 获取用户输入 IP
+            self.data_transporter.ip = self.esp32_rx_ip_input.text().strip()  # 鑾峰彇鐢ㄦ埛杈撳叆 IP
             self.data_transporter.port = int(self.esp32_rx_port_input.text().strip())
         except ValueError:
             QMessageBox.warning(self, "Input Error", "Port must be an integer")
@@ -535,14 +455,14 @@ class PlotWindow(QWidget):
             self.T_Esp32_button.setText("Transporting...")
             self.T_Esp32_button.setStyleSheet("background-color: lightgreen")
 
-            # 开启发送开关（由 DataReceiver 使用）
+            # 寮€鍚彂閫佸紑鍏筹紙鐢?DataReceiver 浣跨敤锛?
             self.data_receiver.transport_enabled = True
             print("Transport enable ")
         else:
             # Stop Transport
             self.T_Esp32_button.setText("Transport to ESP32")
             self.T_Esp32_button.setStyleSheet("background-color: orange")
-            # 关闭发送开关，必要时也停线程
+            # 鍏抽棴鍙戦€佸紑鍏筹紝蹇呰鏃朵篃鍋滅嚎绋?
             self.data_receiver.transport_enabled = False
             print("Transport disenable ")
 
@@ -561,7 +481,7 @@ class PlotWindow(QWidget):
             self.bota_status_label.setStyleSheet("color: Green;")
 
     def refresh_serial_ports(self):
-        """扫描可用串口"""
+        """Refresh available serial ports."""
         current = self.serial_combo.currentText()
         ports = [port.device for port in serial.tools.list_ports.comports()]
         existing = [self.serial_combo.itemText(i) for i in range(self.serial_combo.count())]
@@ -593,16 +513,16 @@ class PlotWindow(QWidget):
             self.toggle_bota_btn.setStyleSheet("background-color: orange")
 
     def export_csv(self):
-        """导出当前 PlotWidget 的曲线为 CSV"""
-        # 1. 自动停止数据接收
+        """Export the current plot to CSV."""
+        # 1. 鑷姩鍋滄鏁版嵁鎺ユ敹
         if self.plot_state == PlotState.RUNNING:
             self.toggle_reception()
 
-        # 2. 准备保存目录
+        # 2. 鍑嗗淇濆瓨鐩綍
         export_dir = "./csv_data"
         os.makedirs(export_dir, exist_ok=True)
 
-        # 3. 获取路径（自动命名或用户自定义）
+        # 3. 鑾峰彇璺緞锛堣嚜鍔ㄥ懡鍚嶆垨鐢ㄦ埛鑷畾涔夛級
         user_input = self.export_filename_edit.text().strip()
         if user_input:
             path = os.path.join(export_dir, user_input)
@@ -610,24 +530,24 @@ class PlotWindow(QWidget):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             path = os.path.join(export_dir, f"{timestamp}_waveform.csv")
 
-        # 4. 确保扩展名正确
+        # 4. 纭繚鎵╁睍鍚嶆纭?
         base, ext = os.path.splitext(path)
         if ext.lower() != ".csv":
             ext = ".csv"
-            base = path  # 用户可能没写扩展名
+            base = path  # 鐢ㄦ埛鍙兘娌″啓鎵╁睍鍚?
         final_path = base + ext
 
-        # 5. 避免重名，自动加 _1, _2 等
+        # 5. 閬垮厤閲嶅悕锛岃嚜鍔ㄥ姞 _1, _2 绛?
         counter = 1
         while os.path.exists(final_path):
             final_path = f"{base}_{counter}{ext}"
             counter += 1
-            # 6. 执行导出
+            # 6. 鎵ц瀵煎嚭
         try:
             exporter = CSVExporter(self.plot_widget.getPlotItem())
             exporter.export(final_path)
-            QMessageBox.information(self, "Export successful", f"CSV file exported to：\n{final_path}")
-            # 可选：写回路径到输入框
+            QMessageBox.information(self, "Export successful", f"CSV file exported to锛歕n{final_path}")
+            # 鍙€夛細鍐欏洖璺緞鍒拌緭鍏ユ
             # self.export_filename_edit.setText(final_path)
         except Exception as e:
             QMessageBox.critical(self, "Export failed", f"\n{str(e)}")
@@ -661,7 +581,7 @@ class PlotWindow(QWidget):
             self.auto_x.setChecked(False)
 
     def get_default_color(self, var_name):
-        """根据变量名获取默认颜色"""
+        """Return the default curve color for a variable."""
         color_map = {
             # === PID ===
             "Target_posx": (100, 200, 100), "Target_posy": (200, 100, 100), "Target_posz": (100, 100, 200),
@@ -696,7 +616,7 @@ class PlotWindow(QWidget):
             "F_X": (0, 200, 0), "F_Y": (200, 0, 0), "F_Z": (0, 0, 200),
             "T_X": (0, 150, 0), "T_Y": (150, 0, 0), "T_Z": (0, 0, 150),
 
-            # === Attitude_Mocap 主体 ===
+            # === Attitude_Mocap 涓讳綋 ===
             "Mocap_pitch": (0, 200, 0), "Mocap_roll": (200, 0, 0), "Mocap_yaw": (0, 0, 200),
             "Mocap_X": (0, 200, 0), "Mocap_Y": (200, 0, 0), "Mocap_Z": (0, 0, 200),
             "Mocap_SpeedX": (0, 180, 0), "Mocap_SpeedY": (180, 0, 0), "Mocap_SpeedZ": (0, 0, 180),
@@ -728,7 +648,17 @@ class PlotWindow(QWidget):
             "Marker_X": (0, 180, 0), "Marker_Y": (180, 0, 0), "Marker_Z": (0, 0, 180),
         }
 
-        return color_map.get(var_name, (200, 200, 200))  # 默认灰色
+        if var_name in color_map:
+            return color_map[var_name]
+
+        seed = 0
+        for idx, ch in enumerate(var_name):
+            seed += (idx + 1) * ord(ch)
+        return (
+            80 + (seed * 3) % 140,
+            80 + (seed * 5) % 140,
+            80 + (seed * 7) % 140,
+        )
 
     def toggle_reception(self):
         now = time.time() * 1000  # ms
@@ -736,7 +666,7 @@ class PlotWindow(QWidget):
             print(self.plot_state)
             self.data_receiver.first_ft_received_flag = False
             self.data_receiver.first_udp_received_flag = False
-            self.data_model.clear()  # 防止残留数据
+            self.data_model.clear()  # 闃叉娈嬬暀鏁版嵁
             self.data_receiver.start()
             self.reception_start_time = now
             unix_time = time.time_ns() / 1000
@@ -765,6 +695,7 @@ class PlotWindow(QWidget):
         if self.plot_state == PlotState.STOPPED:
             print(self.plot_state)
             # self.data_receiver.start()
+            self.data_receiver.begin_nfv1_schema_sync()
             self.toggle_reception_btn.setText("Pause")
             self.toggle_reception_btn.setStyleSheet("background-color: lightblue")
             self.plot_state = PlotState.RUNNING
@@ -780,38 +711,38 @@ class PlotWindow(QWidget):
             return
 
         if self.plot_state == PlotState.CLEARING:
-            for var in self.fixed_variables:
+            for var in self.signal_variables:
                 self.curves[var].setData([], [])
             return
 
-        # 暂停时立刻绘制所有数据（便于csv收集所有数据）
+        # 鏆傚仠鏃剁珛鍒荤粯鍒舵墍鏈夋暟鎹紙渚夸簬csv鏀堕泦鎵€鏈夋暟鎹級
         if self.plot_state == PlotState.STOPPING:
-            for var in self.fixed_variables:
+            for var in self.signal_variables:
                 ts, vs = self.data_model.get_series(var, None)
                 self.curves[var].setData(ts, vs)
             return
 
-        # 高性能防卡顿
+        # 楂樻€ц兘闃插崱椤?
         if self.plot_state == PlotState.RUNNING:
             window_start = self.window_start
             window_end = self.window_now
 
-            for var in self.fixed_variables:
+            for var in self.signal_variables:
                 if not self.curves[var].isVisible():
-                    continue  # 跳过隐藏曲线
+                    continue  # 璺宠繃闅愯棌鏇茬嚎
 
                 if self.auto_scroll_enabled:
                     ts, vs = self.data_model.get_series_fast(var, self.fixed_window_seconds * 1000)
                     if not ts:
-                        continue  # 无数据则跳过
-                    # 只保留窗口内数据
+                        continue  # 鏃犳暟鎹垯璺宠繃
+                    # 鍙繚鐣欑獥鍙ｅ唴鏁版嵁
                     idx_range = [i for i, t in enumerate(ts) if window_start <= t <= window_end]
                     if not idx_range:
                         if self.curves[var].xData is not None and len(self.curves[var].xData) > 0:
-                            self.curves[var].setData([], [])  # 有数据 -> 无数据才需要清除
+                            self.curves[var].setData([], [])  # 鏈夋暟鎹?-> 鏃犳暟鎹墠闇€瑕佹竻闄?
                         continue
 
-                    # 切片数据
+                    # 鍒囩墖鏁版嵁
                     i_min = idx_range[0]
                     i_max = idx_range[-1] + 1
                     ts_window = ts[i_min:i_max]
@@ -819,12 +750,12 @@ class PlotWindow(QWidget):
                 else:
                     ts, vs = self.data_model.get_series(var, None)
                     if not ts:
-                        continue  # 无数据则跳过
-                    # 手动模式：显示全部数据
+                        continue  # 鏃犳暟鎹垯璺宠繃
+                    # 鎵嬪姩妯″紡锛氭樉绀哄叏閮ㄦ暟鎹?
                     ts_window = ts
                     vs_window = vs
 
-                # 仅在数据变化时更新
+                # 浠呭湪鏁版嵁鍙樺寲鏃舵洿鏂?
                 if (
                         self.curves[var].xData is None or
                         len(self.curves[var].xData) != len(ts_window) or
@@ -832,7 +763,7 @@ class PlotWindow(QWidget):
                 ):
                     self.curves[var].setData(ts_window, vs_window)
 
-    # plot window时间戳更新
+    # plot window鏃堕棿鎴虫洿鏂?
     def update_cursor(self):
         now = time.time() * 1000  # ms
         self.begin_line.setValue(self.reception_start_time)
@@ -841,7 +772,7 @@ class PlotWindow(QWidget):
         if self.plot_state == PlotState.RUNNING:
             self.window_now = now
             self.window_start = self.window_now - self.fixed_window_seconds * 1000
-            self.now_line.setValue(self.window_now)  # 自动跟随时间前进
+            self.now_line.setValue(self.window_now)  # 鑷姩璺熼殢鏃堕棿鍓嶈繘
 
         elif self.plot_state == PlotState.CLEARING:
             self.window_now = self.reception_start_time
@@ -858,7 +789,7 @@ class PlotWindow(QWidget):
             self.x_axis.setTicks(None)
 
     def clear_data(self):
-        """清空数据"""
+        """Clear all buffered data."""
         now = time.time() * 1000  # ms
         # CLEANING:
         self.plot_state = PlotState.CLEARING
@@ -873,14 +804,67 @@ class PlotWindow(QWidget):
         self.toggle_reception_btn.setText("Start Receive")
         self.toggle_reception_btn.setStyleSheet("background-color: orange")
 
+    def _register_variable(self, var_name, checked, grid, columns, count_attr, create_control=True):
+        if not var_name or var_name in self.curves:
+            return False
+
+        color = self.get_default_color(var_name)
+        curve = self.plot_widget.plot(pen=pg.mkPen(color=color, width=2), name=var_name)
+        curve.setVisible(bool(checked))
+        self.curves[var_name] = curve
+        self.colors[var_name] = color
+        self.default_colors[var_name] = color
+
+        if create_control:
+            ctrl = VariableControlItem(var_name, color, color, checked=bool(checked))
+            ctrl.visibility_changed.connect(self.set_curve_visibility)
+            ctrl.color_changed.connect(self.set_curve_color)
+            self.var_controls[var_name] = ctrl
+
+            if grid is not None:
+                idx = int(getattr(self, count_attr))
+                row = idx // max(1, int(columns))
+                col = idx % max(1, int(columns))
+                grid.addWidget(ctrl, row, col)
+                setattr(self, count_attr, idx + 1)
+
+        self.signal_variables.append(var_name)
+        return True
+
+    def _register_static_variable(self, var_name, checked, grid, columns, count_attr, show_control=True):
+        self._register_variable(
+            var_name=var_name,
+            checked=checked,
+            grid=grid,
+            columns=columns,
+            count_attr=count_attr,
+            create_control=show_control,
+        )
+
+    def register_signal_export_variables(self, names):
+        added = []
+        for var_name in names:
+            checked = len(self.dynamic_signal_variables) < self.default_visible_count
+            if self._register_variable(
+                var_name=var_name,
+                checked=checked,
+                grid=self.signal_export_grid,
+                columns=4,
+                count_attr="signal_export_count",
+            ):
+                self.dynamic_signal_variables.append(var_name)
+                added.append(var_name)
+
+        return added
+
     def set_curve_visibility(self, var_name, visible):
-        if var_name in self.hidden_variables:
-            return  # 模板隐藏的变量，忽略任何可见性修改
         if var_name in self.curves:
             self.curves[var_name].setVisible(visible)
 
     def set_curve_color(self, var_name, rgb):
-        """设置变量曲线颜色"""
+        """Set the curve color for a variable."""
         if var_name in self.curves:
             self.colors[var_name] = rgb
             self.curves[var_name].setPen(pg.mkPen(color=rgb, width=2))
+
+

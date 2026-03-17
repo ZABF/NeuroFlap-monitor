@@ -1,42 +1,52 @@
-import socket
+﻿import socket
 import threading
 import time
-from collections import deque, defaultdict
+from collections import defaultdict, deque
 
 import numpy as np
 
-from data_parser import DataParser
 from bota_lite import BotaSerialSensor
+from data_parser import DataParser
+from nfv1_parser import NFv1Parser
 import MoCap.LuMo.LuMoSDKClient as LuMoSDKClient
 
+
 class DataReceiver:
+    NF_SOURCE_PREFIX = "udp:nf:"
+    NF_SCHEMA_RETRY_MS = 1000
 
-    JUMP_THRESHOLD_MS = 200 # ms # 判定“不是同一段接收/回绕”的门限
-
-    def __init__(self, data_model, main_window, udp_ip="0.0.0.0", udp_port=28080, bota_port="COM10",
-                 sdk_ip="172.16.23.64", rigid_id="Rigid_WingLite_R_MainRod"):
+    def __init__(
+        self,
+        data_model,
+        main_window,
+        udp_ip="0.0.0.0",
+        udp_port=28080,
+        bota_port="COM10",
+        sdk_ip="172.16.23.64",
+        rigid_id="Rigid_WingLite_R_MainRod",
+        udp_target_ip=None,
+        udp_target_port=None,
+    ):
         self.data_model = data_model
         self.main_window = main_window
         self.data_transporter = main_window.data_transporter
 
-        # UDP
         self.udp_ip = udp_ip
         self.udp_port = udp_port
+        self.udp_target_ip = udp_target_ip or getattr(main_window, "esp32_ip", None)
+        self.udp_target_port = udp_target_port or udp_port
         self.sock = None
         self.udp_thread = None
 
-        # Bota
         self.bota_port = bota_port
         self.bota_thread = None
         self.bota_sensor = None
         self.bota_state = "Disconnect"
         self.bota_running = False
-        self.bias_buffers = defaultdict(lambda: deque(maxlen=100))  # 滑动窗口
+        self.bias_buffers = defaultdict(lambda: deque(maxlen=100))
         self.ft_bias = defaultdict(lambda: 0.0)
 
-        # MoCap
         self.sdk_ip = sdk_ip
-        # HACK: Multi Rigid
         self.rigid_id = rigid_id
         self.wing1_id = None
         self.wing2_id = None
@@ -46,24 +56,25 @@ class DataReceiver:
         self.mocap_running = False
         self.mocap_writer = None
         self.mocap_csv_file = None
-        self.transport_enabled = None
+        self.transport_enabled = False
 
-        # 状态
         self.running = False
-
-        # 统一来源状态表：
-        self.source = {
-            # "udp": {"session_id": 0, "min_offset":None, "first_flag":False,"last_ts":None},
-            "udp:imu": {"session_id": 0, "min_offset": None, "first_flag": False, "last_ts": None},
-            "udp:att": {"session_id": 0, "min_offset": None, "first_flag": False, "last_ts": None},
-            "udp:servo": {"session_id": 0, "min_offset": None, "first_flag": False, "last_ts": None},
-            "ft": {"session_id": 0, "min_offset": None, "first_flag": False, "last_ts": None},
-            "mocap": {"session_id": 0, "min_offset": None, "first_flag": False, "last_ts": None},
-        }
-
-        # 全局
         self.pending_queue = deque()
         self.parser = DataParser()
+        self.nf_parser = NFv1Parser()
+        self.first_ft_received_flag = False
+        self.first_udp_received_flag = False
+
+        self.nf_schema = {}
+        self.nf_schema_order = []
+        self.nf_schema_chunks = {}
+        self.nf_schema_chunk_total = 0
+        self.nf_request_id = 0
+        self.nf_last_schema_request_ms = 0.0
+        self.nf_last_packet_seq = None
+        self.nf_packet_gap_count = 0
+        self.nf_schema_retry_active = False
+        self.nf_next_schema_retry_ms = 0.0
 
     def start(self):
         if self.running:
@@ -75,30 +86,74 @@ class DataReceiver:
 
     def stop(self):
         self.running = False
-        if self.udp_thread:
+        self.bota_running = False
+        self.mocap_running = False
+
+        if self.udp_thread and self.udp_thread.is_alive():
             self.udp_thread.join()
             print("UDP thread stopped")
+        self.udp_thread = None
+
         if self.sock:
             self.sock.close()
+            self.sock = None
             print("Socket closed")
-        if self.bota_thread:
+
+        if self.bota_thread and self.bota_thread.is_alive():
             self.bota_thread.join()
             print("Bota thread stopped")
-        if self.mocap_thread:
+        self.bota_thread = None
+
+        if self.mocap_thread and self.mocap_thread.is_alive():
             self.mocap_thread.join()
             print("MoCap thread stopped")
+        self.mocap_thread = None
 
-    # ------------------- 各源启动 -------------------
     def _start_udp(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Windows UDP sockets can raise WSAECONNRESET(10054) on recvfrom after
+        # sending to an unreachable peer; disable this behavior for retry flow.
+        if hasattr(socket, "SIO_UDP_CONNRESET"):
+            try:
+                self.sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+            except OSError:
+                pass
         self.sock.bind((self.udp_ip, self.udp_port))
         self.udp_thread = threading.Thread(target=self.receive_udp_data, daemon=True)
         self.udp_thread.start()
+        self.begin_nfv1_schema_sync()
         print(f"UDP listening on {self.udp_ip}:{self.udp_port}")
 
+    def begin_nfv1_schema_sync(self):
+        if self.nf_schema_retry_active and not self.nf_schema_order:
+            return
+        self.nf_schema = {}
+        self.nf_schema_order = []
+        self.nf_schema_chunks = {}
+        self.nf_schema_chunk_total = 0
+        self.nf_last_packet_seq = None
+        self.nf_schema_retry_active = True
+        self.nf_next_schema_retry_ms = 0.0
+        self._request_nfv1_schema(force=True)
+
+    def _tick_nfv1_schema_retry(self):
+        if not self.nf_schema_retry_active:
+            return
+        if self.nf_schema_order:
+            self.nf_schema_retry_active = False
+            self.nf_next_schema_retry_ms = 0.0
+            return
+
+        now_ms = time.time() * 1000.0
+        if now_ms < self.nf_next_schema_retry_ms:
+            return
+
+        self._request_nfv1_schema(force=True)
+        self.nf_next_schema_retry_ms = now_ms + self.NF_SCHEMA_RETRY_MS
+
     def _start_bota(self):
-        if self.bota_sensor:  # 已经 connect_bota 成功
-            if not self.bota_thread or not self.bota_thread.isAlive():
+        if self.bota_sensor:
+            if not self.bota_thread or not self.bota_thread.is_alive():
                 self.bota_thread = threading.Thread(target=self.receive_ft_data, daemon=True)
                 self.bota_thread.start()
             print("Bota receiving started.")
@@ -117,8 +172,7 @@ class DataReceiver:
         else:
             print("MoCap thread already running.")
 
-    # ------------------- 连接管理 -------------------
-    def connect_mocap(self, sdk_ip = None):
+    def connect_mocap(self, sdk_ip=None):
         if sdk_ip:
             self.sdk_ip = sdk_ip
         if self.mocap_state in ("Connecting", "Connected"):
@@ -131,20 +185,25 @@ class DataReceiver:
                 LuMoSDKClient.Init()
                 LuMoSDKClient.Connnect(self.sdk_ip)
                 self.mocap_state = "Connected"
-                print(f"Connected to {self.sdk_ip}. Listening for MoCap data... Rigid:({self.rigid_id} Wing1:({self.wing1_id} Wing2:({self.wing2_id})")
+                print(
+                    f"Connected to {self.sdk_ip}. Listening for MoCap data... "
+                    f"Rigid:({self.rigid_id}) Wing1:({self.wing1_id}) Wing2:({self.wing2_id})"
+                )
                 self.mocap_running = True
                 self.mocap_thread = threading.Thread(target=self.receive_mocap_data, daemon=True)
                 self.mocap_thread.start()
-            except Exception as e:
+            except Exception as exc:
                 self.mocap_state = "Disconnected"
-                print(f"Connect {self.sdk_ip} failed: {e}")
+                print(f"Connect {self.sdk_ip} failed: {exc}")
+
         threading.Thread(target=_connect_task, daemon=True).start()
 
     def disconnect_mocap(self):
         self.mocap_running = False
-        if self.mocap_thread:
+        if self.mocap_thread and self.mocap_thread.is_alive():
             self.mocap_thread.join()
             print("Mocap thread stopped")
+        self.mocap_thread = None
         LuMoSDKClient.Close()
         print("Mocap socket closed")
         self.mocap_state = "Disconnect"
@@ -172,29 +231,30 @@ class DataReceiver:
                     self.bota_sensor.close()
                     self.bota_sensor = None
                     self.bota_running = False
-            except Exception as e:
-                print(f"Failed to open bota: {e}")
+            except Exception as exc:
+                print(f"Failed to open bota: {exc}")
                 self.bota_state = "Disconnect"
                 self.bota_sensor = None
                 self.bota_running = False
+
         threading.Thread(target=_connect_task, daemon=True).start()
 
     def disconnect_ft(self):
         self.bota_running = False
-        if self.bota_thread:
+        if self.bota_thread and self.bota_thread.is_alive():
             self.bota_thread.join()
             print("Bota thread stopped")
+        self.bota_thread = None
         if self.bota_sensor:
             self.bota_sensor.close()
             self.bota_sensor = None
             print("Bota disconnected.")
         self.bota_state = "Disconnect"
 
-    # ------------------- 接收线程 -------------------
     def receive_mocap_data(self):
         while self.running and self.mocap_running:
             try:
-                frame = LuMoSDKClient.ReceiveData(1)    # 非阻塞
+                frame = LuMoSDKClient.ReceiveData(1)
                 if frame is None:
                     time.sleep(0.001)
                     continue
@@ -202,25 +262,26 @@ class DataReceiver:
                 self.ingest_data("mocap", frame)
 
                 if self.transport_enabled:
-                    print("data_receiver_old.py: Transport enabled.")
                     for rigid in frame.rigidBodys:
                         if rigid.Name == self.rigid_id:
-                            print("data_receiver_old.py: Rigid ID found and transmitted.")
                             self.data_transporter.udp_send_mocap_message(rigid)
-
-            except Exception as e:
-                print("MoCap receive error:", e)
+            except Exception as exc:
+                print("MoCap receive error:", exc)
 
     def receive_udp_data(self):
         self.sock.settimeout(0.5)
         while self.running:
             try:
-                data, _ = self.sock.recvfrom(1024)
-                self.ingest_data("udp", data)
+                data, remote_addr = self.sock.recvfrom(2048)
+                self.ingest_data("udp", data, {"remote_addr": remote_addr})
             except socket.timeout:
-                continue  # 超时，说明没有数据，继续下一轮循环
-            except Exception as e:
-                print("UDP receive error:", e)
+                continue
+            except OSError as exc:
+                if getattr(exc, "winerror", None) == 10054:
+                    continue
+                break
+            except Exception as exc:
+                print("UDP receive error:", exc)
 
     def receive_ft_data(self):
         while self.running and self.bota_running:
@@ -233,66 +294,182 @@ class DataReceiver:
                 data = self.bota_sensor._ser.read(36)
                 if len(data) == 36:
                     self.ingest_data("ft", data)
-
-            except Exception as e:
-                print("Bota receive error:", e)
+            except Exception as exc:
+                print("Bota receive error:", exc)
                 time.sleep(0.0001)
 
-    # ------------------- 队列 & 统一入口 -------------------
-    def ingest_data(self, data_source, data):
-        """
-        :param data_source:
-        :param data:
-        :param timestamp_unix: unix timestamp (ms)
-        """
-        timestamp_unix = time.time() * 1000
-        self.pending_queue.append((data_source, data, timestamp_unix))
+    def ingest_data(self, data_source, data, meta=None):
+        timestamp_unix = time.time() * 1000.0
+        self.pending_queue.append((data_source, data, timestamp_unix, meta or {}))
 
-    # ------------------- 解包存储 -------------------
+    def _request_nfv1_schema(self, force=False):
+        if not self.sock or not self.udp_target_ip or not self.udp_target_port:
+            return False
+
+        now_ms = time.time() * 1000.0
+        if not force and (now_ms - self.nf_last_schema_request_ms) < self.NF_SCHEMA_RETRY_MS:
+            return False
+
+        self.nf_request_id = (self.nf_request_id + 1) & 0xFFFFFFFF
+        packet = self.nf_parser.build_schema_request(self.nf_request_id)
+        try:
+            self.sock.sendto(packet, (self.udp_target_ip, self.udp_target_port))
+            self.nf_last_schema_request_ms = now_ms
+            return True
+        except OSError as exc:
+            print(f"NF schema request failed: {exc}")
+            return False
+
+    def _handle_nfv1_schema_response(self, packet):
+        if (not self.nf_schema_retry_active) and self.nf_schema_order:
+            return
+
+        chunk_total = packet["chunk_total"]
+        chunk_index = packet["chunk_index"]
+
+        if chunk_total == 0:
+            return
+
+        # chunk 0 indicates a fresh schema transfer.
+        if chunk_index == 0 or self.nf_schema_chunk_total != chunk_total:
+            self.nf_schema_chunks = {}
+            self.nf_schema_chunk_total = chunk_total
+
+        self.nf_schema_chunks[chunk_index] = packet["entries"]
+        if len(self.nf_schema_chunks) != self.nf_schema_chunk_total:
+            return
+
+        entries = []
+        for chunk_index in range(self.nf_schema_chunk_total):
+            chunk_entries = self.nf_schema_chunks.get(chunk_index)
+            if chunk_entries is None:
+                return
+            entries.extend(chunk_entries)
+
+        schema = {}
+        self.nf_schema_order = []
+        used_names = set()
+        ordered_names = []
+        for entry in entries:
+            gid = entry["gid"]
+            base_name = entry["name"] or f"gid_{gid:08X}"
+            var_name = base_name
+            if var_name in used_names:
+                var_name = f"{base_name}[{gid:08X}]"
+            used_names.add(var_name)
+            schema[gid] = {
+                "gid": gid,
+                "scalar_type": entry["scalar_type"],
+                "name": entry["name"],
+                "unit": entry["unit"],
+                "var_name": var_name,
+            }
+            self.nf_schema_order.append(schema[gid])
+            ordered_names.append(var_name)
+
+        self.nf_schema = schema
+        self.nf_schema_chunks = {}
+        self.nf_schema_chunk_total = 0
+        self.nf_schema_retry_active = False
+        self.nf_next_schema_retry_ms = 0.0
+        self.main_window.register_signal_export_variables(ordered_names)
+        print(f"NF schema synced: count={len(schema)}")
+
+    def _process_nfv1_data(self, packet, unix_ts):
+        if not self.nf_schema_order:
+            if not self.nf_schema_retry_active:
+                self.begin_nfv1_schema_sync()
+            return
+
+        schema_size = len(self.nf_schema_order)
+        start_index = packet["start_index"]
+        item_count = packet["item_count"]
+        if item_count == 0:
+            return
+        if start_index >= schema_size:
+            self.begin_nfv1_schema_sync()
+            return
+        if (start_index + item_count) > schema_size:
+            self.begin_nfv1_schema_sync()
+            return
+
+        if self.nf_last_packet_seq is not None:
+            expected_packet_seq = (self.nf_last_packet_seq + 1) & 0xFFFFFFFF
+            if packet["packet_seq"] != expected_packet_seq:
+                self.nf_packet_gap_count += 1
+        self.nf_last_packet_seq = packet["packet_seq"]
+
+        # Offset estimate uses packet send_us; each sample keeps its own t_src_us.
+        send_timestamp_ms = packet["send_us"] / 1000.0
+        for index, item in enumerate(packet["items"]):
+            desc = self.nf_schema_order[start_index + index]
+            value = self.nf_parser.raw_to_value(desc["scalar_type"], item["raw"])
+            if value is None:
+                continue
+
+            src_timestamp_ms = item["t_src_us"] / 1000.0
+            unix_for_offset = unix_ts + (src_timestamp_ms - send_timestamp_ms)
+            src = f"{self.NF_SOURCE_PREFIX}{desc['gid']}"
+            self.data_model.add_data(src, unix_for_offset, src_timestamp_ms, {desc["var_name"]: value})
+
+    def _process_udp_packet(self, data, unix_ts, meta):
+        remote_addr = meta.get("remote_addr")
+        if remote_addr:
+            self.udp_target_ip = remote_addr[0]
+            self.udp_target_port = remote_addr[1]
+
+        packet = self.nf_parser.parse_packet(data)
+        if packet is None:
+            return
+
+        if packet["type"] == "schema_resp":
+            self._handle_nfv1_schema_response(packet)
+            return
+
+        if packet["type"] == "data":
+            self._process_nfv1_data(packet, unix_ts)
+
     def process_data(self):
+        self._tick_nfv1_schema_retry()
+
         to_process = []
         while self.pending_queue:
             try:
-                item = self.pending_queue.popleft()
-                to_process.append(item)
+                to_process.append(self.pending_queue.popleft())
             except IndexError:
                 break
 
-        for data_source, data, unix_ts in to_process:
+        for data_source, data, unix_ts, meta in to_process:
             if data_source == "udp":
-                source_ts, att, imu, servo = self.parser.parse_packet(data)
-                if source_ts is None:
-                    continue
-                if att is not None:
-                    self.data_model.add_data("udp:att",unix_ts, source_ts,att)
-                if imu is not None:
-                    self.data_model.add_data("udp:imu",unix_ts, source_ts,imu)
-                if servo is not None:
-                    self.data_model.add_data("udp:servo",unix_ts, source_ts,servo)
-
-            elif data_source == "ft":
-                source_ts, ft_data = self.parser.parse_ft_frame(data)
-                if source_ts is None:
-                    continue
-                if ft_data:
-                    corrected_data = {}
-                    for k, v in ft_data.items():
-                        self.bias_buffers[k].append(v)
-                        corrected_data[k] = v - self.ft_bias[k]
-                    self.data_model.add_data(data_source, unix_ts, source_ts, corrected_data)
-
-            elif data_source == "mocap":
-                source_ts, mocap_data = self.parser.parse_mocap_frame(data, self.rigid_id, self.wing1_id,self.wing2_id)
-                if source_ts is not None:
-                    continue
-                if mocap_data is not None:
-                    self.data_model.add_data(data_source,unix_ts, source_ts,mocap_data)
-            else:
+                self._process_udp_packet(data, unix_ts, meta)
                 continue
 
-    def set_ft_bias(self):
-        for k, buf in self.bias_buffers.items():
-            if buf:
-                self.ft_bias[k] = float(np.mean(list(buf)))
-        print("Bias set:", dict(self.ft_bias))
+            if data_source == "ft":
+                parsed = self.parser.parse_ft_frame(data)
+                if not parsed or len(parsed) != 2:
+                    continue
+                source_ts, ft_data = parsed
+                if source_ts is None or not ft_data:
+                    continue
 
+                corrected_data = {}
+                for key, value in ft_data.items():
+                    self.bias_buffers[key].append(value)
+                    corrected_data[key] = value - self.ft_bias[key]
+                self.data_model.add_data(data_source, unix_ts, source_ts, corrected_data)
+                continue
+
+            if data_source == "mocap":
+                parsed = self.parser.parse_mocap_frame(data, self.rigid_id, self.wing1_id, self.wing2_id)
+                if not parsed or len(parsed) != 2:
+                    continue
+                source_ts, mocap_data = parsed
+                if source_ts is None or mocap_data is None:
+                    continue
+                self.data_model.add_data(data_source, unix_ts, source_ts, mocap_data)
+
+    def set_ft_bias(self):
+        for key, buf in self.bias_buffers.items():
+            if buf:
+                self.ft_bias[key] = float(np.mean(list(buf)))
+        print("Bias set:", dict(self.ft_bias))
