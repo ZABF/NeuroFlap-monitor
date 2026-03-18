@@ -20,8 +20,8 @@ TYPE_U32 = 4
 TYPE_I32 = 5
 TYPE_F32 = 6
 
-DATA_HEADER_FMT = "<HBBIQHH"
-DATA_ITEM_FMT = "<QI"
+DATA_HEADER_FMT = "<HBBIQH"
+DATA_ITEM_FMT = "<BII"
 SCHEMA_REQ_FMT = "<HBBI"
 SCHEMA_RESP_HEADER_FMT = "<HBBHHH"
 SCHEMA_ENTRY_PREFIX_FMT = "<IBBBB"
@@ -62,6 +62,7 @@ class NFv1UdpSimulator:
         self.packet_seq = 0
         self.send_count = 0
         self.last_stat_ts = time.time()
+        self.last_raw_by_signal_no = {}
 
         # Internal domain(0), id asc order.
         self.schema = [
@@ -164,24 +165,35 @@ class NFv1UdpSimulator:
         loop_hz = 1000
         armed = (int(now_s) % 4) < 2
 
-        values_raw = [
-            f32_to_raw(roll),
-            f32_to_raw(pitch),
-            f32_to_raw(yaw),
-            u16_to_raw(pwm1),
-            u16_to_raw(pwm2),
-            u32_to_raw(loop_hz),
-            bool_to_raw(armed),
+        values = [
+            (10, f32_to_raw(roll)),
+            (11, f32_to_raw(pitch)),
+            (12, f32_to_raw(yaw)),
+            (20, u16_to_raw(pwm1)),
+            (21, u16_to_raw(pwm2)),
+            (30, u32_to_raw(loop_hz)),
+            (31, bool_to_raw(armed)),
         ]
+
+        changed_values = []
+        for signal_no, raw in values:
+            last_raw = self.last_raw_by_signal_no.get(signal_no)
+            if last_raw is not None and last_raw == raw:
+                continue
+            self.last_raw_by_signal_no[signal_no] = raw
+            changed_values.append((signal_no, raw))
+
+        if not changed_values:
+            return []
 
         if self.chunk_size > 0:
             chunk_size = self.chunk_size
         else:
-            chunk_size = len(values_raw)
+            chunk_size = len(changed_values)
 
         packets = []
-        for start_index in range(0, len(values_raw), chunk_size):
-            chunk = values_raw[start_index:start_index + chunk_size]
+        for offset in range(0, len(changed_values), chunk_size):
+            chunk = changed_values[offset:offset + chunk_size]
             packet = bytearray(
                 struct.pack(
                     DATA_HEADER_FMT,
@@ -190,12 +202,18 @@ class NFv1UdpSimulator:
                     TYPE_DATA,
                     self.packet_seq & 0xFFFFFFFF,
                     send_us & 0xFFFFFFFFFFFFFFFF,
-                    start_index & 0xFFFF,
                     len(chunk),
                 )
             )
-            for raw in chunk:
-                packet.extend(struct.pack(DATA_ITEM_FMT, t_src_us & 0xFFFFFFFFFFFFFFFF, raw & 0xFFFFFFFF))
+            for signal_no, raw in chunk:
+                packet.extend(
+                    struct.pack(
+                        DATA_ITEM_FMT,
+                        signal_no & 0xFF,
+                        t_src_us & 0xFFFFFFFF,
+                        raw & 0xFFFFFFFF,
+                    )
+                )
 
             packets.append(bytes(packet))
             self.packet_seq = (self.packet_seq + 1) & 0xFFFFFFFF

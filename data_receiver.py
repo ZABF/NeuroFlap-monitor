@@ -67,6 +67,7 @@ class DataReceiver:
 
         self.nf_schema = {}
         self.nf_schema_order = []
+        self.nf_schema_by_signal_no = {}
         self.nf_schema_chunks = {}
         self.nf_schema_chunk_total = 0
         self.nf_request_id = 0
@@ -129,6 +130,7 @@ class DataReceiver:
             return
         self.nf_schema = {}
         self.nf_schema_order = []
+        self.nf_schema_by_signal_no = {}
         self.nf_schema_chunks = {}
         self.nf_schema_chunk_total = 0
         self.nf_last_packet_seq = None
@@ -347,6 +349,7 @@ class DataReceiver:
             entries.extend(chunk_entries)
 
         schema = {}
+        schema_by_signal_no = {}
         self.nf_schema_order = []
         used_names = set()
         ordered_names = []
@@ -364,10 +367,15 @@ class DataReceiver:
                 "unit": entry["unit"],
                 "var_name": var_name,
             }
+            domain = (gid >> 16) & 0xFFFF
+            signal_no = gid & 0xFFFF
+            if domain == 0 and signal_no < 256:
+                schema_by_signal_no[signal_no] = schema[gid]
             self.nf_schema_order.append(schema[gid])
             ordered_names.append(var_name)
 
         self.nf_schema = schema
+        self.nf_schema_by_signal_no = schema_by_signal_no
         self.nf_schema_chunks = {}
         self.nf_schema_chunk_total = 0
         self.nf_schema_retry_active = False
@@ -376,21 +384,9 @@ class DataReceiver:
         print(f"NF schema synced: count={len(schema)}")
 
     def _process_nfv1_data(self, packet, unix_ts):
-        if not self.nf_schema_order:
+        if not self.nf_schema_by_signal_no:
             if not self.nf_schema_retry_active:
                 self.begin_nfv1_schema_sync()
-            return
-
-        schema_size = len(self.nf_schema_order)
-        start_index = packet["start_index"]
-        item_count = packet["item_count"]
-        if item_count == 0:
-            return
-        if start_index >= schema_size:
-            self.begin_nfv1_schema_sync()
-            return
-        if (start_index + item_count) > schema_size:
-            self.begin_nfv1_schema_sync()
             return
 
         if self.nf_last_packet_seq is not None:
@@ -401,13 +397,25 @@ class DataReceiver:
 
         # Offset estimate uses packet send_us; each sample keeps its own t_src_us.
         send_timestamp_ms = packet["send_us"] / 1000.0
-        for index, item in enumerate(packet["items"]):
-            desc = self.nf_schema_order[start_index + index]
+        send_us = int(packet["send_us"])
+        base_hi = send_us & 0xFFFFFFFF00000000
+        for item in packet["items"]:
+            signal_no = int(item.get("signal_no", 0))
+            desc = self.nf_schema_by_signal_no.get(signal_no)
+            if desc is None:
+                continue
             value = self.nf_parser.raw_to_value(desc["scalar_type"], item["raw"])
             if value is None:
                 continue
 
-            src_timestamp_ms = item["t_src_us"] / 1000.0
+            t32 = int(item["t_src_us"]) & 0xFFFFFFFF
+            cand = base_hi | t32
+            if cand + 0x80000000 < send_us:
+                cand += 0x100000000
+            elif cand > send_us + 0x80000000:
+                cand -= 0x100000000
+
+            src_timestamp_ms = cand / 1000.0
             unix_for_offset = unix_ts + (src_timestamp_ms - send_timestamp_ms)
             src = f"{self.NF_SOURCE_PREFIX}{desc['gid']}"
             self.data_model.add_data(src, unix_for_offset, src_timestamp_ms, {desc["var_name"]: value})

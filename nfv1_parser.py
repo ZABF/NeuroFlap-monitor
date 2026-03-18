@@ -9,10 +9,10 @@ class NFv1Parser:
     TYPE_SCHEMA_REQ = 0x10
     TYPE_SCHEMA_RESP = 0x11
 
-    # DATA: magic + ver + type + packet_seq + send_us + start_index + item_count
-    DATA_HEADER_FMT = "<HBBIQHH"
-    # DATA item: t_src_us + raw
-    DATA_ITEM_FMT = "<QI"
+    # DATA: magic + ver + type + packet_seq + send_us + item_count
+    DATA_HEADER_FMT = "<HBBIQH"
+    # DATA item: signal_no + t_src_us32 + raw
+    DATA_ITEM_FMT = "<BII"
     # SCHEMA_REQ: magic + ver + type + request_id
     SCHEMA_REQ_FMT = "<HBBI"
     # SCHEMA_RESP: magic + ver + type + chunk_index + chunk_total + entry_count
@@ -72,7 +72,7 @@ class NFv1Parser:
         if len(data) < self.DATA_HEADER_SIZE:
             return None
 
-        magic, version, packet_type, packet_seq, send_us, start_index, item_count = struct.unpack_from(
+        magic, version, packet_type, packet_seq, send_us, item_count = struct.unpack_from(
             self.DATA_HEADER_FMT, data, 0
         )
         expected_size = self.DATA_HEADER_SIZE + item_count * self.DATA_ITEM_SIZE
@@ -82,9 +82,10 @@ class NFv1Parser:
         items = []
         offset = self.DATA_HEADER_SIZE
         for _ in range(item_count):
-            t_src_us, raw = struct.unpack_from(self.DATA_ITEM_FMT, data, offset)
+            signal_no, t_src_us, raw = struct.unpack_from(self.DATA_ITEM_FMT, data, offset)
             items.append(
                 {
+                    "signal_no": signal_no,
                     "t_src_us": t_src_us,
                     "raw": raw,
                 }
@@ -95,7 +96,6 @@ class NFv1Parser:
             "type": "data",
             "packet_seq": packet_seq,
             "send_us": send_us,
-            "start_index": start_index,
             "item_count": item_count,
             "items": items,
         }

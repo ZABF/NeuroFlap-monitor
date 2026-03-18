@@ -844,7 +844,7 @@ class PlotWindow(QWidget):
     def register_signal_export_variables(self, names):
         added = []
         for var_name in names:
-            checked = len(self.dynamic_signal_variables) < self.default_visible_count
+            checked = False
             if self._register_variable(
                 var_name=var_name,
                 checked=checked,

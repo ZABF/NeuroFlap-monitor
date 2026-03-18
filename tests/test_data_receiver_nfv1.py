@@ -71,8 +71,14 @@ class DataReceiverNFv1DecodeTest(unittest.TestCase):
             {"gid": 3, "scalar_type": self.parser.TYPE_U32, "var_name": "c"},
             {"gid": 4, "scalar_type": self.parser.TYPE_U32, "var_name": "d"},
         ]
+        self.receiver.nf_schema_by_signal_no = {
+            1: self.receiver.nf_schema_order[0],
+            2: self.receiver.nf_schema_order[1],
+            3: self.receiver.nf_schema_order[2],
+            4: self.receiver.nf_schema_order[3],
+        }
 
-    def _build_data_packet(self, packet_seq, start_index, raw_values):
+    def _build_data_packet(self, packet_seq, signal_raw_pairs):
         send_us = int(time.monotonic_ns() // 1000)
         header = struct.pack(
             self.parser.DATA_HEADER_FMT,
@@ -81,17 +87,22 @@ class DataReceiverNFv1DecodeTest(unittest.TestCase):
             self.parser.TYPE_DATA,
             packet_seq,
             send_us,
-            start_index,
-            len(raw_values),
+            len(signal_raw_pairs),
         )
         items = b"".join(
-            struct.pack(self.parser.DATA_ITEM_FMT, send_us, int(raw) & 0xFFFFFFFF) for raw in raw_values
+            struct.pack(
+                self.parser.DATA_ITEM_FMT,
+                int(sig_no) & 0xFF,
+                send_us & 0xFFFFFFFF,
+                int(raw) & 0xFFFFFFFF,
+            )
+            for sig_no, raw in signal_raw_pairs
         )
         return self.parser.parse_packet(header + items)
 
     def test_multi_packet_snapshot_decode(self):
-        p0 = self._build_data_packet(10, 0, [11, 22])
-        p1 = self._build_data_packet(11, 2, [33, 44])
+        p0 = self._build_data_packet(10, [(1, 11), (2, 22)])
+        p1 = self._build_data_packet(11, [(3, 33), (4, 44)])
 
         self.receiver._process_nfv1_data(p1, unix_ts=1000.0)
         self.receiver._process_nfv1_data(p0, unix_ts=1000.0)
