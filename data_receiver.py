@@ -76,6 +76,7 @@ class DataReceiver:
         self.nf_packet_gap_count = 0
         self.nf_schema_retry_active = False
         self.nf_next_schema_retry_ms = 0.0
+        self.nf_last_value_by_signal_no = {}
 
     def start(self):
         if self.running:
@@ -134,6 +135,7 @@ class DataReceiver:
         self.nf_schema_chunks = {}
         self.nf_schema_chunk_total = 0
         self.nf_last_packet_seq = None
+        self.nf_last_value_by_signal_no = {}
         self.nf_schema_retry_active = True
         self.nf_next_schema_retry_ms = 0.0
         self._request_nfv1_schema(force=True)
@@ -378,6 +380,11 @@ class DataReceiver:
         self.nf_schema_by_signal_no = schema_by_signal_no
         self.nf_schema_chunks = {}
         self.nf_schema_chunk_total = 0
+        self.nf_last_value_by_signal_no = {
+            signal_no: self.nf_last_value_by_signal_no[signal_no]
+            for signal_no in self.nf_last_value_by_signal_no
+            if signal_no in self.nf_schema_by_signal_no
+        }
         self.nf_schema_retry_active = False
         self.nf_next_schema_retry_ms = 0.0
         self.main_window.register_signal_export_variables(ordered_names)
@@ -395,30 +402,38 @@ class DataReceiver:
                 self.nf_packet_gap_count += 1
         self.nf_last_packet_seq = packet["packet_seq"]
 
-        # Offset estimate uses packet send_us; each sample keeps its own t_src_us.
+        # Offset estimate uses packet send_us; each sample source time is reconstructed by build_us - dt_us.
+        build_us = int(packet["build_us"])
         send_timestamp_ms = packet["send_us"] / 1000.0
-        send_us = int(packet["send_us"])
-        base_hi = send_us & 0xFFFFFFFF00000000
+        seen_signal_no = set()
         for item in packet["items"]:
             signal_no = int(item.get("signal_no", 0))
             desc = self.nf_schema_by_signal_no.get(signal_no)
             if desc is None:
                 continue
+            seen_signal_no.add(signal_no)
             value = self.nf_parser.raw_to_value(desc["scalar_type"], item["raw"])
             if value is None:
                 continue
 
-            t32 = int(item["t_src_us"]) & 0xFFFFFFFF
-            cand = base_hi | t32
-            if cand + 0x80000000 < send_us:
-                cand += 0x100000000
-            elif cand > send_us + 0x80000000:
-                cand -= 0x100000000
-
-            src_timestamp_ms = cand / 1000.0
+            dt_us = int(item.get("dt_us", 0)) & 0xFFFF
+            src_us = build_us - dt_us if build_us >= dt_us else 0
+            src_timestamp_ms = src_us / 1000.0
             unix_for_offset = unix_ts + (src_timestamp_ms - send_timestamp_ms)
             src = f"{self.NF_SOURCE_PREFIX}{desc['gid']}"
             self.data_model.add_data(src, unix_for_offset, src_timestamp_ms, {desc["var_name"]: value})
+            self.nf_last_value_by_signal_no[signal_no] = value
+
+        # Delta packet carry-forward rule:
+        # for signals missing in this packet, append one point using last known value.
+        for signal_no, last_value in self.nf_last_value_by_signal_no.items():
+            if signal_no in seen_signal_no:
+                continue
+            desc = self.nf_schema_by_signal_no.get(signal_no)
+            if desc is None:
+                continue
+            src = f"{self.NF_SOURCE_PREFIX}{desc['gid']}"
+            self.data_model.add_data(src, unix_ts, send_timestamp_ms, {desc["var_name"]: last_value})
 
     def _process_udp_packet(self, data, unix_ts, meta):
         remote_addr = meta.get("remote_addr")

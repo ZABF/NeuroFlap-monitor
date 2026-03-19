@@ -79,6 +79,7 @@ class DataReceiverNFv1DecodeTest(unittest.TestCase):
         }
 
     def _build_data_packet(self, packet_seq, signal_raw_pairs):
+        build_us = int(time.monotonic_ns() // 1000)
         send_us = int(time.monotonic_ns() // 1000)
         header = struct.pack(
             self.parser.DATA_HEADER_FMT,
@@ -86,6 +87,7 @@ class DataReceiverNFv1DecodeTest(unittest.TestCase):
             self.parser.VERSION,
             self.parser.TYPE_DATA,
             packet_seq,
+            build_us,
             send_us,
             len(signal_raw_pairs),
         )
@@ -93,7 +95,7 @@ class DataReceiverNFv1DecodeTest(unittest.TestCase):
             struct.pack(
                 self.parser.DATA_ITEM_FMT,
                 int(sig_no) & 0xFF,
-                send_us & 0xFFFFFFFF,
+                0,
                 int(raw) & 0xFFFFFFFF,
             )
             for sig_no, raw in signal_raw_pairs

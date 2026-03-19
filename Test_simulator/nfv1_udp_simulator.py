@@ -20,8 +20,8 @@ TYPE_U32 = 4
 TYPE_I32 = 5
 TYPE_F32 = 6
 
-DATA_HEADER_FMT = "<HBBIQH"
-DATA_ITEM_FMT = "<BII"
+DATA_HEADER_FMT = "<HBBIQQH"
+DATA_ITEM_FMT = "<BHI"
 SCHEMA_REQ_FMT = "<HBBI"
 SCHEMA_RESP_HEADER_FMT = "<HBBHHH"
 SCHEMA_ENTRY_PREFIX_FMT = "<IBBBB"
@@ -154,8 +154,8 @@ class NFv1UdpSimulator:
             self._send_schema_response(remote_addr)
 
     def _build_data_packets(self, now_s):
-        send_us = time.monotonic_ns() // 1000
-        t_src_us = send_us
+        build_us = time.monotonic_ns() // 1000
+        send_us = build_us
 
         roll = 30.0 * math.sin(2.0 * math.pi * 0.5 * now_s)
         pitch = 20.0 * math.cos(2.0 * math.pi * 0.6 * now_s)
@@ -201,6 +201,7 @@ class NFv1UdpSimulator:
                     VERSION,
                     TYPE_DATA,
                     self.packet_seq & 0xFFFFFFFF,
+                    build_us & 0xFFFFFFFFFFFFFFFF,
                     send_us & 0xFFFFFFFFFFFFFFFF,
                     len(chunk),
                 )
@@ -210,7 +211,7 @@ class NFv1UdpSimulator:
                     struct.pack(
                         DATA_ITEM_FMT,
                         signal_no & 0xFF,
-                        t_src_us & 0xFFFFFFFF,
+                        0,
                         raw & 0xFFFFFFFF,
                     )
                 )
