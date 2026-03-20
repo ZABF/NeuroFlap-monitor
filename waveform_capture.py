@@ -239,7 +239,7 @@ class WaveformCaptureWindow(QWidget):
 
     def _create_signal_checkboxes(self):
         layout = QGridLayout()
-        columns = 8
+        columns = 6
         for i, name in enumerate(self.signal_names):
             box = QCheckBox(name)
             box.setChecked(False)

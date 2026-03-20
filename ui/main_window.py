@@ -849,7 +849,7 @@ class PlotWindow(QWidget):
                 var_name=var_name,
                 checked=checked,
                 grid=self.signal_export_grid,
-                columns=4,
+                columns=6,
                 count_attr="signal_export_count",
             ):
                 self.dynamic_signal_variables.append(var_name)
