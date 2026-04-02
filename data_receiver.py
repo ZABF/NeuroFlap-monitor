@@ -72,6 +72,8 @@ class DataReceiver:
         self.nf_schema_chunk_total = 0
         self.nf_request_id = 0
         self.nf_last_schema_request_ms = 0.0
+        self.nf_schema_req_sent_count = 0
+        self.nf_last_schema_sync_ok_ms = 0.0
         self.nf_last_packet_seq = None
         self.nf_packet_gap_count = 0
         self.nf_schema_retry_active = False
@@ -128,6 +130,12 @@ class DataReceiver:
 
     def begin_nfv1_schema_sync(self):
         if self.nf_schema_retry_active and not self.nf_schema_order:
+            print(
+                "NF schema sync begin skipped: "
+                f"schema_req_sent_count={self.nf_schema_req_sent_count} "
+                f"last_sync_ok_ts={int(self.nf_last_schema_sync_ok_ms)} "
+                f"retry_active={int(self.nf_schema_retry_active)}"
+            )
             return
         self.nf_schema = {}
         self.nf_schema_order = []
@@ -138,6 +146,12 @@ class DataReceiver:
         self.nf_last_value_by_signal_no = {}
         self.nf_schema_retry_active = True
         self.nf_next_schema_retry_ms = 0.0
+        print(
+            "NF schema sync begin: "
+            f"schema_req_sent_count={self.nf_schema_req_sent_count} "
+            f"last_sync_ok_ts={int(self.nf_last_schema_sync_ok_ms)} "
+            f"retry_active={int(self.nf_schema_retry_active)}"
+        )
         self._request_nfv1_schema(force=True)
 
     def _tick_nfv1_schema_retry(self):
@@ -152,6 +166,12 @@ class DataReceiver:
         if now_ms < self.nf_next_schema_retry_ms:
             return
 
+        print(
+            "NF schema retry tick: "
+            f"schema_req_sent_count={self.nf_schema_req_sent_count} "
+            f"last_sync_ok_ts={int(self.nf_last_schema_sync_ok_ms)} "
+            f"retry_active={int(self.nf_schema_retry_active)}"
+        )
         self._request_nfv1_schema(force=True)
         self.nf_next_schema_retry_ms = now_ms + self.NF_SCHEMA_RETRY_MS
 
@@ -319,6 +339,13 @@ class DataReceiver:
         try:
             self.sock.sendto(packet, (self.udp_target_ip, self.udp_target_port))
             self.nf_last_schema_request_ms = now_ms
+            self.nf_schema_req_sent_count += 1
+            print(
+                "NF schema req sent: "
+                f"schema_req_sent_count={self.nf_schema_req_sent_count} "
+                f"last_sync_ok_ts={int(self.nf_last_schema_sync_ok_ms)} "
+                f"retry_active={int(self.nf_schema_retry_active)}"
+            )
             return True
         except OSError as exc:
             print(f"NF schema request failed: {exc}")
@@ -387,8 +414,14 @@ class DataReceiver:
         }
         self.nf_schema_retry_active = False
         self.nf_next_schema_retry_ms = 0.0
+        self.nf_last_schema_sync_ok_ms = time.time() * 1000.0
         self.main_window.register_signal_export_variables(ordered_names)
-        print(f"NF schema synced: count={len(schema)}")
+        print(
+            "NF schema synced: "
+            f"count={len(schema)} "
+            f"schema_req_sent_count={self.nf_schema_req_sent_count} "
+            f"last_sync_ok_ts={int(self.nf_last_schema_sync_ok_ms)}"
+        )
 
     def _process_nfv1_data(self, packet, unix_ts):
         if not self.nf_schema_by_signal_no:
