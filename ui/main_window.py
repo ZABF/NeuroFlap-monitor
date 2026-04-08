@@ -1,7 +1,8 @@
 ﻿from PyQt5.QtGui import QPen
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QCheckBox, QLabel, QSpinBox, QGridLayout, QMessageBox, QLineEdit, QComboBox, QFrame, QTabWidget
+    QCheckBox, QLabel, QSpinBox, QGridLayout, QMessageBox, QLineEdit, QComboBox, QFrame, QTabWidget, QGroupBox,
+    QScrollArea, QLayout
 )
 from PyQt5.QtCore import QTimer, Qt
 from pyqtgraph.exporters import CSVExporter
@@ -100,7 +101,7 @@ class PlotWindow(QWidget):
         self.window_now = time.time() * 1000
         # 鏁版嵁妯″瀷涓庢敹鍙戝櫒
         self.sdk_ip = "172.16.23.64"
-        self.esp32_ip = "172.16.23.13"
+        self.esp32_ip = "192.168.4.1"
         self.esp32_port = 28090
         self.rigid_id = "Rigid_Body"
         self.rigid_wing1_id = "Rigid_Wing_L"
@@ -110,6 +111,7 @@ class PlotWindow(QWidget):
         # self.data_transporter = None
         self.data_transporter = DataTransporter(self.esp32_ip, self.esp32_port)
         self.data_receiver = DataReceiver(self.data_model, self)
+        self.data_receiver.start()
         # 瀛愮獥鍙?
         self.waveform_capture_window = None
 
@@ -153,14 +155,33 @@ class PlotWindow(QWidget):
         self.open_capture_btn = QPushButton("Waveform Capture")
         self.open_capture_btn.clicked.connect(self.open_waveform_capture)
 
+        self.nf_ip_input = QLineEdit(self.esp32_ip)
+        self.nf_ip_input.setFixedWidth(140)
+        self.nf_port_input = QLineEdit("28080")
+        self.nf_port_input.setFixedWidth(80)
+        self.nf_connect_btn = QPushButton("Connect")
+        self.nf_connect_btn.clicked.connect(self.connect_nfv1)
+        self.nf_disconnect_btn = QPushButton("Disconnect")
+        self.nf_disconnect_btn.clicked.connect(self.disconnect_nfv1)
+        self.nf_status_label = QLabel("● Disconnected")
+        self.nf_status_label.setStyleSheet("color: #808080;")
+        self.nf_local_ip_label = QLabel("0.0.0.0")
+        self.nf_busy_label = QLabel("")
+        self.nf_busy_label.setVisible(False)
+
         # ===== 鍙橀噺鍕鹃€夊尯鍩?=====
         self.var_controls = {}
         self.signal_export_grid = None
+        self.signal_export_scroll = None
+        self.signal_export_container = None
         self.signal_export_count = 0
+        self.signal_export_sections = {}
+        self.signal_export_section_order = []
         self.tf_signal_grid = None
         self.tf_signal_count = 0
         self.mocap_signal_grid = None
         self.mocap_signal_count = 0
+        self.dynamic_signal_sections = {}
 
         # Variable area: split by tabs.
         variable_layout = QHBoxLayout()
@@ -197,7 +218,21 @@ class PlotWindow(QWidget):
         self.tf_signal_grid = tf_signal_grid
 
         # Dynamic signal controls from ESP32 schema response.
-        signal_export_grid = QGridLayout()
+        signal_export_scroll = QScrollArea()
+        signal_export_scroll.setWidgetResizable(False)
+        signal_export_scroll.setFrameShape(QFrame.NoFrame)
+        signal_export_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        signal_export_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        signal_export_container = QWidget()
+        signal_export_grid = QGridLayout(signal_export_container)
+        signal_export_grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        signal_export_grid.setSizeConstraint(QLayout.SetMinimumSize)
+        signal_export_grid.setContentsMargins(0, 0, 0, 0)
+        signal_export_grid.setHorizontalSpacing(8)
+        signal_export_grid.setVerticalSpacing(8)
+        signal_export_scroll.setWidget(signal_export_container)
+        self.signal_export_scroll = signal_export_scroll
+        self.signal_export_container = signal_export_container
         self.signal_export_grid = signal_export_grid
 
         # MoCap fixed variables.
@@ -246,7 +281,7 @@ class PlotWindow(QWidget):
 
         # 娣诲姞 IP 杈撳叆妗嗭紝璁剧疆榛樿鍊?
         self.esp32_rx_ip_input = QLineEdit()
-        self.esp32_rx_ip_input.setText("172.16.23.13")
+        self.esp32_rx_ip_input.setText("192.168.4.1")
         self.esp32_rx_ip_input.setFixedWidth(130)  # 鍙€夛細闄愬埗瀹藉害
 
         mocap_tx_layout.addWidget(self.esp32_rx_ip_input)
@@ -294,14 +329,34 @@ class PlotWindow(QWidget):
         port_layout.addStretch()
         port_layout.addWidget(self.bias_button)
 
-        main_page = QWidget()
-        main_page_layout = QVBoxLayout(main_page)
-        main_page_layout.addLayout(port_layout)
-        main_page_layout.addWidget(QLabel("TF Serial (Fixed 6):"))
-        main_page_layout.addLayout(tf_signal_grid)
-        main_page_layout.addWidget(QLabel("ESP32 Signal Export (Dynamic):"))
-        main_page_layout.addLayout(signal_export_grid)
-        main_page_layout.addStretch()
+        neuroflap_page = QWidget()
+        neuroflap_page_layout = QVBoxLayout(neuroflap_page)
+        neuroflap_page_layout.setContentsMargins(4, 4, 4, 4)
+        neuroflap_page_layout.setSpacing(3)
+        nfv1_ctrl_layout = QHBoxLayout()
+        nfv1_ctrl_layout.setContentsMargins(0, 0, 0, 0)
+        nfv1_ctrl_layout.setSpacing(6)
+        nfv1_ctrl_layout.addWidget(QLabel("Local IP:"))
+        nfv1_ctrl_layout.addWidget(self.nf_local_ip_label)
+        nfv1_ctrl_layout.addWidget(QLabel("ESP32 IP:"))
+        nfv1_ctrl_layout.addWidget(self.nf_ip_input)
+        nfv1_ctrl_layout.addWidget(QLabel("Port:"))
+        nfv1_ctrl_layout.addWidget(self.nf_port_input)
+        nfv1_ctrl_layout.addWidget(self.nf_connect_btn)
+        nfv1_ctrl_layout.addWidget(self.nf_disconnect_btn)
+        nfv1_ctrl_layout.addWidget(self.nf_status_label)
+        nfv1_ctrl_layout.addStretch()
+        neuroflap_page_layout.addLayout(nfv1_ctrl_layout)
+        neuroflap_page_layout.addWidget(self.nf_busy_label)
+        neuroflap_page_layout.addWidget(QLabel("ESP32 Signal Export (Dynamic):"))
+        neuroflap_page_layout.addWidget(signal_export_scroll, 1)
+
+        bota_page = QWidget()
+        bota_page_layout = QVBoxLayout(bota_page)
+        bota_page_layout.addLayout(port_layout)
+        bota_page_layout.addWidget(QLabel("Bota FT Variables (Fixed 6):"))
+        bota_page_layout.addLayout(tf_signal_grid)
+        bota_page_layout.addStretch()
 
         mocap_page = QWidget()
         mocap_page_layout = QVBoxLayout(mocap_page)
@@ -312,7 +367,8 @@ class PlotWindow(QWidget):
         mocap_page_layout.addStretch()
 
         tab_widget = QTabWidget()
-        tab_widget.addTab(main_page, "Main")
+        tab_widget.addTab(neuroflap_page, "NeuroFlap")
+        tab_widget.addTab(bota_page, "Bota FT")
         tab_widget.addTab(mocap_page, "MoCap")
 
         # 浜岀骇甯冨眬
@@ -391,6 +447,7 @@ class PlotWindow(QWidget):
 
         self.plot_state = PlotState.IDLE
         self.last_plot_state = PlotState.IDLE
+        self.update_nfv1_status()
 
     def toggle_mocap(self):
         # HACK: multi rigid
@@ -466,8 +523,59 @@ class PlotWindow(QWidget):
             self.data_receiver.transport_enabled = False
             print("Transport disenable ")
 
+    def connect_nfv1(self):
+        target_ip = self.nf_ip_input.text().strip()
+        if not target_ip:
+            QMessageBox.warning(self, "Input Error", "ESP32 IP cannot be empty.")
+            return
+        try:
+            target_port = int(self.nf_port_input.text().strip())
+        except ValueError:
+            QMessageBox.warning(self, "Input Error", "Port must be an integer.")
+            return
+        self.data_receiver.connect_nfv1(target_ip, target_port)
+        self.update_nfv1_status()
+
+    def disconnect_nfv1(self):
+        self.data_receiver.disconnect_nfv1()
+        self.update_nfv1_status()
+
+    def update_nfv1_status(self):
+        status = self.data_receiver.get_nfv1_status()
+        state = status.get("state", "disconnected")
+        local_ip = status.get("local_ip", "0.0.0.0")
+        self.nf_local_ip_label.setText(f"{local_ip}")
+
+        if state == "connected":
+            self.nf_status_label.setText("● Connected")
+            self.nf_status_label.setStyleSheet("color: #2ca02c;")
+        elif state == "connecting":
+            self.nf_status_label.setText("● Connecting")
+            self.nf_status_label.setStyleSheet("color: #f0ad4e;")
+        elif state == "busy":
+            self.nf_status_label.setText("● Busy")
+            self.nf_status_label.setStyleSheet("color: #d9534f;")
+        else:
+            self.nf_status_label.setText("● Disconnected")
+            self.nf_status_label.setStyleSheet("color: #808080;")
+
+        busy_ip = status.get("busy_owner_ip", "")
+        busy_port = int(status.get("busy_owner_port", 0))
+        if busy_ip:
+            self.nf_busy_label.setText(f"Occupied by: {busy_ip}:{busy_port}")
+            self.nf_busy_label.setStyleSheet("color: #d9534f;")
+        else:
+            last_error = status.get("last_error", "")
+            self.nf_busy_label.setText(last_error if last_error else "")
+            self.nf_busy_label.setStyleSheet("color: #666666;")
+        self.nf_busy_label.setVisible(bool(self.nf_busy_label.text()))
+
+        self.nf_connect_btn.setEnabled(state != "connected")
+        self.nf_disconnect_btn.setEnabled(state in ("connected", "connecting"))
+
     def update_misc_tasks(self):
         self.update_bota_status_label()
+        self.update_nfv1_status()
         self.refresh_serial_ports()
 
     def update_bota_status_label(self):
@@ -667,7 +775,6 @@ class PlotWindow(QWidget):
             self.data_receiver.first_ft_received_flag = False
             self.data_receiver.first_udp_received_flag = False
             self.data_model.clear()  # 闃叉娈嬬暀鏁版嵁
-            self.data_receiver.start()
             self.reception_start_time = now
             unix_time = time.time_ns() / 1000
             # print(f"The latest window t0 corresponds to the unix time {unix_time} us")
@@ -694,8 +801,6 @@ class PlotWindow(QWidget):
 
         if self.plot_state == PlotState.STOPPED:
             print(self.plot_state)
-            # self.data_receiver.start()
-            self.data_receiver.begin_nfv1_schema_sync()
             self.toggle_reception_btn.setText("Pause")
             self.toggle_reception_btn.setStyleSheet("background-color: lightblue")
             self.plot_state = PlotState.RUNNING
@@ -799,7 +904,6 @@ class PlotWindow(QWidget):
 
         # IDLE:
         self.plot_state = PlotState.IDLE
-        self.data_receiver.stop()
         self.data_model.clear()
         self.toggle_reception_btn.setText("Start Receive")
         self.toggle_reception_btn.setStyleSheet("background-color: orange")
@@ -841,21 +945,113 @@ class PlotWindow(QWidget):
             create_control=show_control,
         )
 
-    def register_signal_export_variables(self, names):
+    def _get_or_create_signal_export_section(self, section_name):
+        section = (section_name or "Other").strip() or "Other"
+        info = self.signal_export_sections.get(section)
+        if info is not None:
+            return info
+
+        box = QGroupBox(section)
+        grid = QGridLayout()
+        grid.setContentsMargins(6, 6, 6, 6)
+        grid.setHorizontalSpacing(4)
+        grid.setVerticalSpacing(2)
+        grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        box.setLayout(grid)
+        info = {"box": box, "grid": grid, "items": []}
+        self.signal_export_sections[section] = info
+        self.signal_export_section_order.append(section)
+        self._relayout_signal_export_sections()
+        return info
+
+    @staticmethod
+    def _detach_layout_items(layout):
+        if layout is None:
+            return
+        while layout.count():
+            layout.takeAt(0)
+
+    def _relayout_signal_export_sections(self):
+        if self.signal_export_grid is None:
+            return
+        self._detach_layout_items(self.signal_export_grid)
+        for idx, section in enumerate(self.signal_export_section_order):
+            info = self.signal_export_sections.get(section)
+            if not info:
+                continue
+            self.signal_export_grid.addWidget(info["box"], 0, idx, alignment=Qt.AlignTop | Qt.AlignLeft)
+        if self.signal_export_container is not None:
+            self.signal_export_container.adjustSize()
+
+    def _relayout_signal_export_section_items(self, section_name):
+        info = self.signal_export_sections.get(section_name)
+        if not info:
+            return
+        grid = info["grid"]
+        self._detach_layout_items(grid)
+        for idx, var_name in enumerate(info.get("items", [])):
+            ctrl = self.var_controls.get(var_name)
+            if ctrl is None:
+                continue
+            grid.addWidget(ctrl, idx, 0, alignment=Qt.AlignLeft)
+        if self.signal_export_container is not None:
+            self.signal_export_container.adjustSize()
+
+    def register_signal_export_descriptors(self, descriptors):
         added = []
-        for var_name in names:
+        changed_sections = set()
+        for desc in descriptors:
+            var_name = (desc.get("var_name") or desc.get("name") or "").strip()
+            if not var_name:
+                continue
+            section = (desc.get("section") or "Other").strip() or "Other"
             checked = False
-            if self._register_variable(
-                var_name=var_name,
-                checked=checked,
-                grid=self.signal_export_grid,
-                columns=6,
-                count_attr="signal_export_count",
-            ):
+            if var_name not in self.curves:
+                if self._register_variable(
+                    var_name=var_name,
+                    checked=checked,
+                    grid=None,
+                    columns=1,
+                    count_attr="signal_export_count",
+                ):
+                    added.append(var_name)
+            elif var_name not in self.var_controls:
+                color = self.colors.get(var_name, self.get_default_color(var_name))
+                ctrl = VariableControlItem(var_name, color, color, checked=self.curves[var_name].isVisible())
+                ctrl.visibility_changed.connect(self.set_curve_visibility)
+                ctrl.color_changed.connect(self.set_curve_color)
+                self.var_controls[var_name] = ctrl
+
+            if var_name not in self.dynamic_signal_variables:
                 self.dynamic_signal_variables.append(var_name)
-                added.append(var_name)
+
+            last_section = self.dynamic_signal_sections.get(var_name)
+            if last_section == section:
+                continue
+            if last_section:
+                last_info = self.signal_export_sections.get(last_section)
+                if last_info and var_name in last_info.get("items", []):
+                    last_info["items"].remove(var_name)
+                    changed_sections.add(last_section)
+            self.dynamic_signal_sections[var_name] = section
+            ctrl = self.var_controls.get(var_name)
+            if ctrl is None:
+                continue
+            section_info = self._get_or_create_signal_export_section(section)
+            if var_name not in section_info["items"]:
+                section_info["items"].append(var_name)
+            changed_sections.add(section)
+
+        for section in changed_sections:
+            self._relayout_signal_export_section_items(section)
+        if changed_sections:
+            self._relayout_signal_export_sections()
 
         return added
+
+    def register_signal_export_variables(self, names):
+        descriptors = [{"var_name": name, "section": "Other"} for name in names]
+        return self.register_signal_export_descriptors(descriptors)
 
     def set_curve_visibility(self, var_name, visible):
         if var_name in self.curves:
@@ -866,5 +1062,19 @@ class PlotWindow(QWidget):
         if var_name in self.curves:
             self.colors[var_name] = rgb
             self.curves[var_name].setPen(pg.mkPen(color=rgb, width=2))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._relayout_signal_export_sections()
+        for section in self.signal_export_section_order:
+            self._relayout_signal_export_section_items(section)
+
+    def closeEvent(self, event):
+        try:
+            self.data_receiver.disconnect_nfv1()
+            self.data_receiver.stop()
+        except Exception:
+            pass
+        event.accept()
 
 

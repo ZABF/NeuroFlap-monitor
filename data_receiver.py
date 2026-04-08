@@ -14,6 +14,16 @@ import MoCap.LuMo.LuMoSDKClient as LuMoSDKClient
 class DataReceiver:
     NF_SOURCE_PREFIX = "udp:nf:"
     NF_SCHEMA_RETRY_MS = 1000
+    NF_CONNECT_RETRY_MS = 200
+    NF_CONNECT_TIMEOUT_MS = 5000
+    NF_LINK_PING_MS = 2000
+    NF_LINK_PING_RETRY_MS = 1000
+    NF_LINK_TIMEOUT_MS = 6000
+    NF_RECONNECT_MIN_MS = 500
+    NF_RECONNECT_MAX_MS = 5000
+    NF_BUSY_RECONNECT_MS = 3000
+    NF_DISCONNECT_BURST_COUNT = 3
+    NF_DISCONNECT_BURST_INTERVAL_MS = 120
 
     def __init__(
         self,
@@ -79,6 +89,24 @@ class DataReceiver:
         self.nf_schema_retry_active = False
         self.nf_next_schema_retry_ms = 0.0
         self.nf_last_value_by_signal_no = {}
+        self.nf_want_connected = False
+        self.nf_connected = False
+        self.nf_connecting = False
+        self.nf_connect_start_ms = 0.0
+        self.nf_next_connect_req_ms = 0.0
+        self.nf_last_connect_req_ms = 0.0
+        self.nf_next_reconnect_ms = 0.0
+        self.nf_reconnect_backoff_ms = float(self.NF_RECONNECT_MIN_MS)
+        self.nf_disconnect_burst_left = 0
+        self.nf_next_disconnect_burst_ms = 0.0
+        self.nf_last_pong_ms = 0.0
+        self.nf_next_ping_due_ms = 0.0
+        self.nf_next_ping_retry_ms = 0.0
+        self.nf_waiting_pong = False
+        self.nf_busy_owner_ip = ""
+        self.nf_busy_owner_port = 0
+        self.nf_last_error = ""
+        self.nf_local_ip = "0.0.0.0"
 
     def start(self):
         if self.running:
@@ -123,12 +151,124 @@ class DataReceiver:
             except OSError:
                 pass
         self.sock.bind((self.udp_ip, self.udp_port))
+        try:
+            self.nf_local_ip = str(self.sock.getsockname()[0] or "0.0.0.0")
+        except OSError:
+            self.nf_local_ip = "0.0.0.0"
         self.udp_thread = threading.Thread(target=self.receive_udp_data, daemon=True)
         self.udp_thread.start()
-        self.begin_nfv1_schema_sync()
         print(f"UDP listening on {self.udp_ip}:{self.udp_port}")
 
+    def _resolve_local_ip(self):
+        if not self.udp_target_ip or not self.udp_target_port:
+            return self.nf_local_ip
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.connect((self.udp_target_ip, self.udp_target_port))
+                self.nf_local_ip = str(probe.getsockname()[0] or self.nf_local_ip)
+        except OSError:
+            pass
+        return self.nf_local_ip
+
+    def connect_nfv1(self, target_ip=None, target_port=None):
+        if target_ip:
+            self.udp_target_ip = target_ip
+        if target_port:
+            self.udp_target_port = int(target_port)
+        if not self.running:
+            self.start()
+
+        self.nf_schema = {}
+        self.nf_schema_order = []
+        self.nf_schema_by_signal_no = {}
+        self.nf_schema_chunks = {}
+        self.nf_schema_chunk_total = 0
+        self.nf_last_value_by_signal_no = {}
+        self.nf_schema_retry_active = False
+        self.nf_next_schema_retry_ms = 0.0
+
+        now_ms = time.time() * 1000.0
+        self.nf_want_connected = True
+        self.nf_reconnect_backoff_ms = float(self.NF_RECONNECT_MIN_MS)
+        self.nf_next_reconnect_ms = 0.0
+        self.nf_disconnect_burst_left = 0
+        self.nf_next_disconnect_burst_ms = 0.0
+        self.nf_last_pong_ms = 0.0
+        self.nf_next_ping_due_ms = 0.0
+        self.nf_next_ping_retry_ms = 0.0
+        self.nf_waiting_pong = False
+        self.nf_busy_owner_ip = ""
+        self.nf_busy_owner_port = 0
+        self.nf_last_error = ""
+        self._start_connect_attempt_(now_ms)
+
+    def disconnect_nfv1(self):
+        self.nf_want_connected = False
+        self.nf_connecting = False
+        self.nf_connected = False
+        self.nf_next_reconnect_ms = 0.0
+        self.nf_reconnect_backoff_ms = float(self.NF_RECONNECT_MIN_MS)
+        self.nf_waiting_pong = False
+        self.nf_schema_retry_active = False
+        self.nf_next_schema_retry_ms = 0.0
+        self.nf_busy_owner_ip = ""
+        self.nf_busy_owner_port = 0
+        self.nf_disconnect_burst_left = self.NF_DISCONNECT_BURST_COUNT
+        self.nf_next_disconnect_burst_ms = 0.0
+        if self.nf_disconnect_burst_left > 0:
+            self._send_disconnect_request()
+            self.nf_disconnect_burst_left -= 1
+            self.nf_next_disconnect_burst_ms = time.time() * 1000.0 + self.NF_DISCONNECT_BURST_INTERVAL_MS
+
+    def _start_connect_attempt_(self, now_ms):
+        self.nf_connecting = True
+        self.nf_connected = False
+        self.nf_connect_start_ms = now_ms
+        self.nf_next_connect_req_ms = now_ms + self.NF_CONNECT_RETRY_MS
+        self.nf_last_connect_req_ms = 0.0
+        self.nf_waiting_pong = False
+        self.nf_busy_owner_ip = ""
+        self.nf_busy_owner_port = 0
+        self._resolve_local_ip()
+        self._send_connect_request()
+
+    def _schedule_reconnect_(self, now_ms, reason="", busy=False):
+        if not self.nf_want_connected:
+            return
+        if reason:
+            self.nf_last_error = reason
+        delay_ms = self.NF_BUSY_RECONNECT_MS if busy else int(self.nf_reconnect_backoff_ms)
+        self.nf_next_reconnect_ms = now_ms + delay_ms
+        if not busy:
+            self.nf_reconnect_backoff_ms = min(
+                float(self.NF_RECONNECT_MAX_MS),
+                max(float(self.NF_RECONNECT_MIN_MS), self.nf_reconnect_backoff_ms * 2.0),
+            )
+
+    def get_nfv1_status(self):
+        state = "disconnected"
+        if self.nf_connected:
+            state = "connected"
+        elif self.nf_connecting:
+            state = "connecting"
+        elif self.nf_busy_owner_ip:
+            state = "busy"
+        return {
+            "state": state,
+            "want_connected": bool(self.nf_want_connected),
+            "connected": bool(self.nf_connected),
+            "connecting": bool(self.nf_connecting),
+            "target_ip": self.udp_target_ip or "",
+            "target_port": int(self.udp_target_port or 0),
+            "local_ip": self.nf_local_ip,
+            "busy_owner_ip": self.nf_busy_owner_ip,
+            "busy_owner_port": int(self.nf_busy_owner_port or 0),
+            "last_error": self.nf_last_error,
+        }
+
     def begin_nfv1_schema_sync(self):
+        if not self.nf_connected:
+            return
         if self.nf_schema_retry_active and not self.nf_schema_order:
             print(
                 "NF schema sync begin skipped: "
@@ -326,8 +466,77 @@ class DataReceiver:
         timestamp_unix = time.time() * 1000.0
         self.pending_queue.append((data_source, data, timestamp_unix, meta or {}))
 
-    def _request_nfv1_schema(self, force=False):
+    def _send_udp_packet(self, packet):
         if not self.sock or not self.udp_target_ip or not self.udp_target_port:
+            return False
+        try:
+            self.sock.sendto(packet, (self.udp_target_ip, self.udp_target_port))
+            return True
+        except OSError as exc:
+            self.nf_last_error = f"udp send failed: {exc}"
+            return False
+
+    def _send_connect_request(self):
+        packet = self.nf_parser.build_connect_request()
+        if self._send_udp_packet(packet):
+            self.nf_last_connect_req_ms = time.time() * 1000.0
+            return True
+        return False
+
+    def _send_link_ping(self):
+        packet = self.nf_parser.build_link_ping()
+        return self._send_udp_packet(packet)
+
+    def _send_disconnect_request(self):
+        packet = self.nf_parser.build_disconnect_request()
+        return self._send_udp_packet(packet)
+
+    def _tick_nfv1_connection(self):
+        now_ms = time.time() * 1000.0
+
+        if self.nf_disconnect_burst_left > 0 and now_ms >= self.nf_next_disconnect_burst_ms:
+            self._send_disconnect_request()
+            self.nf_disconnect_burst_left -= 1
+            self.nf_next_disconnect_burst_ms = now_ms + self.NF_DISCONNECT_BURST_INTERVAL_MS
+
+        if self.nf_connecting:
+            if (now_ms - self.nf_connect_start_ms) >= self.NF_CONNECT_TIMEOUT_MS:
+                self.nf_connecting = False
+                self.nf_connected = False
+                self.nf_waiting_pong = False
+                self._schedule_reconnect_(now_ms, reason="connect timeout", busy=False)
+                return
+            if now_ms >= self.nf_next_connect_req_ms:
+                self._send_connect_request()
+                self.nf_next_connect_req_ms = now_ms + self.NF_CONNECT_RETRY_MS
+            return
+
+        if not self.nf_connected:
+            if self.nf_want_connected and now_ms >= self.nf_next_reconnect_ms:
+                self._start_connect_attempt_(now_ms)
+            return
+
+        if self.nf_last_pong_ms > 0 and (now_ms - self.nf_last_pong_ms) >= self.NF_LINK_TIMEOUT_MS:
+            self.nf_connected = False
+            self.nf_waiting_pong = False
+            self.nf_schema_retry_active = False
+            self.nf_next_schema_retry_ms = 0.0
+            self._schedule_reconnect_(now_ms, reason="link timeout", busy=False)
+            return
+
+        if self.nf_waiting_pong:
+            if now_ms >= self.nf_next_ping_retry_ms:
+                self._send_link_ping()
+                self.nf_next_ping_retry_ms = now_ms + self.NF_LINK_PING_RETRY_MS
+            return
+
+        if now_ms >= self.nf_next_ping_due_ms:
+            self._send_link_ping()
+            self.nf_waiting_pong = True
+            self.nf_next_ping_retry_ms = now_ms + self.NF_LINK_PING_RETRY_MS
+
+    def _request_nfv1_schema(self, force=False):
+        if not self.nf_connected:
             return False
 
         now_ms = time.time() * 1000.0
@@ -337,7 +546,8 @@ class DataReceiver:
         self.nf_request_id = (self.nf_request_id + 1) & 0xFFFFFFFF
         packet = self.nf_parser.build_schema_request(self.nf_request_id)
         try:
-            self.sock.sendto(packet, (self.udp_target_ip, self.udp_target_port))
+            if not self._send_udp_packet(packet):
+                return False
             self.nf_last_schema_request_ms = now_ms
             self.nf_schema_req_sent_count += 1
             print(
@@ -381,7 +591,7 @@ class DataReceiver:
         schema_by_signal_no = {}
         self.nf_schema_order = []
         used_names = set()
-        ordered_names = []
+        ordered_descriptors = []
         for entry in entries:
             gid = entry["gid"]
             base_name = entry["name"] or f"gid_{gid:08X}"
@@ -389,11 +599,13 @@ class DataReceiver:
             if var_name in used_names:
                 var_name = f"{base_name}[{gid:08X}]"
             used_names.add(var_name)
+            section = entry.get("section") or "Other"
             schema[gid] = {
                 "gid": gid,
                 "scalar_type": entry["scalar_type"],
                 "name": entry["name"],
                 "unit": entry["unit"],
+                "section": section,
                 "var_name": var_name,
             }
             domain = (gid >> 16) & 0xFFFF
@@ -401,7 +613,16 @@ class DataReceiver:
             if domain == 0 and signal_no < 256:
                 schema_by_signal_no[signal_no] = schema[gid]
             self.nf_schema_order.append(schema[gid])
-            ordered_names.append(var_name)
+            ordered_descriptors.append(
+                {
+                    "gid": gid,
+                    "scalar_type": entry["scalar_type"],
+                    "name": entry["name"],
+                    "unit": entry["unit"],
+                    "section": section,
+                    "var_name": var_name,
+                }
+            )
 
         self.nf_schema = schema
         self.nf_schema_by_signal_no = schema_by_signal_no
@@ -415,7 +636,12 @@ class DataReceiver:
         self.nf_schema_retry_active = False
         self.nf_next_schema_retry_ms = 0.0
         self.nf_last_schema_sync_ok_ms = time.time() * 1000.0
-        self.main_window.register_signal_export_variables(ordered_names)
+        if hasattr(self.main_window, "register_signal_export_descriptors"):
+            self.main_window.register_signal_export_descriptors(ordered_descriptors)
+        else:
+            self.main_window.register_signal_export_variables(
+                [item["var_name"] for item in ordered_descriptors]
+            )
         print(
             "NF schema synced: "
             f"count={len(schema)} "
@@ -424,6 +650,8 @@ class DataReceiver:
         )
 
     def _process_nfv1_data(self, packet, unix_ts):
+        if not self.nf_connected:
+            return
         if not self.nf_schema_by_signal_no:
             if not self.nf_schema_retry_active:
                 self.begin_nfv1_schema_sync()
@@ -478,7 +706,44 @@ class DataReceiver:
         if packet is None:
             return
 
+        now_ms = time.time() * 1000.0
+
+        if packet["type"] == "connect_ack":
+            self.nf_connecting = False
+            self.nf_connected = True
+            self.nf_waiting_pong = False
+            self.nf_last_pong_ms = now_ms
+            self.nf_next_ping_due_ms = now_ms + self.NF_LINK_PING_MS
+            self.nf_next_ping_retry_ms = 0.0
+            self.nf_busy_owner_ip = ""
+            self.nf_busy_owner_port = 0
+            self.nf_last_error = ""
+            self.nf_next_reconnect_ms = 0.0
+            self.nf_reconnect_backoff_ms = float(self.NF_RECONNECT_MIN_MS)
+            self.nf_disconnect_burst_left = 0
+            self.begin_nfv1_schema_sync()
+            return
+
+        if packet["type"] == "busy_ack":
+            self.nf_connecting = False
+            self.nf_connected = False
+            self.nf_waiting_pong = False
+            self.nf_busy_owner_ip = packet.get("owner_ip", "")
+            self.nf_busy_owner_port = int(packet.get("owner_port", 0))
+            self.nf_last_error = f"busy by {self.nf_busy_owner_ip}:{self.nf_busy_owner_port}"
+            self._schedule_reconnect_(now_ms, busy=True)
+            return
+
+        if packet["type"] == "link_pong":
+            if self.nf_connected:
+                self.nf_last_pong_ms = now_ms
+                self.nf_waiting_pong = False
+                self.nf_next_ping_due_ms = now_ms + self.NF_LINK_PING_MS
+            return
+
         if packet["type"] == "schema_resp":
+            if not self.nf_connected:
+                return
             self._handle_nfv1_schema_response(packet)
             return
 
@@ -486,7 +751,9 @@ class DataReceiver:
             self._process_nfv1_data(packet, unix_ts)
 
     def process_data(self):
-        self._tick_nfv1_schema_retry()
+        self._tick_nfv1_connection()
+        if self.nf_connected:
+            self._tick_nfv1_schema_retry()
 
         to_process = []
         while self.pending_queue:

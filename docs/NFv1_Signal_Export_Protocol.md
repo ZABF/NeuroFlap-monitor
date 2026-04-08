@@ -20,6 +20,12 @@ Implementation references:
 - `0x01`: `DATA` (firmware -> monitor)
 - `0x10`: `SCHEMA_REQ` (monitor -> firmware)
 - `0x11`: `SCHEMA_RESP` (firmware -> monitor)
+- `0x20`: `CONNECT_REQ` (monitor -> firmware)
+- `0x21`: `CONNECT_ACK` (firmware -> monitor)
+- `0x22`: `BUSY_ACK` (firmware -> monitor)
+- `0x23`: `LINK_PING` (monitor -> firmware)
+- `0x24`: `LINK_PONG` (firmware -> monitor)
+- `0x25`: `DISCONNECT_REQ` (monitor -> firmware)
 
 ## Binary Layouts
 
@@ -29,6 +35,8 @@ Python struct formats used by monitor parser:
 - `DATA_ITEM_FMT = "<BHI"`
 - `SCHEMA_REQ_FMT = "<HBBI"`
 - `SCHEMA_RESP_HEADER_FMT = "<HBBHHH"`
+- `CTRL_HEADER_FMT = "<HBB"`
+- `BUSY_ACK_FMT = "<4sH"`
 
 ### DATA Packet (`type=0x01`)
 
@@ -67,9 +75,31 @@ Monitor reconstructs sample source timestamp as:
 - `scalar_type: u8`
 - `name_len: u8`
 - `unit_len: u8`
-- `reserved: u8`
+- `section_len: u8`
 - `name: bytes`
 - `unit: bytes`
+- `section: bytes` (e.g. `Actuator`, `Control`, `RC`, `Sensor`, `Nav`, `Other`)
+
+## Session Handshake And Keepalive
+
+Monitor side:
+
+1. Send `CONNECT_REQ` every 200ms (max 5s) until `CONNECT_ACK`.
+2. `CONNECT_ACK` is a control ACK only (no schema payload).
+3. On `CONNECT_ACK`, request schema via `SCHEMA_REQ`.
+4. During session, send `LINK_PING` every 2s.
+5. If waiting for `LINK_PONG`, retry ping every 1s.
+6. If no `LINK_PONG` for 6s, treat as disconnected.
+7. On manual disconnect, send `DISCONNECT_REQ`.
+
+Firmware side:
+
+1. Single-session mode (one active monitor endpoint).
+2. New `CONNECT_REQ` from another endpoint returns `BUSY_ACK`:
+   - `owner_ip[4]`
+   - `owner_port(u16)`
+3. Session expires after 6s without ping/connect refresh.
+4. `DATA` is sent only when a session is alive.
 
 ## Scalar Type Mapping
 
