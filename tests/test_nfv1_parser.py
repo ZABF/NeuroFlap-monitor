@@ -14,6 +14,7 @@ class NFv1ParserTest(unittest.TestCase):
             self.parser.MAGIC,
             self.parser.VERSION,
             self.parser.TYPE_DATA,
+            3,
             7,
             123450000,
             123456789,
@@ -29,6 +30,7 @@ class NFv1ParserTest(unittest.TestCase):
         packet = self.parser.parse_packet(header + items)
         self.assertIsNotNone(packet)
         self.assertEqual(packet["type"], "data")
+        self.assertEqual(packet["schema_generation"], 3)
         self.assertEqual(packet["packet_seq"], 7)
         self.assertEqual(packet["build_us"], 123450000)
         self.assertEqual(packet["send_us"], 123456789)
@@ -63,6 +65,8 @@ class NFv1ParserTest(unittest.TestCase):
             self.parser.MAGIC,
             self.parser.VERSION,
             self.parser.TYPE_SCHEMA_RESP,
+            5,
+            0x00007FFF,
             0,
             1,
             len(entries),
@@ -71,6 +75,8 @@ class NFv1ParserTest(unittest.TestCase):
         packet = self.parser.parse_packet(header + b"".join(entries))
         self.assertIsNotNone(packet)
         self.assertEqual(packet["type"], "schema_resp")
+        self.assertEqual(packet["schema_generation"], 5)
+        self.assertEqual(packet["section_mask"], 0x00007FFF)
         self.assertEqual(packet["chunk_total"], 1)
         self.assertEqual(len(packet["entries"]), 2)
         self.assertEqual(packet["entries"][0]["gid"], 0x00010002)

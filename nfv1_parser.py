@@ -3,7 +3,7 @@ import struct
 
 class NFv1Parser:
     MAGIC = 0x464E
-    VERSION = 1
+    VERSION = 2
 
     TYPE_DATA = 0x01
     TYPE_SCHEMA_REQ = 0x10
@@ -15,14 +15,14 @@ class NFv1Parser:
     TYPE_LINK_PONG = 0x24
     TYPE_DISCONNECT_REQ = 0x25
 
-    # DATA: magic + ver + type + packet_seq + build_us + send_us + item_count
-    DATA_HEADER_FMT = "<HBBIQQH"
+    # DATA: magic + ver + type + schema_generation + packet_seq + build_us + send_us + item_count
+    DATA_HEADER_FMT = "<HBBIIQQH"
     # DATA item: signal_no + dt_us16 + raw
     DATA_ITEM_FMT = "<BHI"
     # SCHEMA_REQ: magic + ver + type + request_id
     SCHEMA_REQ_FMT = "<HBBI"
-    # SCHEMA_RESP: magic + ver + type + chunk_index + chunk_total + entry_count
-    SCHEMA_RESP_HEADER_FMT = "<HBBHHH"
+    # SCHEMA_RESP: magic + ver + type + schema_generation + section_mask + chunk_index + chunk_total + entry_count
+    SCHEMA_RESP_HEADER_FMT = "<HBBIIHHH"
     # CTRL header: magic + ver + type
     CTRL_HEADER_FMT = "<HBB"
     # BUSY_ACK payload: owner_ip[4] + owner_port(u16)
@@ -35,6 +35,7 @@ class NFv1Parser:
     CTRL_HEADER_SIZE = struct.calcsize(CTRL_HEADER_FMT)
     BUSY_ACK_SIZE = struct.calcsize(BUSY_ACK_FMT)
 
+    TYPE_UNKNOWN = 0
     TYPE_BOOL = 1
     TYPE_U8 = 2
     TYPE_U16 = 3
@@ -99,7 +100,7 @@ class NFv1Parser:
         if len(data) < self.DATA_HEADER_SIZE:
             return None
 
-        magic, version, packet_type, packet_seq, build_us, send_us, item_count = struct.unpack_from(
+        magic, version, packet_type, schema_generation, packet_seq, build_us, send_us, item_count = struct.unpack_from(
             self.DATA_HEADER_FMT, data, 0
         )
         expected_size = self.DATA_HEADER_SIZE + item_count * self.DATA_ITEM_SIZE
@@ -121,6 +122,7 @@ class NFv1Parser:
 
         return {
             "type": "data",
+            "schema_generation": schema_generation,
             "packet_seq": packet_seq,
             "build_us": build_us,
             "send_us": send_us,
@@ -132,7 +134,7 @@ class NFv1Parser:
         if len(data) < self.SCHEMA_RESP_HEADER_SIZE:
             return None
 
-        magic, version, packet_type, chunk_index, chunk_total, entry_count = struct.unpack_from(
+        magic, version, packet_type, schema_generation, section_mask, chunk_index, chunk_total, entry_count = struct.unpack_from(
             self.SCHEMA_RESP_HEADER_FMT, data, 0
         )
         if chunk_total == 0:
@@ -172,6 +174,8 @@ class NFv1Parser:
 
         return {
             "type": "schema_resp",
+            "schema_generation": schema_generation,
+            "section_mask": section_mask,
             "chunk_index": chunk_index,
             "chunk_total": chunk_total,
             "entries": entries,

@@ -7,7 +7,7 @@ import time
 
 
 MAGIC = 0x464E
-VERSION = 1
+VERSION = 2
 
 TYPE_DATA = 0x01
 TYPE_SCHEMA_REQ = 0x10
@@ -20,10 +20,10 @@ TYPE_U32 = 4
 TYPE_I32 = 5
 TYPE_F32 = 6
 
-DATA_HEADER_FMT = "<HBBIQQH"
+DATA_HEADER_FMT = "<HBBIIQQH"
 DATA_ITEM_FMT = "<BHI"
 SCHEMA_REQ_FMT = "<HBBI"
-SCHEMA_RESP_HEADER_FMT = "<HBBHHH"
+SCHEMA_RESP_HEADER_FMT = "<HBBIIHHH"
 SCHEMA_ENTRY_PREFIX_FMT = "<IBBBB"
 
 MAX_PAYLOAD = 1200
@@ -45,8 +45,8 @@ def bool_to_raw(value):
     return 1 if value else 0
 
 
-def make_gid(domain, signal_id):
-    return ((int(domain) & 0xFFFF) << 16) | (int(signal_id) & 0xFFFF)
+def make_gid(section, signal_id):
+    return ((int(section) & 0xFFFF) << 16) | (int(signal_id) & 0xFFFF)
 
 
 class NFv1UdpSimulator:
@@ -59,20 +59,22 @@ class NFv1UdpSimulator:
         self.chunk_size = int(chunk_size)
         self.sock = None
         self.stop_event = threading.Event()
+        self.schema_generation = 1
+        self.section_mask = 0xFFFFFFFF
         self.packet_seq = 0
         self.send_count = 0
         self.last_stat_ts = time.time()
         self.last_raw_by_signal_no = {}
 
-        # Internal domain(0), id asc order.
+        # GID stays stable as (section << 16) | id; DATA signal_no follows schema order.
         self.schema = [
-            {"gid": make_gid(0, 10), "type": TYPE_F32, "name": "roll_6", "unit": "deg"},
-            {"gid": make_gid(0, 11), "type": TYPE_F32, "name": "pitch", "unit": "deg"},
-            {"gid": make_gid(0, 12), "type": TYPE_F32, "name": "yaw", "unit": "deg"},
-            {"gid": make_gid(0, 20), "type": TYPE_U16, "name": "pwm1", "unit": "us"},
-            {"gid": make_gid(0, 21), "type": TYPE_U16, "name": "pwm2", "unit": "us"},
-            {"gid": make_gid(0, 30), "type": TYPE_U32, "name": "loop_hz", "unit": "hz"},
-            {"gid": make_gid(0, 31), "type": TYPE_BOOL, "name": "armed", "unit": ""},
+            {"gid": make_gid(1, 10), "type": TYPE_F32, "name": "roll_6", "unit": "deg", "section": "Att"},
+            {"gid": make_gid(1, 11), "type": TYPE_F32, "name": "pitch", "unit": "deg", "section": "Att"},
+            {"gid": make_gid(1, 12), "type": TYPE_F32, "name": "yaw", "unit": "deg", "section": "Att"},
+            {"gid": make_gid(0, 20), "type": TYPE_U16, "name": "pwm1", "unit": "us", "section": "Actuator"},
+            {"gid": make_gid(0, 21), "type": TYPE_U16, "name": "pwm2", "unit": "us", "section": "Actuator"},
+            {"gid": make_gid(4, 30), "type": TYPE_U32, "name": "loop_hz", "unit": "hz", "section": "Control"},
+            {"gid": make_gid(4, 31), "type": TYPE_BOOL, "name": "armed", "unit": "", "section": "Control"},
         ]
 
     def _build_schema_chunks(self):
@@ -83,7 +85,8 @@ class NFv1UdpSimulator:
         for entry in self.schema:
             name_bytes = entry["name"].encode("utf-8")
             unit_bytes = entry["unit"].encode("utf-8")
-            entry_size = struct.calcsize(SCHEMA_ENTRY_PREFIX_FMT) + len(name_bytes) + len(unit_bytes)
+            section_bytes = entry["section"].encode("utf-8")
+            entry_size = struct.calcsize(SCHEMA_ENTRY_PREFIX_FMT) + len(name_bytes) + len(unit_bytes) + len(section_bytes)
             if entry_size > (MAX_PAYLOAD - struct.calcsize(SCHEMA_RESP_HEADER_FMT)):
                 raise ValueError("schema entry too large for one UDP packet")
 
@@ -92,7 +95,7 @@ class NFv1UdpSimulator:
                 current_entries = []
                 current_size = struct.calcsize(SCHEMA_RESP_HEADER_FMT)
 
-            current_entries.append((entry, name_bytes, unit_bytes))
+            current_entries.append((entry, name_bytes, unit_bytes, section_bytes))
             current_size += entry_size
 
         if current_entries or not chunks:
@@ -107,12 +110,14 @@ class NFv1UdpSimulator:
                     MAGIC,
                     VERSION,
                     TYPE_SCHEMA_RESP,
+                    self.schema_generation & 0xFFFFFFFF,
+                    self.section_mask & 0xFFFFFFFF,
                     chunk_index,
                     chunk_total,
                     len(chunk),
                 )
             )
-            for entry, name_bytes, unit_bytes in chunk:
+            for entry, name_bytes, unit_bytes, section_bytes in chunk:
                 packet.extend(
                     struct.pack(
                         SCHEMA_ENTRY_PREFIX_FMT,
@@ -120,11 +125,12 @@ class NFv1UdpSimulator:
                         entry["type"],
                         len(name_bytes),
                         len(unit_bytes),
-                        0,
+                        len(section_bytes),
                     )
                 )
                 packet.extend(name_bytes)
                 packet.extend(unit_bytes)
+                packet.extend(section_bytes)
             packets.append(bytes(packet))
         return packets
 
@@ -166,13 +172,13 @@ class NFv1UdpSimulator:
         armed = (int(now_s) % 4) < 2
 
         values = [
-            (10, f32_to_raw(roll)),
-            (11, f32_to_raw(pitch)),
-            (12, f32_to_raw(yaw)),
-            (20, u16_to_raw(pwm1)),
-            (21, u16_to_raw(pwm2)),
-            (30, u32_to_raw(loop_hz)),
-            (31, bool_to_raw(armed)),
+            (0, f32_to_raw(roll)),
+            (1, f32_to_raw(pitch)),
+            (2, f32_to_raw(yaw)),
+            (3, u16_to_raw(pwm1)),
+            (4, u16_to_raw(pwm2)),
+            (5, u32_to_raw(loop_hz)),
+            (6, bool_to_raw(armed)),
         ]
 
         changed_values = []
@@ -200,6 +206,7 @@ class NFv1UdpSimulator:
                     MAGIC,
                     VERSION,
                     TYPE_DATA,
+                    self.schema_generation & 0xFFFFFFFF,
                     self.packet_seq & 0xFFFFFFFF,
                     build_us & 0xFFFFFFFFFFFFFFFF,
                     send_us & 0xFFFFFFFFFFFFFFFF,

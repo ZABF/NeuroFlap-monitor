@@ -78,8 +78,12 @@ class DataReceiver:
         self.nf_schema = {}
         self.nf_schema_order = []
         self.nf_schema_by_signal_no = {}
+        self.nf_schema_generation = None
+        self.nf_schema_section_mask = 0
         self.nf_schema_chunks = {}
         self.nf_schema_chunk_total = 0
+        self.nf_schema_chunk_generation = None
+        self.nf_schema_chunk_section_mask = 0
         self.nf_request_id = 0
         self.nf_last_schema_request_ms = 0.0
         self.nf_schema_req_sent_count = 0
@@ -181,8 +185,12 @@ class DataReceiver:
         self.nf_schema = {}
         self.nf_schema_order = []
         self.nf_schema_by_signal_no = {}
+        self.nf_schema_generation = None
+        self.nf_schema_section_mask = 0
         self.nf_schema_chunks = {}
         self.nf_schema_chunk_total = 0
+        self.nf_schema_chunk_generation = None
+        self.nf_schema_chunk_section_mask = 0
         self.nf_last_value_by_signal_no = {}
         self.nf_schema_retry_active = False
         self.nf_next_schema_retry_ms = 0.0
@@ -280,8 +288,12 @@ class DataReceiver:
         self.nf_schema = {}
         self.nf_schema_order = []
         self.nf_schema_by_signal_no = {}
+        self.nf_schema_generation = None
+        self.nf_schema_section_mask = 0
         self.nf_schema_chunks = {}
         self.nf_schema_chunk_total = 0
+        self.nf_schema_chunk_generation = None
+        self.nf_schema_chunk_section_mask = 0
         self.nf_last_packet_seq = None
         self.nf_last_value_by_signal_no = {}
         self.nf_schema_retry_active = True
@@ -296,10 +308,6 @@ class DataReceiver:
 
     def _tick_nfv1_schema_retry(self):
         if not self.nf_schema_retry_active:
-            return
-        if self.nf_schema_order:
-            self.nf_schema_retry_active = False
-            self.nf_next_schema_retry_ms = 0.0
             return
 
         now_ms = time.time() * 1000.0
@@ -562,19 +570,25 @@ class DataReceiver:
             return False
 
     def _handle_nfv1_schema_response(self, packet):
-        if (not self.nf_schema_retry_active) and self.nf_schema_order:
-            return
-
+        schema_generation = int(packet.get("schema_generation", 0)) & 0xFFFFFFFF
+        section_mask = int(packet.get("section_mask", 0)) & 0xFFFFFFFF
         chunk_total = packet["chunk_total"]
         chunk_index = packet["chunk_index"]
 
         if chunk_total == 0:
             return
 
-        # chunk 0 indicates a fresh schema transfer.
-        if chunk_index == 0 or self.nf_schema_chunk_total != chunk_total:
+        fresh_transfer = (
+            chunk_index == 0
+            or self.nf_schema_chunk_generation != schema_generation
+            or self.nf_schema_chunk_section_mask != section_mask
+            or self.nf_schema_chunk_total != chunk_total
+        )
+        if fresh_transfer:
             self.nf_schema_chunks = {}
             self.nf_schema_chunk_total = chunk_total
+            self.nf_schema_chunk_generation = schema_generation
+            self.nf_schema_chunk_section_mask = section_mask
 
         self.nf_schema_chunks[chunk_index] = packet["entries"]
         if len(self.nf_schema_chunks) != self.nf_schema_chunk_total:
@@ -600,7 +614,7 @@ class DataReceiver:
                 var_name = f"{base_name}[{gid:08X}]"
             used_names.add(var_name)
             section = entry.get("section") or "Other"
-            schema[gid] = {
+            desc = {
                 "gid": gid,
                 "scalar_type": entry["scalar_type"],
                 "name": entry["name"],
@@ -608,11 +622,11 @@ class DataReceiver:
                 "section": section,
                 "var_name": var_name,
             }
-            domain = (gid >> 16) & 0xFFFF
-            signal_no = gid & 0xFFFF
-            if domain == 0 and signal_no < 256:
-                schema_by_signal_no[signal_no] = schema[gid]
-            self.nf_schema_order.append(schema[gid])
+            schema[gid] = desc
+            signal_no = len(self.nf_schema_order)
+            if signal_no < 256:
+                schema_by_signal_no[signal_no] = desc
+            self.nf_schema_order.append(desc)
             ordered_descriptors.append(
                 {
                     "gid": gid,
@@ -626,13 +640,13 @@ class DataReceiver:
 
         self.nf_schema = schema
         self.nf_schema_by_signal_no = schema_by_signal_no
+        self.nf_schema_generation = schema_generation
+        self.nf_schema_section_mask = section_mask
         self.nf_schema_chunks = {}
         self.nf_schema_chunk_total = 0
-        self.nf_last_value_by_signal_no = {
-            signal_no: self.nf_last_value_by_signal_no[signal_no]
-            for signal_no in self.nf_last_value_by_signal_no
-            if signal_no in self.nf_schema_by_signal_no
-        }
+        self.nf_schema_chunk_generation = None
+        self.nf_schema_chunk_section_mask = 0
+        self.nf_last_value_by_signal_no = {}
         self.nf_schema_retry_active = False
         self.nf_next_schema_retry_ms = 0.0
         self.nf_last_schema_sync_ok_ms = time.time() * 1000.0
@@ -644,6 +658,8 @@ class DataReceiver:
             )
         print(
             "NF schema synced: "
+            f"generation={schema_generation} "
+            f"section_mask=0x{section_mask:08X} "
             f"count={len(schema)} "
             f"schema_req_sent_count={self.nf_schema_req_sent_count} "
             f"last_sync_ok_ts={int(self.nf_last_schema_sync_ok_ms)}"
@@ -652,9 +668,16 @@ class DataReceiver:
     def _process_nfv1_data(self, packet, unix_ts):
         if not self.nf_connected:
             return
-        if not self.nf_schema_by_signal_no:
+        packet_generation = int(packet.get("schema_generation", 0)) & 0xFFFFFFFF
+        if not self.nf_schema_by_signal_no or self.nf_schema_generation != packet_generation:
             if not self.nf_schema_retry_active:
-                self.begin_nfv1_schema_sync()
+                self.nf_schema_retry_active = True
+                self.nf_next_schema_retry_ms = 0.0
+                self.nf_schema_chunks = {}
+                self.nf_schema_chunk_total = 0
+                self.nf_schema_chunk_generation = None
+                self.nf_schema_chunk_section_mask = 0
+                self._request_nfv1_schema(force=True)
             return
 
         if self.nf_last_packet_seq is not None:

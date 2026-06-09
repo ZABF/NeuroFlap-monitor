@@ -33,6 +33,26 @@ sys.modules["MoCap"] = _mocap_pkg
 sys.modules["MoCap.LuMo"] = _mocap_lumo_pkg
 sys.modules["MoCap.LuMo.LuMoSDKClient"] = _mocap_sdk_mod
 
+_crc_mod = types.ModuleType("crc")
+
+
+class _DummyConfiguration:
+    def __init__(self, *args, **kwargs):
+        return None
+
+
+class _DummyCalculator:
+    def __init__(self, *args, **kwargs):
+        return None
+
+    def checksum(self, _data):
+        return 0
+
+
+_crc_mod.Calculator = _DummyCalculator
+_crc_mod.Configuration = _DummyConfiguration
+sys.modules["crc"] = _crc_mod
+
 from data_receiver import DataReceiver
 
 
@@ -64,6 +84,7 @@ class DataReceiverNFv1DecodeTest(unittest.TestCase):
         self.window = _DummyMainWindow()
         self.receiver = DataReceiver(self.model, self.window, udp_target_ip="127.0.0.1", udp_target_port=19001)
         self.parser = NFv1Parser()
+        self.receiver.nf_connected = True
 
         self.receiver.nf_schema_order = [
             {"gid": 1, "scalar_type": self.parser.TYPE_U32, "var_name": "a"},
@@ -72,11 +93,12 @@ class DataReceiverNFv1DecodeTest(unittest.TestCase):
             {"gid": 4, "scalar_type": self.parser.TYPE_U32, "var_name": "d"},
         ]
         self.receiver.nf_schema_by_signal_no = {
-            1: self.receiver.nf_schema_order[0],
-            2: self.receiver.nf_schema_order[1],
-            3: self.receiver.nf_schema_order[2],
-            4: self.receiver.nf_schema_order[3],
+            0: self.receiver.nf_schema_order[0],
+            1: self.receiver.nf_schema_order[1],
+            2: self.receiver.nf_schema_order[2],
+            3: self.receiver.nf_schema_order[3],
         }
+        self.receiver.nf_schema_generation = 1
 
     def _build_data_packet(self, packet_seq, signal_raw_pairs):
         build_us = int(time.monotonic_ns() // 1000)
@@ -86,6 +108,7 @@ class DataReceiverNFv1DecodeTest(unittest.TestCase):
             self.parser.MAGIC,
             self.parser.VERSION,
             self.parser.TYPE_DATA,
+            1,
             packet_seq,
             build_us,
             send_us,
@@ -103,8 +126,8 @@ class DataReceiverNFv1DecodeTest(unittest.TestCase):
         return self.parser.parse_packet(header + items)
 
     def test_multi_packet_snapshot_decode(self):
-        p0 = self._build_data_packet(10, [(1, 11), (2, 22)])
-        p1 = self._build_data_packet(11, [(3, 33), (4, 44)])
+        p0 = self._build_data_packet(10, [(0, 11), (1, 22)])
+        p1 = self._build_data_packet(11, [(2, 33), (3, 44)])
 
         self.receiver._process_nfv1_data(p1, unix_ts=1000.0)
         self.receiver._process_nfv1_data(p0, unix_ts=1000.0)
@@ -117,6 +140,38 @@ class DataReceiverNFv1DecodeTest(unittest.TestCase):
         self.assertEqual(values.get("b"), 22.0)
         self.assertEqual(values.get("c"), 33.0)
         self.assertEqual(values.get("d"), 44.0)
+
+    def test_schema_response_maps_signal_numbers_by_schema_order(self):
+        packet = {
+            "schema_generation": 2,
+            "section_mask": 0x00007FFF,
+            "chunk_index": 0,
+            "chunk_total": 1,
+            "entries": [
+                {"gid": (5 << 16) | 12, "scalar_type": self.parser.TYPE_F32, "name": "yaw", "unit": "deg", "section": "IMU"},
+                {"gid": (1 << 16) | 7, "scalar_type": self.parser.TYPE_F32, "name": "roll", "unit": "deg", "section": "Att"},
+                {"gid": (4 << 16) | 31, "scalar_type": self.parser.TYPE_BOOL, "name": "armed", "unit": "", "section": "Control"},
+            ],
+        }
+
+        self.receiver.nf_schema_retry_active = True
+        self.receiver._handle_nfv1_schema_response(packet)
+
+        self.assertEqual(self.receiver.nf_schema_generation, 2)
+        self.assertEqual(self.receiver.nf_schema_section_mask, 0x00007FFF)
+        self.assertEqual(self.receiver.nf_schema_by_signal_no[0]["gid"], (5 << 16) | 12)
+        self.assertEqual(self.receiver.nf_schema_by_signal_no[1]["gid"], (1 << 16) | 7)
+        self.assertEqual(self.receiver.nf_schema_by_signal_no[2]["gid"], (4 << 16) | 31)
+
+    def test_data_with_unknown_schema_generation_is_dropped_and_requests_schema(self):
+        packet = self._build_data_packet(20, [(0, 99)])
+        packet["schema_generation"] = 9
+
+        self.receiver.nf_schema_retry_active = False
+        self.receiver._process_nfv1_data(packet, unix_ts=1000.0)
+
+        self.assertEqual(len(self.model.records), 0)
+        self.assertTrue(self.receiver.nf_schema_retry_active)
 
 
 if __name__ == "__main__":
