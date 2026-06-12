@@ -1,10 +1,12 @@
-﻿from PyQt5.QtGui import QPen
+from PyQt5.QtGui import QColor, QPen
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QCheckBox, QLabel, QSpinBox, QGridLayout, QMessageBox, QLineEdit, QComboBox, QFrame, QTabWidget, QGroupBox,
-    QScrollArea, QLayout
+    QScrollArea, QLayout, QColorDialog, QDoubleSpinBox
 )
-from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtCore import QEvent, QPointF, QTimer, Qt
+from bisect import bisect_left
+import math
 from pyqtgraph.exporters import CSVExporter
 import pyqtgraph as pg
 import time
@@ -27,8 +29,14 @@ IDLE           |    RUNNING         ----            ----
 RUNNING        |    ----            STOPPING        CLEARING
 STOPPED        |    RUNNING         ----            CLEARING
 
-STOPPING -> (redraw all points) -> STOPPED                                           
+STOPPING -> redraw current plot data -> STOPPED
 CLEARING -> (clear all points) -> IDLE
+
+Plot data pipeline:
+DataModel source -> curve transform -> time-window clip -> PlotWidget.
+AutoX controls the clip window rule. Pan/zoom controls the ViewBox and exits
+AutoX, but does not rewrite t_now_line. Pause exits AutoX/AutoY and freezes
+t_now_line; resume restores the Auto states from before pause.
 '''
 
 
@@ -43,7 +51,7 @@ class PlotState(Enum):
 class PlotWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Monitor v2.2.0")
+        self.setWindowTitle("Monitor v2.3.0")
 
         self.tf_variables = ["F_X", "F_Y", "F_Z", "T_X", "T_Y", "T_Z"]
         self.mocap_variable_templates = [
@@ -86,14 +94,24 @@ class PlotWindow(QWidget):
         # 缁樺浘绐楀彛
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.showGrid(x=True, y=True)
+        self.plot_widget.enableAutoRange(axis=1, enable=False)
         self.view_box = self.plot_widget.getViewBox()
         self.view_box.sigRangeChangedManually.connect(self.manual_scroll)
         self.curves = {}  # 鍙橀噺鍚?-> 鏇茬嚎
         self.colors = {}  # 褰撳墠棰滆壊
         self.default_colors = {}  # 榛樿棰滆壊
+        self.curve_transforms = {}
+        self.selected_var_name = None
+        self.selected_curve_focus_active = False
+        self.selected_hover_point = None
+        self.hover_hit_px = 48.0
+        self._plot_mouse_press_curve_selected = False
+        self._updating_selected_controls = False
         self.fully_plotted = False
         self.auto_scroll_enabled = True
+        self.auto_scroll_enabled_before_pause = True
         self.auto_y_enabled = True
+        self.auto_y_enabled_before_pause = True
 
         # 鏃堕棿杞村彉閲?
         self.reception_start_time = time.time() * 1000  # ms
@@ -389,6 +407,51 @@ class PlotWindow(QWidget):
         control_layout.addStretch()
         control_layout.addWidget(self.open_capture_btn)
 
+        selected_plot_layout = QHBoxLayout()
+        selected_plot_layout.setContentsMargins(0, 0, 0, 0)
+        selected_plot_layout.setSpacing(6)
+        self.selected_plot_value = QLabel("-")
+        self.selected_plot_value.setMinimumWidth(180)
+        self.selected_coord_value = QLabel("")
+        self.selected_coord_value.setMinimumWidth(150)
+
+        self.selected_color_btn = QPushButton()
+        self.selected_color_btn.setFixedSize(42, 22)
+        self.selected_color_btn.clicked.connect(self.change_selected_curve_color)
+
+        self.selected_phase_spin = QDoubleSpinBox()
+        self.selected_phase_spin.setRange(-3600000.0, 3600000.0)
+        self.selected_phase_spin.setDecimals(3)
+        self.selected_phase_spin.setSingleStep(10.0)
+        self.selected_phase_spin.setSuffix(" ms")
+        self.selected_phase_spin.valueChanged.connect(self._selected_transform_changed)
+
+        self.selected_offset_spin = QDoubleSpinBox()
+        self.selected_offset_spin.setRange(-1000000000.0, 1000000000.0)
+        self.selected_offset_spin.setDecimals(6)
+        self.selected_offset_spin.setSingleStep(1.0)
+        self.selected_offset_spin.valueChanged.connect(self._selected_transform_changed)
+
+        self.selected_scale_spin = QDoubleSpinBox()
+        self.selected_scale_spin.setRange(-1000000000.0, 1000000000.0)
+        self.selected_scale_spin.setDecimals(6)
+        self.selected_scale_spin.setSingleStep(0.1)
+        self.selected_scale_spin.valueChanged.connect(self._selected_transform_changed)
+
+        selected_plot_layout.addWidget(QLabel("Selected plot:"))
+        selected_plot_layout.addWidget(self.selected_plot_value)
+        selected_plot_layout.addWidget(self.selected_coord_value)
+        selected_plot_layout.addWidget(QLabel("color:"))
+        selected_plot_layout.addWidget(self.selected_color_btn)
+        selected_plot_layout.addWidget(QLabel("phase:"))
+        selected_plot_layout.addWidget(self.selected_phase_spin)
+        selected_plot_layout.addWidget(QLabel("offset:"))
+        selected_plot_layout.addWidget(self.selected_offset_spin)
+        selected_plot_layout.addWidget(QLabel("scale:"))
+        selected_plot_layout.addWidget(self.selected_scale_spin)
+        selected_plot_layout.addStretch()
+        self._update_selected_controls()
+
         hline_1 = QFrame()
         hline_1.setFrameShape(QFrame.HLine)
         hline_1.setFrameShadow(QFrame.Sunken)
@@ -400,10 +463,17 @@ class PlotWindow(QWidget):
         main_layout = QVBoxLayout()
         main_layout.addLayout(setting_layout)
         main_layout.addWidget(self.plot_widget, 1)
+        main_layout.addLayout(selected_plot_layout)
         main_layout.addLayout(control_layout)
         main_layout.addWidget(hline_1)  # 鈫?鎻掑叆姘村钩鍒嗛殧绾?
         main_layout.addLayout(variable_layout)
         self.setLayout(main_layout)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.plot_widget.setFocusPolicy(Qt.StrongFocus)
+        self.plot_widget.setMouseTracking(True)
+        self.plot_widget.viewport().setMouseTracking(True)
+        self.plot_widget.installEventFilter(self)
+        self.plot_widget.viewport().installEventFilter(self)
 
         # 鐢诲竷鍐呯敾鍏夋爣鏄剧ず鏁板瓧绛?
         self.now_line = pg.InfiniteLine(angle=90, movable=False,
@@ -412,6 +482,20 @@ class PlotWindow(QWidget):
                                           pen=pg.mkPen('y', width=2, style=Qt.CustomDashLine, dash=[5, 5, 1, 5]))
         self.plot_widget.addItem(self.now_line)
         self.plot_widget.addItem(self.begin_line)
+        self.selected_hover_marker = pg.ScatterPlotItem(
+            size=11,
+            pen=pg.mkPen((255, 255, 255), width=2),
+            brush=pg.mkBrush(255, 64, 64, 210),
+        )
+        self.selected_hover_marker.setVisible(False)
+        self.plot_widget.addItem(self.selected_hover_marker)
+        hover_pen = pg.mkPen((255, 0, 0, 235), width=1, style=Qt.DashLine)
+        self.selected_hover_vline = pg.InfiniteLine(angle=90, movable=False, pen=hover_pen)
+        self.selected_hover_hline = pg.InfiniteLine(angle=0, movable=False, pen=hover_pen)
+        self.selected_hover_vline.setVisible(False)
+        self.selected_hover_hline.setVisible(False)
+        self.plot_widget.addItem(self.selected_hover_vline)
+        self.plot_widget.addItem(self.selected_hover_hline)
 
         # self.plot_widget.showAxis('top', show=True)
         # self.x_axis = self.plot_widget.getAxis('top')
@@ -673,20 +757,37 @@ class PlotWindow(QWidget):
     def update_window_duration(self, value):
         self.fixed_window_seconds = value
 
+    def _set_auto_checkboxes_silent(self, auto_x, auto_y):
+        self.auto_x.blockSignals(True)
+        self.auto_y.blockSignals(True)
+        self.auto_x.setChecked(bool(auto_x))
+        self.auto_y.setChecked(bool(auto_y))
+        self.auto_y.blockSignals(False)
+        self.auto_x.blockSignals(False)
+
     def set_auto_scroll_enabled(self, state):
-        self.auto_scroll_enabled = (state == 2)
+        enabled = (state == Qt.Checked)
+        if self.auto_scroll_enabled == enabled:
+            return
+        self.auto_scroll_enabled = enabled
+        self.refresh_all_curves(visible_only=True)
 
     def set_auto_y_enabled(self, state):
-        self.auto_y_enabled = (state == 2)
-        self.plot_widget.enableAutoRange(axis=1, enable=self.auto_y_enabled)
+        self.auto_y_enabled = (state == Qt.Checked)
+        self.plot_widget.enableAutoRange(axis=1, enable=False)
+        if self.auto_y_enabled:
+            self._apply_auto_y_range()
 
     def manual_scroll(self):
+        auto_x_was_enabled = self.auto_scroll_enabled
         if self.auto_y_enabled:
             self.auto_y_enabled = False
             self.auto_y.setChecked(False)
         if self.auto_scroll_enabled:
             self.auto_scroll_enabled = False
             self.auto_x.setChecked(False)
+        if auto_x_was_enabled:
+            self.refresh_all_curves(visible_only=True)
 
     def get_default_color(self, var_name):
         """Return the default curve color for a variable."""
@@ -788,6 +889,12 @@ class PlotWindow(QWidget):
         if self.plot_state == PlotState.RUNNING:
             print(self.plot_state)
             # self.data_receiver.stop()
+            self.auto_scroll_enabled_before_pause = self.auto_scroll_enabled
+            self.auto_y_enabled_before_pause = self.auto_y_enabled
+            self.auto_scroll_enabled = False
+            self.auto_y_enabled = False
+            self._set_auto_checkboxes_silent(False, False)
+            self.plot_widget.enableAutoRange(axis=1, enable=False)
             self.toggle_reception_btn.setText("Disable...")
             self.toggle_reception_btn.setStyleSheet("background-color: gray")
             self.plot_state = PlotState.STOPPING
@@ -803,13 +910,428 @@ class PlotWindow(QWidget):
             print(self.plot_state)
             self.toggle_reception_btn.setText("Pause")
             self.toggle_reception_btn.setStyleSheet("background-color: lightblue")
+            self.auto_scroll_enabled = bool(self.auto_scroll_enabled_before_pause)
+            self.auto_y_enabled = bool(self.auto_y_enabled_before_pause)
+            self._set_auto_checkboxes_silent(self.auto_scroll_enabled, self.auto_y_enabled)
             self.plot_state = PlotState.RUNNING
+            self.refresh_all_curves(visible_only=True)
             return
 
 
     def auto_scale_all(self):
         self.auto_x.setChecked(True)
         self.auto_y.setChecked(True)
+
+    @staticmethod
+    def _default_curve_transform():
+        return {"phase_ms": 0.0, "scale": 1.0, "offset": 0.0}
+
+    def _get_curve_transform(self, var_name):
+        return self.curve_transforms.get(var_name, self._default_curve_transform())
+
+    @staticmethod
+    def _is_default_curve_transform(transform):
+        return (
+            abs(float(transform.get("phase_ms", 0.0))) < 1e-9 and
+            abs(float(transform.get("scale", 1.0)) - 1.0) < 1e-12 and
+            abs(float(transform.get("offset", 0.0))) < 1e-12
+        )
+
+    def _curve_source_data(self, var_name):
+        return self.data_model.get_series(var_name, None)
+
+    def _transform_curve_data(self, var_name, ts, vs):
+        transform = self._get_curve_transform(var_name)
+        if self._is_default_curve_transform(transform):
+            return ts, vs
+
+        phase_ms = float(transform.get("phase_ms", 0.0))
+        scale = float(transform.get("scale", 1.0))
+        offset = float(transform.get("offset", 0.0))
+
+        ts_out = [float(t) + phase_ms for t in ts] if abs(phase_ms) >= 1e-9 else ts
+        vs_out = [(float(v) * scale) + offset for v in vs]
+        return ts_out, vs_out
+
+    def _clip_window_range(self):
+        clip_end = self.window_now
+        if self.auto_scroll_enabled:
+            return clip_end - self.fixed_window_seconds * 1000, clip_end
+        return self.reception_start_time, clip_end
+
+    def _clip_curve_to_time_window(self, ts, vs):
+        window_start, window_end = self._clip_window_range()
+        clipped_ts = []
+        clipped_vs = []
+        for t, v in zip(ts, vs):
+            if window_start <= t <= window_end:
+                clipped_ts.append(t)
+                clipped_vs.append(v)
+        return clipped_ts, clipped_vs
+
+    def _curve_plot_data(self, var_name):
+        ts, vs = self._curve_source_data(var_name)
+        if not ts:
+            return [], []
+
+        ts, vs = self._transform_curve_data(var_name, ts, vs)
+        return self._clip_curve_to_time_window(ts, vs)
+
+    def refresh_curve(self, var_name, update_auto_y=True):
+        curve = self.curves.get(var_name)
+        if curve is None:
+            return
+
+        if self.plot_state == PlotState.IDLE:
+            curve.setData([], [])
+            self._hide_selected_hover_point()
+            return
+
+        ts_plot, vs_plot = self._curve_plot_data(var_name)
+        curve.setData(ts_plot, vs_plot)
+        if var_name == self.selected_var_name:
+            self._update_selected_hover_point()
+        if update_auto_y:
+            self._apply_auto_y_range()
+
+    def refresh_all_curves(self, visible_only=False):
+        for var_name in self.signal_variables:
+            curve = self.curves.get(var_name)
+            if curve is None or (visible_only and not curve.isVisible()):
+                continue
+            self.refresh_curve(var_name, update_auto_y=False)
+        self._apply_auto_y_range()
+
+    @staticmethod
+    def _color_button_style(rgb):
+        return f"background-color: rgb{rgb}; border: 1px solid #606060;"
+
+    def _update_selected_color_button(self, rgb):
+        self.selected_color_btn.setStyleSheet(self._color_button_style(rgb))
+
+    @staticmethod
+    def _value_style(is_active):
+        return "color: #d00000;" if is_active else ""
+
+    def _update_transform_control_styles(self, transform, has_selection):
+        if not has_selection:
+            self.selected_phase_spin.setStyleSheet("")
+            self.selected_offset_spin.setStyleSheet("")
+            self.selected_scale_spin.setStyleSheet("")
+            return
+
+        phase = float(transform.get("phase_ms", 0.0))
+        offset = float(transform.get("offset", 0.0))
+        scale = float(transform.get("scale", 1.0))
+        self.selected_phase_spin.setStyleSheet(self._value_style(abs(phase) >= 1e-9))
+        self.selected_offset_spin.setStyleSheet(self._value_style(abs(offset) >= 1e-12))
+        self.selected_scale_spin.setStyleSheet(self._value_style(abs(scale - 1.0) >= 1e-12))
+
+    def _update_selected_controls(self):
+        var_name = self.selected_var_name
+        has_selection = bool(var_name and var_name in self.curves)
+        transform = self._get_curve_transform(var_name) if has_selection else self._default_curve_transform()
+        color = self.colors.get(var_name, (64, 64, 64)) if has_selection else (48, 48, 48)
+
+        self._updating_selected_controls = True
+        self.selected_plot_value.setText(var_name if has_selection else "-")
+        self._update_selected_color_button(color)
+        self.selected_color_btn.setEnabled(has_selection)
+        self.selected_phase_spin.setEnabled(has_selection)
+        self.selected_offset_spin.setEnabled(has_selection)
+        self.selected_scale_spin.setEnabled(has_selection)
+        self.selected_phase_spin.setValue(float(transform.get("phase_ms", 0.0)))
+        self.selected_offset_spin.setValue(float(transform.get("offset", 0.0)))
+        self.selected_scale_spin.setValue(float(transform.get("scale", 1.0)))
+        self._update_transform_control_styles(transform, has_selection)
+        if not has_selection:
+            self.selected_coord_value.setText("")
+            self.selected_coord_value.setStyleSheet("")
+        self._updating_selected_controls = False
+
+    def _store_curve_transform(self, var_name, transform, update_controls=True):
+        if var_name not in self.curves:
+            return
+
+        if self._is_default_curve_transform(transform):
+            self.curve_transforms.pop(var_name, None)
+        else:
+            self.curve_transforms[var_name] = dict(transform)
+
+        self.refresh_curve(var_name)
+        if update_controls and var_name == self.selected_var_name:
+            self._update_selected_controls()
+
+    def _selected_transform_changed(self, *_args):
+        if self._updating_selected_controls:
+            return
+
+        var_name = self.selected_var_name
+        if not var_name or var_name not in self.curves:
+            return
+
+        transform = {
+            "phase_ms": float(self.selected_phase_spin.value()),
+            "scale": float(self.selected_scale_spin.value()),
+            "offset": float(self.selected_offset_spin.value()),
+        }
+        self._update_transform_control_styles(transform, True)
+        self._store_curve_transform(var_name, transform, update_controls=False)
+
+    def shift_curve_phase(self, var_name, delta_ms):
+        transform = dict(self._get_curve_transform(var_name))
+        transform["phase_ms"] = float(transform.get("phase_ms", 0.0)) + float(delta_ms)
+        self._store_curve_transform(var_name, transform)
+
+    def shift_curve_offset(self, var_name, delta):
+        transform = dict(self._get_curve_transform(var_name))
+        transform["offset"] = float(transform.get("offset", 0.0)) + float(delta)
+        self._store_curve_transform(var_name, transform)
+
+    def reset_curve_transform(self, var_name):
+        self._store_curve_transform(var_name, self._default_curve_transform())
+
+    def _curve_pen_width(self, var_name):
+        return 4 if var_name == self.selected_var_name and self.selected_curve_focus_active else 2
+
+    def _update_curve_pen(self, var_name):
+        curve = self.curves.get(var_name)
+        if curve is None:
+            return
+        color = self.colors.get(var_name, self.get_default_color(var_name))
+        curve.setPen(pg.mkPen(color=color, width=self._curve_pen_width(var_name)))
+
+    def _set_selected_curve_focus_active(self, active):
+        if self.selected_curve_focus_active == active:
+            return
+        self.selected_curve_focus_active = active
+        if self.selected_var_name in self.curves:
+            self._update_curve_pen(self.selected_var_name)
+        if not active:
+            self._hide_selected_hover_point()
+
+    def select_curve(self, var_name):
+        if var_name not in self.curves:
+            return
+
+        self._plot_mouse_press_curve_selected = True
+        previous = self.selected_var_name
+        self.selected_var_name = var_name
+        self.selected_curve_focus_active = True
+        if previous and previous in self.curves and previous != var_name:
+            self._update_curve_pen(previous)
+            self._hide_selected_hover_point()
+        self._update_curve_pen(var_name)
+        self._update_selected_controls()
+        self._update_selected_hover_point()
+        self.plot_widget.setFocus()
+
+    def change_selected_curve_color(self):
+        var_name = self.selected_var_name
+        if not var_name or var_name not in self.curves:
+            return
+
+        current = self.colors.get(var_name, self.get_default_color(var_name))
+        dialog = QColorDialog(QColor(*current), self.window())
+        dialog.setOption(QColorDialog.DontUseNativeDialog, True)
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setWindowFlags(dialog.windowFlags() | Qt.WindowStaysOnTopHint)
+        dialog.resize(420, 320)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+        if dialog.exec_() != QColorDialog.Accepted:
+            return
+
+        selected = dialog.selectedColor()
+        if selected.isValid():
+            self.set_curve_color(var_name, selected.getRgb()[:3])
+
+    def _connect_curve_click(self, curve, var_name):
+        if hasattr(curve, "setCurveClickable"):
+            curve.setCurveClickable(True, width=24)
+        if hasattr(curve, "sigClicked"):
+            curve.sigClicked.connect(lambda *_args, name=var_name: self.select_curve(name))
+
+    def _handle_curve_key_event(self, event):
+        var_name = self.selected_var_name
+        if not var_name or var_name not in self.curves or not self.selected_curve_focus_active:
+            return False
+
+        key = event.key()
+        if key == Qt.Key_Left:
+            self.shift_curve_phase(var_name, -10.0)
+            return True
+        if key == Qt.Key_Right:
+            self.shift_curve_phase(var_name, 10.0)
+            return True
+        if key == Qt.Key_Up:
+            self.shift_curve_offset(var_name, 1.0)
+            return True
+        if key == Qt.Key_Down:
+            self.shift_curve_offset(var_name, -1.0)
+            return True
+        return False
+
+    def _hide_selected_hover_point(self):
+        self.selected_hover_point = None
+        if hasattr(self, "selected_hover_marker"):
+            self.selected_hover_marker.setVisible(False)
+        if hasattr(self, "selected_hover_vline"):
+            self.selected_hover_vline.setVisible(False)
+        if hasattr(self, "selected_hover_hline"):
+            self.selected_hover_hline.setVisible(False)
+        self.selected_coord_value.setText("")
+        self.selected_coord_value.setStyleSheet("")
+
+    def _nearest_selected_point(self, x_value):
+        var_name = self.selected_var_name
+        curve = self.curves.get(var_name)
+        if curve is None or curve.xData is None or curve.yData is None:
+            return None
+
+        xs = list(curve.xData)
+        ys = list(curve.yData)
+        count = min(len(xs), len(ys))
+        if count == 0:
+            return None
+
+        idx = bisect_left(xs, x_value)
+        candidates = []
+        if 0 <= idx < count:
+            candidates.append(idx)
+        if 0 <= idx - 1 < count:
+            candidates.append(idx - 1)
+        if not candidates:
+            return None
+
+        best_idx = min(candidates, key=lambda i: abs(float(xs[i]) - float(x_value)))
+        return float(xs[best_idx]), float(ys[best_idx])
+
+    def _point_scene_distance_px(self, x_value, y_value, mouse_scene_pos):
+        point_scene = self.view_box.mapViewToScene(QPointF(float(x_value), float(y_value)))
+        dx = float(point_scene.x()) - float(mouse_scene_pos.x())
+        dy = float(point_scene.y()) - float(mouse_scene_pos.y())
+        return math.hypot(dx, dy)
+
+    def _update_selected_coord_label(self, x_value, y_value):
+        t_s = (float(x_value) - self.reception_start_time) / 1000.0
+        self.selected_coord_value.setText(f"({t_s:.3f} s, {float(y_value):.3f})")
+        self.selected_coord_value.setStyleSheet("color: #d00000;")
+
+    def _show_selected_hover_point(self, x_value, y_value):
+        self.selected_hover_point = (x_value, y_value)
+        self.selected_hover_marker.setData([x_value], [y_value])
+        self.selected_hover_marker.setVisible(True)
+        self.selected_hover_vline.setValue(x_value)
+        self.selected_hover_hline.setValue(y_value)
+        self.selected_hover_vline.setVisible(True)
+        self.selected_hover_hline.setVisible(True)
+        self._update_selected_coord_label(x_value, y_value)
+
+    def _update_selected_hover_point(self, mouse_x=None, mouse_scene_pos=None):
+        if not self.selected_curve_focus_active or not self.selected_var_name:
+            self._hide_selected_hover_point()
+            return
+
+        if mouse_x is None and self.selected_hover_point is not None:
+            mouse_x = self.selected_hover_point[0]
+        if mouse_x is None:
+            return
+
+        point = self._nearest_selected_point(float(mouse_x))
+        if point is None:
+            self._hide_selected_hover_point()
+            return
+
+        x_value, y_value = point
+        if mouse_scene_pos is not None:
+            distance_px = self._point_scene_distance_px(x_value, y_value, mouse_scene_pos)
+            if distance_px > self.hover_hit_px:
+                self._hide_selected_hover_point()
+                return
+
+        self._show_selected_hover_point(x_value, y_value)
+
+    def _handle_plot_mouse_press(self, event):
+        if event.button() != Qt.LeftButton:
+            return False
+        self._plot_mouse_press_curve_selected = False
+        QTimer.singleShot(0, self._deactivate_selected_curve_after_blank_click)
+        return False
+
+    def _deactivate_selected_curve_after_blank_click(self):
+        if not self._plot_mouse_press_curve_selected:
+            self._set_selected_curve_focus_active(False)
+
+    def _handle_plot_mouse_move(self, event):
+        if not self.selected_curve_focus_active or not self.selected_var_name:
+            return False
+        try:
+            scene_pos = self.plot_widget.mapToScene(event.pos())
+            view_pos = self.view_box.mapSceneToView(scene_pos)
+        except Exception:
+            return False
+        self._update_selected_hover_point(mouse_x=float(view_pos.x()), mouse_scene_pos=scene_pos)
+        return False
+
+    def _visible_curve_y_bounds(self):
+        y_min = None
+        y_max = None
+        for curve in self.curves.values():
+            if curve is None or not curve.isVisible() or curve.yData is None:
+                continue
+            for value in curve.yData:
+                try:
+                    y = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(y):
+                    continue
+                y_min = y if y_min is None else min(y_min, y)
+                y_max = y if y_max is None else max(y_max, y)
+        if y_min is None or y_max is None:
+            return None
+        return y_min, y_max
+
+    def _apply_auto_y_range(self):
+        if not self.auto_y_enabled:
+            return
+        bounds = self._visible_curve_y_bounds()
+        if bounds is None:
+            return
+        y_min, y_max = bounds
+        if abs(y_max - y_min) < 1e-12:
+            pad = max(abs(y_min) * 0.1, 1.0)
+        else:
+            pad = abs(y_max - y_min) * 0.05
+        self.plot_widget.setYRange(y_min - pad, y_max + pad, padding=0)
+
+    def eventFilter(self, obj, event):
+        if obj in (self.plot_widget, self.plot_widget.viewport()):
+            if event.type() == QEvent.FocusIn:
+                if self.selected_var_name:
+                    self._set_selected_curve_focus_active(True)
+            elif event.type() == QEvent.FocusOut:
+                self._set_selected_curve_focus_active(False)
+            elif event.type() == QEvent.Leave:
+                self._hide_selected_hover_point()
+            elif event.type() == QEvent.MouseButtonPress:
+                self._handle_plot_mouse_press(event)
+            elif event.type() == QEvent.MouseMove:
+                self._handle_plot_mouse_move(event)
+            elif event.type() == QEvent.KeyPress:
+                if self._handle_curve_key_event(event):
+                    return True
+        return super().eventFilter(obj, event)
+
+    def keyPressEvent(self, event):
+        focus_widget = self.focusWidget()
+        input_widgets = (QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox)
+        if not isinstance(focus_widget, input_widgets) and self._handle_curve_key_event(event):
+            return
+        super().keyPressEvent(event)
 
     def update_plot(self):
         if self.plot_state == PlotState.IDLE or self.plot_state == PlotState.STOPPED:
@@ -820,53 +1342,40 @@ class PlotWindow(QWidget):
                 self.curves[var].setData([], [])
             return
 
-        # 鏆傚仠鏃剁珛鍒荤粯鍒舵墍鏈夋暟鎹紙渚夸簬csv鏀堕泦鎵€鏈夋暟鎹級
+        # Pause freezes the time window; DataModel can still receive data.
         if self.plot_state == PlotState.STOPPING:
             for var in self.signal_variables:
-                ts, vs = self.data_model.get_series(var, None)
+                ts, vs = self._curve_plot_data(var)
                 self.curves[var].setData(ts, vs)
+            self._apply_auto_y_range()
             return
 
-        # 楂樻€ц兘闃插崱椤?
         if self.plot_state == PlotState.RUNNING:
-            window_start = self.window_start
-            window_end = self.window_now
-
             for var in self.signal_variables:
                 if not self.curves[var].isVisible():
                     continue  # 璺宠繃闅愯棌鏇茬嚎
 
-                if self.auto_scroll_enabled:
-                    ts, vs = self.data_model.get_series_fast(var, self.fixed_window_seconds * 1000)
-                    if not ts:
-                        continue  # 鏃犳暟鎹垯璺宠繃
-                    # 鍙繚鐣欑獥鍙ｅ唴鏁版嵁
-                    idx_range = [i for i, t in enumerate(ts) if window_start <= t <= window_end]
-                    if not idx_range:
-                        if self.curves[var].xData is not None and len(self.curves[var].xData) > 0:
-                            self.curves[var].setData([], [])  # 鏈夋暟鎹?-> 鏃犳暟鎹墠闇€瑕佹竻闄?
-                        continue
-
-                    # 鍒囩墖鏁版嵁
-                    i_min = idx_range[0]
-                    i_max = idx_range[-1] + 1
-                    ts_window = ts[i_min:i_max]
-                    vs_window = vs[i_min:i_max]
-                else:
-                    ts, vs = self.data_model.get_series(var, None)
-                    if not ts:
-                        continue  # 鏃犳暟鎹垯璺宠繃
-                    # 鎵嬪姩妯″紡锛氭樉绀哄叏閮ㄦ暟鎹?
-                    ts_window = ts
-                    vs_window = vs
+                ts_plot, vs_plot = self._curve_plot_data(var)
+                if not ts_plot:
+                    if self.curves[var].xData is not None and len(self.curves[var].xData) > 0:
+                        self.curves[var].setData([], [])  # 鏈夋暟鎹?-> 鏃犳暟鎹墠闇€瑕佹竻闄?
+                    if var == self.selected_var_name:
+                        self._hide_selected_hover_point()
+                    continue
 
                 # 浠呭湪鏁版嵁鍙樺寲鏃舵洿鏂?
                 if (
                         self.curves[var].xData is None or
-                        len(self.curves[var].xData) != len(ts_window) or
-                        (ts_window and self.curves[var].xData[-1] != ts_window[-1])
+                        len(self.curves[var].xData) != len(ts_plot) or
+                        (ts_plot and self.curves[var].xData[-1] != ts_plot[-1]) or
+                        self.curves[var].yData is None or
+                        (vs_plot and self.curves[var].yData[-1] != vs_plot[-1])
                 ):
-                    self.curves[var].setData(ts_window, vs_window)
+                    self.curves[var].setData(ts_plot, vs_plot)
+                    if var == self.selected_var_name:
+                        self._update_selected_hover_point()
+
+            self._apply_auto_y_range()
 
     # plot window鏃堕棿鎴虫洿鏂?
     def update_cursor(self):
@@ -908,6 +1417,12 @@ class PlotWindow(QWidget):
         self.toggle_reception_btn.setText("Start Receive")
         self.toggle_reception_btn.setStyleSheet("background-color: orange")
 
+    def _connect_variable_control(self, ctrl):
+        ctrl.selected.connect(self.select_curve)
+        ctrl.visibility_changed.connect(self.set_curve_visibility)
+        ctrl.color_changed.connect(self.set_curve_color)
+        ctrl.transform_reset_requested.connect(self.reset_curve_transform)
+
     def _register_variable(self, var_name, checked, grid, columns, count_attr, create_control=True):
         if not var_name or var_name in self.curves:
             return False
@@ -915,14 +1430,14 @@ class PlotWindow(QWidget):
         color = self.get_default_color(var_name)
         curve = self.plot_widget.plot(pen=pg.mkPen(color=color, width=2), name=var_name)
         curve.setVisible(bool(checked))
+        self._connect_curve_click(curve, var_name)
         self.curves[var_name] = curve
         self.colors[var_name] = color
         self.default_colors[var_name] = color
 
         if create_control:
             ctrl = VariableControlItem(var_name, color, color, checked=bool(checked))
-            ctrl.visibility_changed.connect(self.set_curve_visibility)
-            ctrl.color_changed.connect(self.set_curve_color)
+            self._connect_variable_control(ctrl)
             self.var_controls[var_name] = ctrl
 
             if grid is not None:
@@ -1018,8 +1533,7 @@ class PlotWindow(QWidget):
             elif var_name not in self.var_controls:
                 color = self.colors.get(var_name, self.get_default_color(var_name))
                 ctrl = VariableControlItem(var_name, color, color, checked=self.curves[var_name].isVisible())
-                ctrl.visibility_changed.connect(self.set_curve_visibility)
-                ctrl.color_changed.connect(self.set_curve_color)
+                self._connect_variable_control(ctrl)
                 self.var_controls[var_name] = ctrl
 
             if var_name not in self.dynamic_signal_variables:
@@ -1056,12 +1570,25 @@ class PlotWindow(QWidget):
     def set_curve_visibility(self, var_name, visible):
         if var_name in self.curves:
             self.curves[var_name].setVisible(visible)
+            if visible:
+                self.refresh_curve(var_name)
+            else:
+                if var_name == self.selected_var_name:
+                    self._hide_selected_hover_point()
+                self._apply_auto_y_range()
 
     def set_curve_color(self, var_name, rgb):
         """Set the curve color for a variable."""
         if var_name in self.curves:
             self.colors[var_name] = rgb
-            self.curves[var_name].setPen(pg.mkPen(color=rgb, width=2))
+            self._update_curve_pen(var_name)
+
+            ctrl = self.var_controls.get(var_name)
+            if ctrl is not None:
+                ctrl.set_color(rgb)
+
+            if var_name == self.selected_var_name:
+                self._update_selected_controls()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1076,5 +1603,3 @@ class PlotWindow(QWidget):
         except Exception:
             pass
         event.accept()
-
-

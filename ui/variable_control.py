@@ -1,10 +1,13 @@
+from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import QWidget, QHBoxLayout, QCheckBox, QLabel, QMenu, QColorDialog, QSizePolicy
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import QEvent, Qt, pyqtSignal
 
 
 class VariableControlItem(QWidget):
+    selected = pyqtSignal(str)
     visibility_changed = pyqtSignal(str, bool)
     color_changed = pyqtSignal(str, tuple)
+    transform_reset_requested = pyqtSignal(str)
 
     def __init__(self, var_name, color, default_color, checked=True):
         super().__init__()
@@ -29,6 +32,7 @@ class VariableControlItem(QWidget):
         self.label.setWordWrap(False)
         self.label.setContextMenuPolicy(3)
         self.label.customContextMenuRequested.connect(self.show_context_menu)
+        self.label.installEventFilter(self)
         layout.addWidget(self.label)
 
         self.setLayout(layout)
@@ -44,21 +48,48 @@ class VariableControlItem(QWidget):
         menu = QMenu(self)
         change_color_action = menu.addAction("Change color")
         reset_color_action = menu.addAction("Default color")
+        menu.addSeparator()
+        reset_transform_action = menu.addAction("Reset transform")
         action = menu.exec_(self.label.mapToGlobal(pos))
         if action == change_color_action:
             self.change_color()
         elif action == reset_color_action:
             self.reset_color()
+        elif action == reset_transform_action:
+            self.transform_reset_requested.emit(self.var_name)
+
+    def eventFilter(self, obj, event):
+        if obj is self.label and event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            self.selected.emit(self.var_name)
+        return super().eventFilter(obj, event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.selected.emit(self.var_name)
+        super().mousePressEvent(event)
+
+    def set_color(self, rgb):
+        self.color = rgb
+        self._apply_label_style(rgb)
 
     def change_color(self):
-        color = QColorDialog.getColor()
-        if color.isValid():
-            rgb = color.getRgb()[:3]
-            self.color = rgb
-            self._apply_label_style(rgb)
+        dialog = QColorDialog(QColor(*self.color), self.window())
+        dialog.setOption(QColorDialog.DontUseNativeDialog, True)
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setWindowFlags(dialog.windowFlags() | Qt.WindowStaysOnTopHint)
+        dialog.resize(420, 320)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+        if dialog.exec_() == QColorDialog.Accepted:
+            selected = dialog.selectedColor()
+            if not selected.isValid():
+                return
+            rgb = selected.getRgb()[:3]
+            self.set_color(rgb)
             self.color_changed.emit(self.var_name, rgb)
 
     def reset_color(self):
-        self.color = self.default_color
-        self._apply_label_style(self.default_color)
+        self.set_color(self.default_color)
         self.color_changed.emit(self.var_name, self.default_color)
