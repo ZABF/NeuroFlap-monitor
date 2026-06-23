@@ -2,12 +2,12 @@ from PyQt5.QtGui import QColor, QPen
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QCheckBox, QLabel, QSpinBox, QGridLayout, QMessageBox, QLineEdit, QComboBox, QFrame, QTabWidget, QGroupBox,
-    QScrollArea, QLayout, QColorDialog, QDoubleSpinBox
+    QScrollArea, QLayout, QColorDialog, QDoubleSpinBox, QFileDialog
 )
 from PyQt5.QtCore import QEvent, QPointF, QTimer, Qt
 from bisect import bisect_left
+import csv
 import math
-from pyqtgraph.exporters import CSVExporter
 import pyqtgraph as pg
 import time
 from datetime import datetime
@@ -101,6 +101,8 @@ class PlotWindow(QWidget):
         self.colors = {}  # 褰撳墠棰滆壊
         self.default_colors = {}  # 榛樿棰滆壊
         self.curve_transforms = {}
+        self.derived_curve_sources = {}
+        self.derived_curve_children = {}
         self.selected_var_name = None
         self.selected_curve_focus_active = False
         self.selected_hover_point = None
@@ -141,6 +143,9 @@ class PlotWindow(QWidget):
         # CSV export button
         self.export_button = QPushButton("Export CSV", self)
         self.export_button.clicked.connect(self.export_csv)
+
+        self.import_button = QPushButton("Import CSV", self)
+        self.import_button.clicked.connect(self.import_csv)
 
         self.window_spin = QSpinBox()
         self.window_spin.setRange(1, 60)
@@ -394,6 +399,7 @@ class PlotWindow(QWidget):
         setting_layout.addWidget(QLabel("CSV Filename:"))
         setting_layout.addWidget(self.export_filename_edit)
         setting_layout.addWidget(self.export_button)
+        setting_layout.addWidget(self.import_button)
         setting_layout.addStretch()
         setting_layout.addWidget(QLabel("Window Width:"))
         setting_layout.addWidget(self.window_spin)
@@ -419,6 +425,15 @@ class PlotWindow(QWidget):
         self.selected_color_btn.setFixedSize(42, 22)
         self.selected_color_btn.clicked.connect(self.change_selected_curve_color)
 
+        self.selected_visible_check = QCheckBox("Visible")
+        self.selected_visible_check.setFocusPolicy(Qt.NoFocus)
+        self.selected_visible_check.stateChanged.connect(self._selected_visibility_changed)
+
+        self.selected_derivative_btn = QPushButton("d/dt")
+        self.selected_derivative_btn.setFixedWidth(52)
+        self.selected_derivative_btn.setFocusPolicy(Qt.NoFocus)
+        self.selected_derivative_btn.clicked.connect(self.create_selected_derivative_curve)
+
         self.selected_phase_spin = QDoubleSpinBox()
         self.selected_phase_spin.setRange(-3600000.0, 3600000.0)
         self.selected_phase_spin.setDecimals(3)
@@ -438,8 +453,15 @@ class PlotWindow(QWidget):
         self.selected_scale_spin.setSingleStep(0.1)
         self.selected_scale_spin.valueChanged.connect(self._selected_transform_changed)
 
+        self.selected_reset_btn = QPushButton("Reset")
+        self.selected_reset_btn.setFixedWidth(58)
+        self.selected_reset_btn.setFocusPolicy(Qt.NoFocus)
+        self.selected_reset_btn.clicked.connect(self.reset_selected_transform)
+
         selected_plot_layout.addWidget(QLabel("Selected plot:"))
         selected_plot_layout.addWidget(self.selected_plot_value)
+        selected_plot_layout.addWidget(self.selected_visible_check)
+        selected_plot_layout.addWidget(self.selected_derivative_btn)
         selected_plot_layout.addWidget(self.selected_coord_value)
         selected_plot_layout.addWidget(QLabel("color:"))
         selected_plot_layout.addWidget(self.selected_color_btn)
@@ -449,6 +471,7 @@ class PlotWindow(QWidget):
         selected_plot_layout.addWidget(self.selected_offset_spin)
         selected_plot_layout.addWidget(QLabel("scale:"))
         selected_plot_layout.addWidget(self.selected_scale_spin)
+        selected_plot_layout.addWidget(self.selected_reset_btn)
         selected_plot_layout.addStretch()
         self._update_selected_controls()
 
@@ -705,16 +728,13 @@ class PlotWindow(QWidget):
             self.toggle_bota_btn.setStyleSheet("background-color: orange")
 
     def export_csv(self):
-        """Export the current plot to CSV."""
-        # 1. 鑷姩鍋滄鏁版嵁鎺ユ敹
+        """Export raw source data to a monitor-importable CSV."""
         if self.plot_state == PlotState.RUNNING:
             self.toggle_reception()
 
-        # 2. 鍑嗗淇濆瓨鐩綍
         export_dir = "./csv_data"
         os.makedirs(export_dir, exist_ok=True)
 
-        # 3. 鑾峰彇璺緞锛堣嚜鍔ㄥ懡鍚嶆垨鐢ㄦ埛鑷畾涔夛級
         user_input = self.export_filename_edit.text().strip()
         if user_input:
             path = os.path.join(export_dir, user_input)
@@ -726,23 +746,237 @@ class PlotWindow(QWidget):
         base, ext = os.path.splitext(path)
         if ext.lower() != ".csv":
             ext = ".csv"
-            base = path  # 鐢ㄦ埛鍙兘娌″啓鎵╁睍鍚?
+            base = path
         final_path = base + ext
 
-        # 5. 閬垮厤閲嶅悕锛岃嚜鍔ㄥ姞 _1, _2 绛?
         counter = 1
         while os.path.exists(final_path):
             final_path = f"{base}_{counter}{ext}"
             counter += 1
-            # 6. 鎵ц瀵煎嚭
+
         try:
-            exporter = CSVExporter(self.plot_widget.getPlotItem())
-            exporter.export(final_path)
-            QMessageBox.information(self, "Export successful", f"CSV file exported to锛歕n{final_path}")
-            # 鍙€夛細鍐欏洖璺緞鍒拌緭鍏ユ
-            # self.export_filename_edit.setText(final_path)
+            written = self._write_monitor_csv(final_path)
+            QMessageBox.information(self, "Export successful", f"CSV file exported to:\n{final_path}\nvariables: {written}")
         except Exception as e:
             QMessageBox.critical(self, "Export failed", f"\n{str(e)}")
+
+    def _csv_group_for_var(self, var_name):
+        if var_name in self.dynamic_signal_sections:
+            return self.dynamic_signal_sections.get(var_name) or "Ungrouped"
+        if var_name in self.tf_variables:
+            return "Bota FT"
+        if any(var_name == name for name, _visible in self.mocap_variable_templates):
+            return "MoCap"
+        return "Ungrouped"
+
+    def _write_monitor_csv(self, final_path):
+        series = []
+        for var_name in self.signal_variables:
+            if self._is_derived_curve(var_name):
+                continue
+            ts, vs = self._curve_source_data(var_name)
+            count = min(len(ts), len(vs))
+            if count <= 0:
+                continue
+            series.append((var_name, list(ts)[:count], list(vs)[:count]))
+
+        headers = []
+        for var_name, _ts, _vs in series:
+            headers.extend([f"{var_name}_x", f"{var_name}_y"])
+
+        max_rows = max((len(ts) for _name, ts, _vs in series), default=0)
+        with open(final_path, "w", newline="", encoding="utf-8") as fp:
+            writer = csv.writer(fp)
+            writer.writerow(["#NFMonitorCSV", "2"])
+            for var_name, _ts, _vs in series:
+                writer.writerow(["#var", var_name, self._csv_group_for_var(var_name), ""])
+            writer.writerow(headers)
+            for row_idx in range(max_rows):
+                row = []
+                for _var_name, ts, vs in series:
+                    if row_idx < len(ts) and row_idx < len(vs):
+                        row.extend([f"{float(ts[row_idx]):.6f}", f"{float(vs[row_idx]):.10g}"])
+                    else:
+                        row.extend(["", ""])
+                writer.writerow(row)
+        return len(series)
+
+    def import_csv(self):
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Import CSV",
+            os.path.abspath("./csv_data"),
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not path:
+            return
+
+        try:
+            series = self._read_monitor_csv(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Import failed", str(exc))
+            return
+
+        if not series:
+            QMessageBox.warning(self, "Import failed", "No plottable variable series found in CSV.")
+            return
+
+        self._load_imported_series(path, series)
+        QMessageBox.information(self, "Import successful", f"CSV imported:\n{path}\nvariables: {len(series)}")
+
+    @staticmethod
+    def _parse_csv_float(value):
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            value = float(text)
+        except ValueError:
+            return None
+        return value if math.isfinite(value) else None
+
+    @staticmethod
+    def _csv_series_pairs(headers):
+        pairs = []
+        used = set()
+        index = {name: idx for idx, name in enumerate(headers)}
+        for idx, name in enumerate(headers):
+            if idx in used:
+                continue
+            if name.endswith("_time_ms"):
+                var_name = name[:-8]
+                value_name = f"{var_name}_value"
+            elif name.endswith("_x"):
+                var_name = name[:-2]
+                value_name = f"{var_name}_y"
+            else:
+                continue
+            value_idx = index.get(value_name)
+            if value_idx is None or not var_name or var_name.startswith("x000"):
+                continue
+            pairs.append((var_name, idx, value_idx))
+            used.add(idx)
+            used.add(value_idx)
+        return pairs
+
+    def _read_monitor_csv(self, path):
+        metadata = {}
+        with open(path, "r", newline="", encoding="utf-8-sig") as fp:
+            reader = csv.reader(fp)
+            headers = None
+            for row in reader:
+                if not row:
+                    continue
+                tag = row[0].strip()
+                if tag.startswith("#"):
+                    if tag == "#var" and len(row) >= 3:
+                        var_name = row[1].strip()
+                        section = row[2].strip()
+                        unit = row[3].strip() if len(row) >= 4 else ""
+                        if var_name:
+                            metadata[var_name] = {
+                                "section": section or "Ungrouped",
+                                "unit": unit,
+                            }
+                    elif tag == "#group" and len(row) >= 3:
+                        var_name = row[1].strip()
+                        section = row[2].strip()
+                        if var_name:
+                            metadata[var_name] = {
+                                "section": section or "Ungrouped",
+                                "unit": "",
+                            }
+                    continue
+                headers = row
+                break
+            if headers is None:
+                return {}
+            headers = [h.strip() for h in headers]
+            pairs = self._csv_series_pairs(headers)
+            if not pairs:
+                return {}
+
+            series = {
+                var_name: {
+                    "timestamps": [],
+                    "values": [],
+                    "section": metadata.get(var_name, {}).get("section", "Ungrouped"),
+                    "unit": metadata.get(var_name, {}).get("unit", ""),
+                }
+                for var_name, _ti, _vi in pairs
+            }
+            for row in reader:
+                for var_name, time_idx, value_idx in pairs:
+                    if time_idx >= len(row) or value_idx >= len(row):
+                        continue
+                    timestamp = self._parse_csv_float(row[time_idx])
+                    value = self._parse_csv_float(row[value_idx])
+                    if timestamp is None or value is None:
+                        continue
+                    series[var_name]["timestamps"].append(timestamp)
+                    series[var_name]["values"].append(value)
+
+        return {
+            var_name: data
+            for var_name, data in series.items()
+            if data["timestamps"] and len(data["timestamps"]) == len(data["values"])
+        }
+
+    def _load_imported_series(self, path, series):
+        if self.plot_state == PlotState.RUNNING:
+            self.toggle_reception()
+
+        self._clear_dynamic_signal_controls()
+        self.data_model.clear()
+        self.curve_transforms.clear()
+        self._hide_selected_hover_point()
+        self.selected_var_name = None
+        self.selected_curve_focus_active = False
+        self._update_selected_controls()
+
+        descriptors = [
+            {"var_name": name, "section": data.get("section") or "Ungrouped"}
+            for name, data in series.items()
+            if name not in self.curves
+        ]
+        self.register_signal_export_descriptors(descriptors)
+
+        all_timestamps = []
+        source_prefix = f"csv:{os.path.basename(path)}:"
+        for var_name, data in series.items():
+            self.data_model.add_series(
+                var=var_name,
+                src=source_prefix + var_name,
+                timestamps=data["timestamps"],
+                values=data["values"],
+            )
+            all_timestamps.extend(data["timestamps"])
+            ctrl = self.var_controls.get(var_name)
+            if ctrl is not None:
+                ctrl.checkbox.setChecked(False)
+            curve = self.curves.get(var_name)
+            if curve is not None:
+                curve.setVisible(False)
+
+        if all_timestamps:
+            self.reception_start_time = min(all_timestamps)
+            self.window_now = max(all_timestamps)
+            self.window_start = self.reception_start_time
+            self.now_line.setValue(self.window_now)
+            self.begin_line.setValue(self.reception_start_time)
+            self.x_axis.set_start_time(self.reception_start_time)
+            self.plot_widget.setXRange(self.reception_start_time, self.window_now, padding=0)
+
+        self.auto_scroll_enabled_before_pause = False
+        self.auto_y_enabled_before_pause = self.auto_y_enabled
+        self.auto_scroll_enabled = False
+        self.auto_y_enabled = True
+        self._set_auto_checkboxes_silent(False, True)
+        self.plot_widget.enableAutoRange(axis=1, enable=False)
+        self.plot_state = PlotState.STOPPED
+        self.toggle_reception_btn.setText("Resume")
+        self.toggle_reception_btn.setStyleSheet("background-color: orange")
+        self.refresh_all_curves(visible_only=True)
 
     def update_capture_plot(self):
         if self.waveform_capture_window:
@@ -937,8 +1171,48 @@ class PlotWindow(QWidget):
             abs(float(transform.get("offset", 0.0))) < 1e-12
         )
 
+    def _is_derived_curve(self, var_name):
+        return var_name in self.derived_curve_sources
+
     def _curve_source_data(self, var_name):
+        parent_name = self.derived_curve_sources.get(var_name)
+        if parent_name:
+            if parent_name not in self.curves:
+                return [], []
+            ts, vs = self._curve_full_transformed_data(parent_name)
+            return self._differentiate_curve_data(ts, vs)
         return self.data_model.get_series(var_name, None)
+
+    @staticmethod
+    def _differentiate_curve_data(ts, vs):
+        count = min(len(ts), len(vs))
+        if count < 2:
+            return [], []
+
+        out_ts = []
+        out_vs = []
+        for i in range(1, count):
+            try:
+                t_prev = float(ts[i - 1])
+                t_cur = float(ts[i])
+                v_prev = float(vs[i - 1])
+                v_cur = float(vs[i])
+            except (TypeError, ValueError):
+                continue
+
+            if not (
+                math.isfinite(t_prev) and math.isfinite(t_cur) and
+                math.isfinite(v_prev) and math.isfinite(v_cur)
+            ):
+                continue
+
+            dt_s = (t_cur - t_prev) / 1000.0
+            if dt_s <= 0.0:
+                continue
+            out_ts.append(t_cur)
+            out_vs.append((v_cur - v_prev) / dt_s)
+
+        return out_ts, out_vs
 
     def _transform_curve_data(self, var_name, ts, vs):
         transform = self._get_curve_transform(var_name)
@@ -952,6 +1226,12 @@ class PlotWindow(QWidget):
         ts_out = [float(t) + phase_ms for t in ts] if abs(phase_ms) >= 1e-9 else ts
         vs_out = [(float(v) * scale) + offset for v in vs]
         return ts_out, vs_out
+
+    def _curve_full_transformed_data(self, var_name):
+        ts, vs = self._curve_source_data(var_name)
+        if not ts:
+            return [], []
+        return self._transform_curve_data(var_name, ts, vs)
 
     def _clip_window_range(self):
         clip_end = self.window_now
@@ -970,11 +1250,9 @@ class PlotWindow(QWidget):
         return clipped_ts, clipped_vs
 
     def _curve_plot_data(self, var_name):
-        ts, vs = self._curve_source_data(var_name)
+        ts, vs = self._curve_full_transformed_data(var_name)
         if not ts:
             return [], []
-
-        ts, vs = self._transform_curve_data(var_name, ts, vs)
         return self._clip_curve_to_time_window(ts, vs)
 
     def refresh_curve(self, var_name, update_auto_y=True):
@@ -1037,9 +1315,13 @@ class PlotWindow(QWidget):
         self.selected_plot_value.setText(var_name if has_selection else "-")
         self._update_selected_color_button(color)
         self.selected_color_btn.setEnabled(has_selection)
+        self.selected_visible_check.setEnabled(has_selection)
+        self.selected_derivative_btn.setEnabled(has_selection)
         self.selected_phase_spin.setEnabled(has_selection)
         self.selected_offset_spin.setEnabled(has_selection)
         self.selected_scale_spin.setEnabled(has_selection)
+        self.selected_reset_btn.setEnabled(has_selection)
+        self.selected_visible_check.setChecked(bool(has_selection and self.curves[var_name].isVisible()))
         self.selected_phase_spin.setValue(float(transform.get("phase_ms", 0.0)))
         self.selected_offset_spin.setValue(float(transform.get("offset", 0.0)))
         self.selected_scale_spin.setValue(float(transform.get("scale", 1.0)))
@@ -1058,9 +1340,18 @@ class PlotWindow(QWidget):
         else:
             self.curve_transforms[var_name] = dict(transform)
 
-        self.refresh_curve(var_name)
+        self.refresh_curve(var_name, update_auto_y=False)
+        self._refresh_derived_descendants(var_name)
+        self._apply_auto_y_range()
         if update_controls and var_name == self.selected_var_name:
             self._update_selected_controls()
+
+    def _refresh_derived_descendants(self, var_name):
+        for child_name in list(self.derived_curve_children.get(var_name, [])):
+            if child_name not in self.curves:
+                continue
+            self.refresh_curve(child_name, update_auto_y=False)
+            self._refresh_derived_descendants(child_name)
 
     def _selected_transform_changed(self, *_args):
         if self._updating_selected_controls:
@@ -1091,6 +1382,65 @@ class PlotWindow(QWidget):
     def reset_curve_transform(self, var_name):
         self._store_curve_transform(var_name, self._default_curve_transform())
 
+    def reset_selected_transform(self):
+        var_name = self.selected_var_name
+        if not var_name or var_name not in self.curves:
+            return
+        self._store_curve_transform(var_name, self._default_curve_transform())
+        self._set_selected_curve_focus_active(True)
+        self.plot_widget.setFocus()
+
+    @staticmethod
+    def _lighten_rgb(rgb):
+        return tuple(min(255, int(c + (255 - c) * 0.35)) for c in rgb)
+
+    def _preferred_derivative_name(self, parent_name):
+        return f"d_{parent_name}"
+
+    def _derivative_name_for_parent(self, parent_name):
+        preferred = self._preferred_derivative_name(parent_name)
+        if preferred not in self.curves or self.derived_curve_sources.get(preferred) == parent_name:
+            return preferred
+
+        index = 2
+        while True:
+            candidate = f"{preferred}_{index}"
+            if candidate not in self.curves or self.derived_curve_sources.get(candidate) == parent_name:
+                return candidate
+            index += 1
+
+    def create_selected_derivative_curve(self):
+        parent_name = self.selected_var_name
+        if not parent_name or parent_name not in self.curves:
+            return
+
+        child_name = self._derivative_name_for_parent(parent_name)
+        if child_name in self.curves:
+            self.set_curve_visibility(child_name, True)
+            self.select_curve(child_name)
+            return
+
+        if not self._register_variable(
+            var_name=child_name,
+            checked=True,
+            grid=None,
+            columns=1,
+            count_attr="signal_export_count",
+            create_control=False,
+        ):
+            return
+
+        parent_color = self.colors.get(parent_name, self.get_default_color(parent_name))
+        child_color = self._lighten_rgb(parent_color)
+        self.colors[child_name] = child_color
+        self.default_colors[child_name] = child_color
+        self.derived_curve_sources[child_name] = parent_name
+        self.derived_curve_children.setdefault(parent_name, []).append(child_name)
+
+        self._update_curve_pen(child_name)
+        self.refresh_curve(child_name)
+        self.select_curve(child_name)
+
     def _curve_pen_width(self, var_name):
         return 4 if var_name == self.selected_var_name and self.selected_curve_focus_active else 2
 
@@ -1099,7 +1449,28 @@ class PlotWindow(QWidget):
         if curve is None:
             return
         color = self.colors.get(var_name, self.get_default_color(var_name))
-        curve.setPen(pg.mkPen(color=color, width=self._curve_pen_width(var_name)))
+        style = Qt.DashLine if self._is_derived_curve(var_name) else Qt.SolidLine
+        curve.setPen(pg.mkPen(color=color, width=self._curve_pen_width(var_name), style=style))
+
+    def _sync_variable_control_visibility(self, var_name, visible):
+        ctrl = self.var_controls.get(var_name)
+        if ctrl is None:
+            return
+        ctrl.checkbox.blockSignals(True)
+        ctrl.checkbox.setChecked(bool(visible))
+        ctrl.checkbox.blockSignals(False)
+
+    def _selected_visibility_changed(self, state):
+        if self._updating_selected_controls:
+            return
+
+        var_name = self.selected_var_name
+        if not var_name or var_name not in self.curves:
+            return
+
+        self.set_curve_visibility(var_name, state == Qt.Checked)
+        self._set_selected_curve_focus_active(True)
+        self.plot_widget.setFocus()
 
     def _set_selected_curve_focus_active(self, active):
         if self.selected_curve_focus_active == active:
@@ -1232,6 +1603,10 @@ class PlotWindow(QWidget):
 
     def _update_selected_hover_point(self, mouse_x=None, mouse_scene_pos=None):
         if not self.selected_curve_focus_active or not self.selected_var_name:
+            self._hide_selected_hover_point()
+            return
+        curve = self.curves.get(self.selected_var_name)
+        if curve is None or not curve.isVisible():
             self._hide_selected_hover_point()
             return
 
@@ -1512,6 +1887,69 @@ class PlotWindow(QWidget):
         if self.signal_export_container is not None:
             self.signal_export_container.adjustSize()
 
+    def _clear_derived_curves(self):
+        derived_names = list(self.derived_curve_sources.keys())
+        for var_name in derived_names:
+            ctrl = self.var_controls.pop(var_name, None)
+            if ctrl is not None:
+                ctrl.setParent(None)
+                ctrl.deleteLater()
+
+            curve = self.curves.pop(var_name, None)
+            if curve is not None:
+                self.plot_widget.removeItem(curve)
+
+            self.colors.pop(var_name, None)
+            self.default_colors.pop(var_name, None)
+            self.curve_transforms.pop(var_name, None)
+            if var_name in self.signal_variables:
+                self.signal_variables.remove(var_name)
+            if self.selected_var_name == var_name:
+                self.selected_var_name = None
+                self.selected_curve_focus_active = False
+
+        self.derived_curve_sources = {}
+        self.derived_curve_children = {}
+        self._update_selected_controls()
+
+    def _clear_dynamic_signal_controls(self):
+        self._clear_derived_curves()
+        dynamic_names = list(self.dynamic_signal_variables)
+        for var_name in dynamic_names:
+            ctrl = self.var_controls.pop(var_name, None)
+            if ctrl is not None:
+                ctrl.setParent(None)
+                ctrl.deleteLater()
+
+            curve = self.curves.pop(var_name, None)
+            if curve is not None:
+                self.plot_widget.removeItem(curve)
+
+            self.colors.pop(var_name, None)
+            self.default_colors.pop(var_name, None)
+            self.curve_transforms.pop(var_name, None)
+            if var_name in self.signal_variables:
+                self.signal_variables.remove(var_name)
+            if self.selected_var_name == var_name:
+                self.selected_var_name = None
+                self.selected_curve_focus_active = False
+
+        for info in self.signal_export_sections.values():
+            box = info.get("box")
+            if box is not None:
+                box.setParent(None)
+                box.deleteLater()
+
+        self.dynamic_signal_variables = []
+        self.dynamic_signal_sections = {}
+        self.signal_export_sections = {}
+        self.signal_export_section_order = []
+        self.signal_export_count = 0
+        self._detach_layout_items(self.signal_export_grid)
+        if self.signal_export_container is not None:
+            self.signal_export_container.adjustSize()
+        self._update_selected_controls()
+
     def register_signal_export_descriptors(self, descriptors):
         added = []
         changed_sections = set()
@@ -1570,12 +2008,15 @@ class PlotWindow(QWidget):
     def set_curve_visibility(self, var_name, visible):
         if var_name in self.curves:
             self.curves[var_name].setVisible(visible)
+            self._sync_variable_control_visibility(var_name, visible)
             if visible:
                 self.refresh_curve(var_name)
             else:
                 if var_name == self.selected_var_name:
                     self._hide_selected_hover_point()
                 self._apply_auto_y_range()
+            if var_name == self.selected_var_name:
+                self._update_selected_controls()
 
     def set_curve_color(self, var_name, rgb):
         """Set the curve color for a variable."""

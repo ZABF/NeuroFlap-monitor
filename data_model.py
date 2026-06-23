@@ -82,6 +82,28 @@ class DataModel:
         for key, value in data.items():
             self.add_value(key, src, value)
 
+    def add_series(self, var: str, src: str, timestamps, values) -> None:
+        count = min(len(timestamps), len(values))
+        if count <= 0:
+            return
+
+        source_bucket = self.ensure_source(src)
+        var_bucket = self.ensure_var(var, src)
+        if source_bucket.src_timestamp or var_bucket.value:
+            self.clear_source(src, clear_offsets=True)
+            source_bucket = self.ensure_source(src)
+            var_bucket = self.ensure_var(var, src)
+
+        self.offsets[(src, 1)] = 0.0
+        source_bucket.current_session = 1
+        source_bucket.last_src_timestamp = float(timestamps[count - 1])
+        for i in range(count):
+            ts = float(timestamps[i])
+            source_bucket.src_timestamp.append(ts)
+            source_bucket.recon_timestamp.append(ts)
+            source_bucket.session.append(1)
+            var_bucket.value.append(float(values[i]))
+
     def get_series(self, var: str, series_time_ms: float):
         var_bucket = self.vars.get(var)
         if not var_bucket or not var_bucket.src:
