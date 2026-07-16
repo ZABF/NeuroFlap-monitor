@@ -2,12 +2,13 @@ from PyQt5.QtGui import QColor, QPen
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QCheckBox, QLabel, QSpinBox, QGridLayout, QMessageBox, QLineEdit, QComboBox, QFrame, QTabWidget, QGroupBox,
-    QScrollArea, QLayout, QColorDialog, QDoubleSpinBox, QFileDialog
+    QScrollArea, QLayout, QColorDialog, QDoubleSpinBox, QFileDialog, QDialog, QDialogButtonBox, QFormLayout
 )
 from PyQt5.QtCore import QEvent, QPointF, QTimer, Qt
 from bisect import bisect_left
 import csv
 import math
+import numpy as np
 import pyqtgraph as pg
 import time
 from datetime import datetime
@@ -22,6 +23,145 @@ from data_transporter_thread import DataTransporterThread
 from ui.variable_control import VariableControlItem
 from waveform_capture import WaveformCaptureWindow
 from enum import Enum
+
+
+class CurveExpressionError(ValueError):
+    pass
+
+
+class CurveExpressionParser:
+    def __init__(self, text):
+        self.text = text or ""
+        self.pos = 0
+
+    def parse(self):
+        node = self._parse_expr()
+        self._skip_ws()
+        if self.pos != len(self.text):
+            raise CurveExpressionError(f"Unexpected token at {self.pos}: {self.text[self.pos:]}")
+        return node
+
+    def _skip_ws(self):
+        while self.pos < len(self.text) and self.text[self.pos].isspace():
+            self.pos += 1
+
+    def _peek(self):
+        self._skip_ws()
+        return self.text[self.pos] if self.pos < len(self.text) else ""
+
+    def _consume(self, char):
+        if self._peek() != char:
+            raise CurveExpressionError(f"Expected '{char}' at {self.pos}")
+        self.pos += 1
+
+    def _parse_expr(self):
+        node = self._parse_term()
+        while True:
+            op = self._peek()
+            if op not in ("+", "-"):
+                return node
+            self.pos += 1
+            node = ("bin", op, node, self._parse_term())
+
+    def _parse_term(self):
+        node = self._parse_unary()
+        while True:
+            op = self._peek()
+            if op not in ("*", "/"):
+                return node
+            self.pos += 1
+            node = ("bin", op, node, self._parse_unary())
+
+    def _parse_unary(self):
+        op = self._peek()
+        if op in ("+", "-"):
+            self.pos += 1
+            return ("unary", op, self._parse_unary())
+        return self._parse_primary()
+
+    def _parse_primary(self):
+        ch = self._peek()
+        if not ch:
+            raise CurveExpressionError("Unexpected end of expression")
+        if ch == "(":
+            self.pos += 1
+            node = self._parse_expr()
+            self._consume(")")
+            return node
+        if ch == "[":
+            return self._parse_bracket_curve_ref()
+        if ch == "/":
+            return self._parse_curve_ref()
+        if ch.isdigit() or ch == ".":
+            return self._parse_number()
+        if ch.isalpha() or ch == "_":
+            return self._parse_call()
+        raise CurveExpressionError(f"Unexpected token at {self.pos}: {ch}")
+
+    def _parse_curve_ref(self):
+        self._consume("/")
+        start = self.pos
+        stop_chars = set("()+-*/, \t\r\n")
+        while self.pos < len(self.text) and self.text[self.pos] not in stop_chars:
+            self.pos += 1
+        name = self.text[start:self.pos].strip()
+        if not name:
+            raise CurveExpressionError(f"Missing curve name after '/' at {start}")
+        return ("ref", name)
+
+    def _parse_bracket_curve_ref(self):
+        self._consume("[")
+        start = self.pos
+        while self.pos < len(self.text) and self.text[self.pos] != "]":
+            self.pos += 1
+        if self.pos >= len(self.text):
+            raise CurveExpressionError(f"Missing closing ']' for curve reference at {start - 1}")
+        name = self.text[start:self.pos].strip()
+        self.pos += 1
+        if not name:
+            raise CurveExpressionError(f"Missing curve name inside brackets at {start}")
+        return ("ref", name)
+
+    def _parse_number(self):
+        start = self.pos
+        saw_digit = False
+        while self.pos < len(self.text) and self.text[self.pos].isdigit():
+            saw_digit = True
+            self.pos += 1
+        if self.pos < len(self.text) and self.text[self.pos] == ".":
+            self.pos += 1
+            while self.pos < len(self.text) and self.text[self.pos].isdigit():
+                saw_digit = True
+                self.pos += 1
+        if self.pos < len(self.text) and self.text[self.pos] in ("e", "E"):
+            exp_pos = self.pos
+            self.pos += 1
+            if self.pos < len(self.text) and self.text[self.pos] in ("+", "-"):
+                self.pos += 1
+            exp_digits = self.pos
+            while self.pos < len(self.text) and self.text[self.pos].isdigit():
+                self.pos += 1
+            if exp_digits == self.pos:
+                self.pos = exp_pos
+        if not saw_digit:
+            raise CurveExpressionError(f"Invalid number at {start}")
+        return ("num", float(self.text[start:self.pos]))
+
+    def _parse_call(self):
+        start = self.pos
+        while self.pos < len(self.text) and (self.text[self.pos].isalnum() or self.text[self.pos] == "_"):
+            self.pos += 1
+        name = self.text[start:self.pos]
+        self._consume("(")
+        args = []
+        if self._peek() != ")":
+            while True:
+                args.append(self._parse_expr())
+                if self._peek() != ",":
+                    break
+                self.pos += 1
+        self._consume(")")
+        return ("call", name, args)
 
 '''
 CURRENT STATE  |    start           stop            clear
@@ -51,7 +191,7 @@ class PlotState(Enum):
 class PlotWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Monitor v2.3.0")
+        self.setWindowTitle("Monitor v2.4.0")
 
         self.tf_variables = ["F_X", "F_Y", "F_Z", "T_X", "T_Y", "T_Z"]
         self.mocap_variable_templates = [
@@ -101,8 +241,7 @@ class PlotWindow(QWidget):
         self.colors = {}  # 褰撳墠棰滆壊
         self.default_colors = {}  # 榛樿棰滆壊
         self.curve_transforms = {}
-        self.derived_curve_sources = {}
-        self.derived_curve_children = {}
+        self.curve_specs = {}
         self.selected_var_name = None
         self.selected_curve_focus_active = False
         self.selected_hover_point = None
@@ -429,10 +568,20 @@ class PlotWindow(QWidget):
         self.selected_visible_check.setFocusPolicy(Qt.NoFocus)
         self.selected_visible_check.stateChanged.connect(self._selected_visibility_changed)
 
-        self.selected_derivative_btn = QPushButton("d/dt")
-        self.selected_derivative_btn.setFixedWidth(52)
-        self.selected_derivative_btn.setFocusPolicy(Qt.NoFocus)
-        self.selected_derivative_btn.clicked.connect(self.create_selected_derivative_curve)
+        self.selected_derived_btn = QPushButton("Derived...")
+        self.selected_derived_btn.setFixedWidth(86)
+        self.selected_derived_btn.setFocusPolicy(Qt.NoFocus)
+        self.selected_derived_btn.clicked.connect(lambda: self.open_derived_curve_dialog())
+
+        self.selected_derived_edit_btn = QPushButton("Edit")
+        self.selected_derived_edit_btn.setFixedWidth(46)
+        self.selected_derived_edit_btn.setFocusPolicy(Qt.NoFocus)
+        self.selected_derived_edit_btn.clicked.connect(self.edit_selected_derived_curve)
+
+        self.selected_derived_delete_btn = QPushButton("Delete")
+        self.selected_derived_delete_btn.setFixedWidth(58)
+        self.selected_derived_delete_btn.setFocusPolicy(Qt.NoFocus)
+        self.selected_derived_delete_btn.clicked.connect(self.delete_selected_derived_curve)
 
         self.selected_phase_spin = QDoubleSpinBox()
         self.selected_phase_spin.setRange(-3600000.0, 3600000.0)
@@ -461,7 +610,9 @@ class PlotWindow(QWidget):
         selected_plot_layout.addWidget(QLabel("Selected plot:"))
         selected_plot_layout.addWidget(self.selected_plot_value)
         selected_plot_layout.addWidget(self.selected_visible_check)
-        selected_plot_layout.addWidget(self.selected_derivative_btn)
+        selected_plot_layout.addWidget(self.selected_derived_btn)
+        selected_plot_layout.addWidget(self.selected_derived_edit_btn)
+        selected_plot_layout.addWidget(self.selected_derived_delete_btn)
         selected_plot_layout.addWidget(self.selected_coord_value)
         selected_plot_layout.addWidget(QLabel("color:"))
         selected_plot_layout.addWidget(self.selected_color_btn)
@@ -1172,16 +1323,32 @@ class PlotWindow(QWidget):
         )
 
     def _is_derived_curve(self, var_name):
-        return var_name in self.derived_curve_sources
+        return self.curve_specs.get(var_name, {}).get("kind") == "expr"
 
-    def _curve_source_data(self, var_name):
-        parent_name = self.derived_curve_sources.get(var_name)
-        if parent_name:
-            if parent_name not in self.curves:
-                return [], []
-            ts, vs = self._curve_full_transformed_data(parent_name)
-            return self._differentiate_curve_data(ts, vs)
+    def _curve_source_data(self, var_name, eval_stack=None):
+        spec = self.curve_specs.get(var_name)
+        if spec and spec.get("kind") == "expr":
+            value = self._eval_curve_expr(spec.get("ast"), eval_stack or ())
+            if value.get("kind") == "series":
+                return value.get("ts", []), value.get("vs", [])
+            return [], []
         return self.data_model.get_series(var_name, None)
+
+    @staticmethod
+    def _series_value(ts, vs):
+        return {"kind": "series", "ts": ts, "vs": vs}
+
+    @staticmethod
+    def _scalar_value(value):
+        return {"kind": "scalar", "value": float(value)}
+
+    @staticmethod
+    def _is_series_value(value):
+        return value.get("kind") == "series"
+
+    @staticmethod
+    def _is_scalar_value(value):
+        return value.get("kind") == "scalar"
 
     @staticmethod
     def _differentiate_curve_data(ts, vs):
@@ -1214,6 +1381,380 @@ class PlotWindow(QWidget):
 
         return out_ts, out_vs
 
+    @staticmethod
+    def _smooth_curve_data(ts, vs, window_ms):
+        count = min(len(ts), len(vs))
+        if count == 0:
+            return [], []
+        window_ms = max(float(window_ms), 0.0)
+        if window_ms <= 0.0:
+            return list(ts)[:count], list(vs)[:count]
+
+        times = []
+        values = []
+        for i in range(count):
+            try:
+                t = float(ts[i])
+                v = float(vs[i])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(t) and math.isfinite(v):
+                times.append(t)
+                values.append(v)
+
+        out_ts = []
+        out_vs = []
+        left = 0
+        right = 0
+        running_sum = 0.0
+        half_window = window_ms * 0.5
+        for i, t in enumerate(times):
+            while right < len(times) and times[right] <= t + half_window:
+                running_sum += values[right]
+                right += 1
+            while left < right and times[left] < t - half_window:
+                running_sum -= values[left]
+                left += 1
+            sample_count = right - left
+            if sample_count <= 0:
+                continue
+            out_ts.append(t)
+            out_vs.append(running_sum / sample_count)
+
+        return out_ts, out_vs
+
+    @staticmethod
+    def _savgol_curve_data(ts, vs, window_ms, order=3, derivative=0):
+        count = min(len(ts), len(vs))
+        if count == 0:
+            return [], []
+
+        try:
+            window_ms = max(float(window_ms), 0.0)
+            order = max(0, int(round(float(order))))
+            derivative = max(0, int(round(float(derivative))))
+        except (TypeError, ValueError):
+            return [], []
+
+        if derivative > order:
+            return [], []
+        if window_ms <= 0.0:
+            if derivative == 0:
+                return list(ts)[:count], list(vs)[:count]
+            d_ts = list(ts)[:count]
+            d_vs = list(vs)[:count]
+            for _ in range(derivative):
+                d_ts, d_vs = PlotWindow._differentiate_curve_data(d_ts, d_vs)
+            return d_ts, d_vs
+
+        times = []
+        values = []
+        for i in range(count):
+            try:
+                t = float(ts[i])
+                v = float(vs[i])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(t) and math.isfinite(v):
+                times.append(t)
+                values.append(v)
+
+        if len(times) < max(order + 2, 5):
+            return [], []
+
+        times_np = np.asarray(times, dtype=float)
+        values_np = np.asarray(values, dtype=float)
+        dt_ms_values = np.diff(times_np)
+        dt_ms_values = dt_ms_values[np.isfinite(dt_ms_values) & (dt_ms_values > 0.0)]
+        if dt_ms_values.size == 0:
+            return [], []
+
+        dt_ms = float(np.median(dt_ms_values))
+        if not math.isfinite(dt_ms) or dt_ms <= 0.0:
+            return [], []
+
+        win = max(order + 2, int(round(window_ms / dt_ms)))
+        if win % 2 == 0:
+            win += 1
+        if win > len(values_np):
+            win = len(values_np) if len(values_np) % 2 == 1 else len(values_np) - 1
+        if win < order + 2 or win < 3:
+            return [], []
+
+        half = win // 2
+        dt_s = dt_ms * 1e-3
+        x = (np.arange(-half, half + 1, dtype=float) * dt_s).reshape(-1, 1)
+        powers = np.arange(order + 1, dtype=float).reshape(1, -1)
+        design = x ** powers
+        coeffs = np.linalg.pinv(design)
+
+        kernel = math.factorial(derivative) * coeffs[derivative, :]
+
+        filtered = np.convolve(values_np, kernel[::-1], mode="same")
+        valid = slice(half, len(values_np) - half)
+        out_times = times_np[valid].tolist()
+        out_values = filtered[valid].tolist()
+        return out_times, out_values
+
+    @staticmethod
+    def _interp_at(ts, vs, x_value):
+        count = min(len(ts), len(vs))
+        if count <= 0:
+            return None
+        if x_value < float(ts[0]) or x_value > float(ts[count - 1]):
+            return None
+        idx = bisect_left(ts, x_value)
+        if idx < count and float(ts[idx]) == x_value:
+            return float(vs[idx])
+        if idx <= 0 or idx >= count:
+            return None
+        t0 = float(ts[idx - 1])
+        t1 = float(ts[idx])
+        v0 = float(vs[idx - 1])
+        v1 = float(vs[idx])
+        if not (math.isfinite(t0) and math.isfinite(t1) and math.isfinite(v0) and math.isfinite(v1)):
+            return None
+        if t1 <= t0:
+            return None
+        alpha = (x_value - t0) / (t1 - t0)
+        return v0 + (v1 - v0) * alpha
+
+    @staticmethod
+    def _apply_binary_scalar(op, left, right):
+        if op == "+":
+            return left + right
+        if op == "-":
+            return left - right
+        if op == "*":
+            return left * right
+        if op == "/":
+            if abs(right) < 1e-12:
+                return None
+            return left / right
+        return None
+
+    def _apply_binary_series_scalar(self, op, ts, vs, scalar, scalar_on_left=False):
+        out_ts = []
+        out_vs = []
+        count = min(len(ts), len(vs))
+        for i in range(count):
+            try:
+                t = float(ts[i])
+                v = float(vs[i])
+            except (TypeError, ValueError):
+                continue
+            if not (math.isfinite(t) and math.isfinite(v) and math.isfinite(scalar)):
+                continue
+            result = (
+                self._apply_binary_scalar(op, scalar, v)
+                if scalar_on_left else
+                self._apply_binary_scalar(op, v, scalar)
+            )
+            if result is None or not math.isfinite(result):
+                continue
+            out_ts.append(t)
+            out_vs.append(result)
+        return self._series_value(out_ts, out_vs)
+
+    def _apply_binary_series_series(self, op, left, right):
+        left_ts = left.get("ts", [])
+        left_vs = left.get("vs", [])
+        right_ts = right.get("ts", [])
+        right_vs = right.get("vs", [])
+        out_ts = []
+        out_vs = []
+        count = min(len(left_ts), len(left_vs))
+        for i in range(count):
+            try:
+                t = float(left_ts[i])
+                left_value = float(left_vs[i])
+            except (TypeError, ValueError):
+                continue
+            right_value = self._interp_at(right_ts, right_vs, t)
+            if right_value is None:
+                continue
+            result = self._apply_binary_scalar(op, left_value, right_value)
+            if result is None or not math.isfinite(result):
+                continue
+            out_ts.append(t)
+            out_vs.append(result)
+        return self._series_value(out_ts, out_vs)
+
+    def _apply_binary_value(self, op, left, right):
+        if self._is_scalar_value(left) and self._is_scalar_value(right):
+            result = self._apply_binary_scalar(op, left["value"], right["value"])
+            if result is None or not math.isfinite(result):
+                return self._series_value([], [])
+            return self._scalar_value(result)
+        if self._is_series_value(left) and self._is_scalar_value(right):
+            return self._apply_binary_series_scalar(op, left["ts"], left["vs"], right["value"])
+        if self._is_scalar_value(left) and self._is_series_value(right):
+            return self._apply_binary_series_scalar(op, right["ts"], right["vs"], left["value"], scalar_on_left=True)
+        if self._is_series_value(left) and self._is_series_value(right):
+            return self._apply_binary_series_series(op, left, right)
+        return self._series_value([], [])
+
+    @staticmethod
+    def _sign_scalar(value):
+        if value > 0.0:
+            return 1.0
+        if value < 0.0:
+            return -1.0
+        return 0.0
+
+    def _apply_unary_function_value(self, name, value):
+        if name != "sign":
+            return self._series_value([], [])
+
+        if self._is_scalar_value(value):
+            return self._scalar_value(self._sign_scalar(value["value"]))
+        if self._is_series_value(value):
+            out_ts = []
+            out_vs = []
+            for t, v in zip(value.get("ts", []), value.get("vs", [])):
+                try:
+                    t = float(t)
+                    v = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if not (math.isfinite(t) and math.isfinite(v)):
+                    continue
+                out_ts.append(t)
+                out_vs.append(self._sign_scalar(v))
+            return self._series_value(out_ts, out_vs)
+        return self._series_value([], [])
+
+    def _joint_tau_curve_data(self, q_ts, q_vs, window_ms, order, J, b, Fc, v_deadband):
+        q_t, q_deg = self._savgol_curve_data(q_ts, q_vs, window_ms, order, 0)
+        qdot_t, qdot_deg_s = self._savgol_curve_data(q_ts, q_vs, window_ms, order, 1)
+        qddot_t, qddot_deg_s2 = self._savgol_curve_data(q_ts, q_vs, window_ms, order, 2)
+
+        if not q_t or not qdot_t or not qddot_t:
+            return [], []
+
+        qdot_by_t = {float(t): float(v) for t, v in zip(qdot_t, qdot_deg_s)}
+        qddot_by_t = {float(t): float(v) for t, v in zip(qddot_t, qddot_deg_s2)}
+
+        out_ts = []
+        out_vs = []
+        for t, q_deg_value in zip(q_t, q_deg):
+            try:
+                t = float(t)
+                q_deg_value = float(q_deg_value)
+            except (TypeError, ValueError):
+                continue
+
+            qdot_value = qdot_by_t.get(t)
+            qddot_value = qddot_by_t.get(t)
+            if qdot_value is None or qddot_value is None:
+                continue
+            if not (
+                math.isfinite(t) and math.isfinite(q_deg_value) and
+                math.isfinite(qdot_value) and math.isfinite(qddot_value)
+            ):
+                continue
+
+            qdot_rad_s = math.radians(qdot_value)
+            qddot_rad_s2 = math.radians(qddot_value)
+            sign_qdot = 0.0 if abs(qdot_rad_s) < v_deadband else self._sign_scalar(qdot_rad_s)
+
+            tau = J * qddot_rad_s2 + b * qdot_rad_s + Fc * sign_qdot
+            if math.isfinite(tau):
+                out_ts.append(t)
+                out_vs.append(tau)
+
+        return out_ts, out_vs
+
+    def _eval_curve_expr(self, node, eval_stack):
+        if node is None:
+            return self._series_value([], [])
+        kind = node[0]
+        if kind == "num":
+            return self._scalar_value(node[1])
+        if kind == "ref":
+            name = node[1]
+            ts, vs = self._curve_full_transformed_data(name, eval_stack)
+            return self._series_value(ts, vs)
+        if kind == "unary":
+            op = node[1]
+            value = self._eval_curve_expr(node[2], eval_stack)
+            if op == "+":
+                return value
+            if self._is_scalar_value(value):
+                return self._scalar_value(-value["value"])
+            return self._series_value(value.get("ts", []), [-float(v) for v in value.get("vs", [])])
+        if kind == "bin":
+            left = self._eval_curve_expr(node[2], eval_stack)
+            right = self._eval_curve_expr(node[3], eval_stack)
+            return self._apply_binary_value(node[1], left, right)
+        if kind == "call":
+            name = node[1].lower()
+            args = node[2]
+            if name == "soomth":
+                name = "smooth"
+            if name == "d":
+                if len(args) != 1:
+                    return self._series_value([], [])
+                value = self._eval_curve_expr(args[0], eval_stack)
+                if not self._is_series_value(value):
+                    return self._series_value([], [])
+                ts, vs = self._differentiate_curve_data(value.get("ts", []), value.get("vs", []))
+                return self._series_value(ts, vs)
+            if name == "smooth":
+                if len(args) != 2:
+                    return self._series_value([], [])
+                value = self._eval_curve_expr(args[0], eval_stack)
+                window = self._eval_curve_expr(args[1], eval_stack)
+                if not self._is_series_value(value) or not self._is_scalar_value(window):
+                    return self._series_value([], [])
+                ts, vs = self._smooth_curve_data(value.get("ts", []), value.get("vs", []), window["value"])
+                return self._series_value(ts, vs)
+            if name == "sg":
+                if len(args) != 4:
+                    return self._series_value([], [])
+                value = self._eval_curve_expr(args[0], eval_stack)
+                window = self._eval_curve_expr(args[1], eval_stack)
+                order = self._eval_curve_expr(args[2], eval_stack)
+                derivative = self._eval_curve_expr(args[3], eval_stack)
+                if (
+                    not self._is_series_value(value) or
+                    not self._is_scalar_value(window) or
+                    not self._is_scalar_value(order) or
+                    not self._is_scalar_value(derivative)
+                ):
+                    return self._series_value([], [])
+                ts, vs = self._savgol_curve_data(
+                    value.get("ts", []),
+                    value.get("vs", []),
+                    window["value"],
+                    order["value"],
+                    derivative["value"],
+                )
+                return self._series_value(ts, vs)
+            if name == "sign":
+                if len(args) != 1:
+                    return self._series_value([], [])
+                value = self._eval_curve_expr(args[0], eval_stack)
+                return self._apply_unary_function_value(name, value)
+            if name == "joint_tau":
+                if len(args) != 7:
+                    return self._series_value([], [])
+                q = self._eval_curve_expr(args[0], eval_stack)
+                scalars = [self._eval_curve_expr(arg, eval_stack) for arg in args[1:]]
+                if (
+                    not self._is_series_value(q) or
+                    any(not self._is_scalar_value(value) for value in scalars)
+                ):
+                    return self._series_value([], [])
+                ts, vs = self._joint_tau_curve_data(
+                    q.get("ts", []),
+                    q.get("vs", []),
+                    *(value["value"] for value in scalars),
+                )
+                return self._series_value(ts, vs)
+            return self._series_value([], [])
+        return self._series_value([], [])
+
     def _transform_curve_data(self, var_name, ts, vs):
         transform = self._get_curve_transform(var_name)
         if self._is_default_curve_transform(transform):
@@ -1227,8 +1768,13 @@ class PlotWindow(QWidget):
         vs_out = [(float(v) * scale) + offset for v in vs]
         return ts_out, vs_out
 
-    def _curve_full_transformed_data(self, var_name):
-        ts, vs = self._curve_source_data(var_name)
+    def _curve_full_transformed_data(self, var_name, eval_stack=None):
+        if var_name not in self.curves:
+            return [], []
+        eval_stack = eval_stack or ()
+        if var_name in eval_stack:
+            return [], []
+        ts, vs = self._curve_source_data(var_name, eval_stack + (var_name,))
         if not ts:
             return [], []
         return self._transform_curve_data(var_name, ts, vs)
@@ -1308,6 +1854,7 @@ class PlotWindow(QWidget):
     def _update_selected_controls(self):
         var_name = self.selected_var_name
         has_selection = bool(var_name and var_name in self.curves)
+        is_derived = bool(has_selection and self._is_derived_curve(var_name))
         transform = self._get_curve_transform(var_name) if has_selection else self._default_curve_transform()
         color = self.colors.get(var_name, (64, 64, 64)) if has_selection else (48, 48, 48)
 
@@ -1316,7 +1863,11 @@ class PlotWindow(QWidget):
         self._update_selected_color_button(color)
         self.selected_color_btn.setEnabled(has_selection)
         self.selected_visible_check.setEnabled(has_selection)
-        self.selected_derivative_btn.setEnabled(has_selection)
+        self.selected_derived_btn.setEnabled(True)
+        self.selected_derived_edit_btn.setVisible(is_derived)
+        self.selected_derived_edit_btn.setEnabled(is_derived)
+        self.selected_derived_delete_btn.setVisible(is_derived)
+        self.selected_derived_delete_btn.setEnabled(is_derived)
         self.selected_phase_spin.setEnabled(has_selection)
         self.selected_offset_spin.setEnabled(has_selection)
         self.selected_scale_spin.setEnabled(has_selection)
@@ -1340,18 +1891,10 @@ class PlotWindow(QWidget):
         else:
             self.curve_transforms[var_name] = dict(transform)
 
-        self.refresh_curve(var_name, update_auto_y=False)
-        self._refresh_derived_descendants(var_name)
+        self.refresh_all_curves(visible_only=True)
         self._apply_auto_y_range()
         if update_controls and var_name == self.selected_var_name:
             self._update_selected_controls()
-
-    def _refresh_derived_descendants(self, var_name):
-        for child_name in list(self.derived_curve_children.get(var_name, [])):
-            if child_name not in self.curves:
-                continue
-            self.refresh_curve(child_name, update_auto_y=False)
-            self._refresh_derived_descendants(child_name)
 
     def _selected_transform_changed(self, *_args):
         if self._updating_selected_controls:
@@ -1394,52 +1937,541 @@ class PlotWindow(QWidget):
     def _lighten_rgb(rgb):
         return tuple(min(255, int(c + (255 - c) * 0.35)) for c in rgb)
 
-    def _preferred_derivative_name(self, parent_name):
-        return f"d_{parent_name}"
-
-    def _derivative_name_for_parent(self, parent_name):
-        preferred = self._preferred_derivative_name(parent_name)
-        if preferred not in self.curves or self.derived_curve_sources.get(preferred) == parent_name:
-            return preferred
-
-        index = 2
+    def _next_derived_name(self, prefix="calc"):
+        index = 1
         while True:
-            candidate = f"{preferred}_{index}"
-            if candidate not in self.curves or self.derived_curve_sources.get(candidate) == parent_name:
-                return candidate
+            name = f"{prefix}_{index}"
+            if name not in self.curves:
+                return name
             index += 1
 
-    def create_selected_derivative_curve(self):
-        parent_name = self.selected_var_name
-        if not parent_name or parent_name not in self.curves:
+    @staticmethod
+    def _expr_refs(node):
+        if node is None:
+            return set()
+        kind = node[0]
+        if kind == "ref":
+            return {node[1]}
+        if kind == "num":
+            return set()
+        if kind == "unary":
+            return PlotWindow._expr_refs(node[2])
+        if kind == "bin":
+            return PlotWindow._expr_refs(node[2]) | PlotWindow._expr_refs(node[3])
+        if kind == "call":
+            refs = set()
+            for arg in node[2]:
+                refs |= PlotWindow._expr_refs(arg)
+            return refs
+        return set()
+
+    @staticmethod
+    def _expr_validation_errors(node):
+        if node is None:
+            return ["Empty expression"]
+        kind = node[0]
+        if kind in ("num", "ref"):
+            return []
+        if kind == "unary":
+            return PlotWindow._expr_validation_errors(node[2])
+        if kind == "bin":
+            return (
+                PlotWindow._expr_validation_errors(node[2]) +
+                PlotWindow._expr_validation_errors(node[3])
+            )
+        if kind == "call":
+            name = node[1].lower()
+            if name == "soomth":
+                name = "smooth"
+            args = node[2]
+            errors = []
+            if name == "d":
+                if len(args) != 1:
+                    errors.append("d() expects 1 argument")
+            elif name == "smooth":
+                if len(args) != 2:
+                    errors.append("smooth() expects 2 arguments")
+            elif name == "sg":
+                if len(args) != 4:
+                    errors.append("sg() expects 4 arguments")
+            elif name == "sign":
+                if len(args) != 1:
+                    errors.append("sign() expects 1 argument")
+            elif name == "joint_tau":
+                if len(args) != 7:
+                    errors.append("joint_tau() expects 7 arguments")
+            else:
+                errors.append(f"Unknown function: {node[1]}")
+            for arg in args:
+                errors.extend(PlotWindow._expr_validation_errors(arg))
+            return errors
+        return [f"Unknown expression node: {kind}"]
+
+    def _direct_derived_dependents(self, var_name):
+        dependents = []
+        for name, spec in self.curve_specs.items():
+            if name == var_name or spec.get("kind") != "expr":
+                continue
+            if var_name in self._expr_refs(spec.get("ast")):
+                dependents.append(name)
+        return sorted(dependents)
+
+    def _derived_dependents(self, var_name):
+        dependents = []
+        seen = set()
+        stack = [var_name]
+        while stack:
+            current = stack.pop()
+            for dependent in self._direct_derived_dependents(current):
+                if dependent in seen:
+                    continue
+                seen.add(dependent)
+                dependents.append(dependent)
+                stack.append(dependent)
+        return dependents
+
+    def _expr_would_create_cycle(self, curve_name, ast):
+        def reaches_target(ref_name, seen):
+            if ref_name == curve_name:
+                return True
+            if ref_name in seen:
+                return False
+            seen.add(ref_name)
+
+            spec = self.curve_specs.get(ref_name)
+            if not spec or spec.get("kind") != "expr":
+                return False
+            return any(
+                reaches_target(child_ref, seen)
+                for child_ref in self._expr_refs(spec.get("ast"))
+            )
+
+        return any(
+            reaches_target(ref_name, set())
+            for ref_name in self._expr_refs(ast)
+        )
+
+    def _derive_name_from_expr(self, expr_text):
+        try:
+            ast = CurveExpressionParser(expr_text).parse()
+        except CurveExpressionError:
+            return self._next_derived_name()
+
+        if ast[0] == "call" and ast[1].lower() == "d" and len(ast[2]) == 1 and ast[2][0][0] == "ref":
+            return f"d_{ast[2][0][1]}"
+        if ast[0] == "call" and ast[1].lower() in ("smooth", "soomth") and len(ast[2]) >= 1 and ast[2][0][0] == "ref":
+            return f"smooth_{ast[2][0][1]}"
+        if ast[0] == "call" and ast[1].lower() == "sg" and len(ast[2]) >= 1 and ast[2][0][0] == "ref":
+            suffix = "sg"
+            if len(ast[2]) >= 4 and ast[2][3][0] == "num":
+                suffix = f"sg{int(ast[2][3][1])}"
+            return f"{suffix}_{ast[2][0][1]}"
+        if ast[0] == "call" and ast[1].lower() == "sign" and len(ast[2]) == 1 and ast[2][0][0] == "ref":
+            return f"sign_{ast[2][0][1]}"
+        if ast[0] == "call" and ast[1].lower() == "joint_tau" and len(ast[2]) >= 1 and ast[2][0][0] == "ref":
+            return f"joint_tau_{ast[2][0][1]}"
+        return self._next_derived_name()
+
+    @staticmethod
+    def _insert_line_edit_text(line_edit, text):
+        cursor = line_edit.cursorPosition()
+        selected = line_edit.selectedText()
+        current = line_edit.text()
+        if selected:
+            start = line_edit.selectionStart()
+            end = start + len(selected)
+            line_edit.setText(current[:start] + text + current[end:])
+            line_edit.setCursorPosition(start + len(text))
+            return
+        line_edit.setText(current[:cursor] + text + current[cursor:])
+        line_edit.setCursorPosition(cursor + len(text))
+
+    @staticmethod
+    def _delete_line_edit_text(line_edit):
+        selected = line_edit.selectedText()
+        current = line_edit.text()
+        if selected:
+            start = line_edit.selectionStart()
+            end = start + len(selected)
+            line_edit.setText(current[:start] + current[end:])
+            line_edit.setCursorPosition(start)
+            return
+        cursor = line_edit.cursorPosition()
+
+        def bracket_ref_span_at(index):
+            if index < 0 or index >= len(current):
+                return None
+            left = current.rfind("[", 0, index + 1)
+            right = current.find("]", index)
+            if left < 0 or right < 0 or left > right:
+                return None
+            if "[" in current[left + 1:right] or "]" in current[left + 1:right]:
+                return None
+            name = current[left + 1:right].strip()
+            if not name:
+                return None
+            return left, right + 1
+
+        span = None
+        for index in (cursor - 1, cursor):
+            span = bracket_ref_span_at(index)
+            if span is not None:
+                break
+        if span is not None:
+            start, end = span
+            line_edit.setText(current[:start] + current[end:])
+            line_edit.setCursorPosition(start)
             return
 
-        child_name = self._derivative_name_for_parent(parent_name)
-        if child_name in self.curves:
-            self.set_curve_visibility(child_name, True)
-            self.select_curve(child_name)
+        if cursor > 0:
+            line_edit.setText(current[:cursor - 1] + current[cursor:])
+            line_edit.setCursorPosition(cursor - 1)
+        elif current:
+            line_edit.setText(current[1:])
+            line_edit.setCursorPosition(0)
+
+    @staticmethod
+    def _format_curve_ref(var_name):
+        name = str(var_name or "")
+        if "]" in name:
+            return f"/{name}"
+        return f"[{name}]"
+
+    def _insert_expr_wrapped(self, expr_edit, template, default_inner):
+        selected = expr_edit.selectedText()
+        current = expr_edit.text().strip()
+        inner = selected or current or default_inner
+        if "{}" in template:
+            text = template.format(inner)
+        else:
+            text = template
+        if selected:
+            self._insert_line_edit_text(expr_edit, text)
+        else:
+            expr_edit.setText(text)
+            expr_edit.setCursorPosition(len(text))
+
+    def open_derived_curve_dialog(self, edit_name=None):
+        if not isinstance(edit_name, str):
+            edit_name = None
+        editing = bool(edit_name and self._is_derived_curve(edit_name))
+        if edit_name and not editing:
+            QMessageBox.warning(self, "Derived curve", f"Curve '{edit_name}' is not a derived curve.")
             return
 
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit Derived Curve" if editing else "Create Derived Curve")
+        layout = QVBoxLayout(dialog)
+
+        selected_ref = self._format_curve_ref(self.selected_var_name) if self.selected_var_name else ""
+        spec = self.curve_specs.get(edit_name, {}) if editing else {}
+        initial_name = edit_name if editing else self._next_derived_name()
+        initial_expr = spec.get("expr", "") if editing else selected_ref
+
+        name_edit = QLineEdit(initial_name)
+        name_edit.setReadOnly(editing)
+        expr_edit = QLineEdit(initial_expr)
+
+        form = QFormLayout()
+        form.addRow("Name:", name_edit)
+        form.addRow("Expr:", expr_edit)
+        layout.addLayout(form)
+
+        variable_combo = QComboBox()
+        variable_combo.addItems(list(self.signal_variables))
+
+        def current_variable_ref():
+            return self._format_curve_ref(variable_combo.currentText()) if variable_combo.currentText() else ""
+
+        variable_layout = QHBoxLayout()
+        function_layout = QHBoxLayout()
+        insert_variable_btn = QPushButton("Insert")
+        d_btn = QPushButton("d()")
+        smooth_btn = QPushButton("smooth()")
+        sg0_btn = QPushButton("sg0()")
+        sg1_btn = QPushButton("sg1()")
+        sg2_btn = QPushButton("sg2()")
+        sign_btn = QPushButton("sign()")
+        joint_tau_btn = QPushButton("joint_tau()")
+        operator_buttons = []
+        for label, token in (("+", " + "), ("-", " - "), ("*", " * "), ("/", " / "), ("(", "("), (")", ")")):
+            btn = QPushButton(label)
+            btn.setFixedWidth(28)
+            btn.clicked.connect(lambda _checked=False, token=token: self._insert_line_edit_text(expr_edit, token))
+            operator_buttons.append(btn)
+        delete_btn = QPushButton("Delete")
+        delete_btn.clicked.connect(lambda: self._delete_line_edit_text(expr_edit))
+
+        insert_variable_btn.clicked.connect(
+            lambda: self._insert_line_edit_text(expr_edit, current_variable_ref())
+        )
+        d_btn.clicked.connect(
+            lambda: (
+                self._insert_expr_wrapped(expr_edit, "d({})", current_variable_ref() or selected_ref),
+                None if editing else name_edit.setText(self._derive_name_from_expr(expr_edit.text()))
+            )
+        )
+        smooth_btn.clicked.connect(
+            lambda: (
+                self._insert_expr_wrapped(expr_edit, "smooth({}, 100)", current_variable_ref() or selected_ref),
+                None if editing else name_edit.setText(self._derive_name_from_expr(expr_edit.text()))
+            )
+        )
+        sg0_btn.clicked.connect(
+            lambda: (
+                self._insert_expr_wrapped(expr_edit, "sg({}, 150, 3, 0)", current_variable_ref() or selected_ref),
+                None if editing else name_edit.setText(self._derive_name_from_expr(expr_edit.text()))
+            )
+        )
+        sg1_btn.clicked.connect(
+            lambda: (
+                self._insert_expr_wrapped(expr_edit, "sg({}, 150, 3, 1)", current_variable_ref() or selected_ref),
+                None if editing else name_edit.setText(self._derive_name_from_expr(expr_edit.text()))
+            )
+        )
+        sg2_btn.clicked.connect(
+            lambda: (
+                self._insert_expr_wrapped(expr_edit, "sg({}, 150, 3, 2)", current_variable_ref() or selected_ref),
+                None if editing else name_edit.setText(self._derive_name_from_expr(expr_edit.text()))
+            )
+        )
+        sign_btn.clicked.connect(
+            lambda: (
+                self._insert_expr_wrapped(expr_edit, "sign({})", current_variable_ref() or selected_ref),
+                None if editing else name_edit.setText(self._derive_name_from_expr(expr_edit.text()))
+            )
+        )
+        joint_tau_btn.clicked.connect(
+            lambda: (
+                self._insert_expr_wrapped(
+                    expr_edit,
+                    "joint_tau({}, 150, 3, "
+                    "0.000569600381, 0.00162242739, 0.0405081479, 0.05)",
+                    current_variable_ref() or selected_ref or "[ServoRightDegOut]",
+                ),
+                None if editing else name_edit.setText(self._derive_name_from_expr(expr_edit.text()))
+            )
+        )
+
+        variable_layout.addWidget(QLabel("Variable:"))
+        variable_layout.addWidget(variable_combo, 1)
+        variable_layout.addWidget(insert_variable_btn)
+        for btn in operator_buttons:
+            variable_layout.addWidget(btn)
+        variable_layout.addWidget(delete_btn)
+        variable_layout.addStretch(1)
+
+        function_layout.addWidget(QLabel("Functions:"))
+        function_layout.addWidget(d_btn)
+        function_layout.addWidget(smooth_btn)
+        function_layout.addWidget(sg0_btn)
+        function_layout.addWidget(sg1_btn)
+        function_layout.addWidget(sg2_btn)
+        function_layout.addWidget(sign_btn)
+        function_layout.addWidget(joint_tau_btn)
+        function_layout.addStretch(1)
+
+        layout.addLayout(variable_layout)
+        layout.addLayout(function_layout)
+
+        validated = {}
+
+        def reject_with_message(message, focus_widget=None):
+            QMessageBox.warning(dialog, "Derived curve", message)
+            if focus_widget is not None:
+                focus_widget.setFocus()
+
+        def validate_and_accept():
+            name = edit_name if editing else name_edit.text().strip()
+            expr = expr_edit.text().strip()
+            if not name or not expr:
+                reject_with_message("Name and expression are required.", expr_edit if name else name_edit)
+                return
+            if name in self.curves and name != edit_name:
+                reject_with_message(f"Curve '{name}' already exists.", name_edit)
+                return
+
+            try:
+                ast = CurveExpressionParser(expr).parse()
+            except CurveExpressionError as exc:
+                reject_with_message(str(exc), expr_edit)
+                return
+
+            errors = self._expr_validation_errors(ast)
+            if errors:
+                reject_with_message("\n".join(errors), expr_edit)
+                return
+
+            refs = self._expr_refs(ast)
+            missing = sorted(ref for ref in refs if ref not in self.curves)
+            if missing:
+                reject_with_message(f"Unknown curve: {', '.join(missing)}", expr_edit)
+                return
+            if not refs:
+                reject_with_message("Expression must reference at least one curve.", expr_edit)
+                return
+            if self._expr_would_create_cycle(name, ast):
+                reject_with_message("Expression creates a derived-curve dependency cycle.", expr_edit)
+                return
+
+            validated["name"] = name
+            validated["expr"] = expr
+            validated["ast"] = ast
+            dialog.accept()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(validate_and_accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        name = validated["name"]
+        expr = validated["expr"]
+        ast = validated["ast"]
+
+        if editing:
+            self.update_derived_curve(name, expr, ast)
+        else:
+            self.create_derived_curve(name, expr, ast)
+
+    def edit_selected_derived_curve(self):
+        var_name = self.selected_var_name
+        if not var_name or not self._is_derived_curve(var_name):
+            return
+        self.open_derived_curve_dialog(edit_name=var_name)
+
+    def create_derived_curve(self, name, expr, ast):
         if not self._register_variable(
-            var_name=child_name,
+            var_name=name,
             checked=True,
             grid=None,
             columns=1,
             count_attr="signal_export_count",
-            create_control=False,
+            create_control=True,
         ):
             return
 
-        parent_color = self.colors.get(parent_name, self.get_default_color(parent_name))
-        child_color = self._lighten_rgb(parent_color)
-        self.colors[child_name] = child_color
-        self.default_colors[child_name] = child_color
-        self.derived_curve_sources[child_name] = parent_name
-        self.derived_curve_children.setdefault(parent_name, []).append(child_name)
+        self.curve_specs[name] = {"kind": "expr", "expr": expr, "ast": ast}
+        self.dynamic_signal_sections[name] = "Derived"
 
-        self._update_curve_pen(child_name)
-        self.refresh_curve(child_name)
-        self.select_curve(child_name)
+        section_info = self._get_or_create_signal_export_section("Derived")
+        if name not in section_info["items"]:
+            section_info["items"].append(name)
+        self._relayout_signal_export_section_items("Derived")
+        self._relayout_signal_export_sections()
+
+        base_color = self.colors.get(self.selected_var_name, self.get_default_color(name))
+        derived_color = self._lighten_rgb(base_color)
+        self.colors[name] = derived_color
+        self.default_colors[name] = derived_color
+        ctrl = self.var_controls.get(name)
+        if ctrl is not None:
+            ctrl.set_color(derived_color)
+
+        self._update_curve_pen(name)
+        self.refresh_curve(name)
+        self.select_curve(name)
+
+    def update_derived_curve(self, name, expr, ast):
+        if not self._is_derived_curve(name):
+            return
+
+        self.curve_specs[name] = {"kind": "expr", "expr": expr, "ast": ast}
+        self.refresh_all_curves(visible_only=True)
+        self._apply_auto_y_range()
+        self._set_selected_curve_focus_active(True)
+        self._update_selected_controls()
+
+    def _remove_curve_objects(self, var_name):
+        ctrl = self.var_controls.pop(var_name, None)
+        if ctrl is not None:
+            ctrl.setParent(None)
+            ctrl.deleteLater()
+
+        curve = self.curves.pop(var_name, None)
+        if curve is not None:
+            self.plot_widget.removeItem(curve)
+
+        self.colors.pop(var_name, None)
+        self.default_colors.pop(var_name, None)
+        self.curve_transforms.pop(var_name, None)
+        self.curve_specs.pop(var_name, None)
+        self.dynamic_signal_sections.pop(var_name, None)
+
+        if var_name in self.signal_variables:
+            self.signal_variables.remove(var_name)
+        if self.selected_var_name == var_name:
+            self.selected_var_name = None
+            self.selected_curve_focus_active = False
+            self._hide_selected_hover_point()
+
+    def _remove_names_from_signal_sections(self, names):
+        names = set(names)
+        for section in list(self.signal_export_section_order):
+            info = self.signal_export_sections.get(section)
+            if not info:
+                continue
+
+            info["items"] = [
+                name for name in info.get("items", [])
+                if name not in names
+            ]
+            if section == "Derived" and not info["items"]:
+                box = info.get("box")
+                if box is not None:
+                    box.setParent(None)
+                    box.deleteLater()
+                self.signal_export_sections.pop(section, None)
+                self.signal_export_section_order.remove(section)
+            else:
+                self._relayout_signal_export_section_items(section)
+
+        self._relayout_signal_export_sections()
+
+    def _delete_derived_curves(self, names):
+        names = [
+            name for name in names
+            if self._is_derived_curve(name)
+        ]
+        if not names:
+            return
+
+        for var_name in names:
+            self._remove_curve_objects(var_name)
+
+        self._remove_names_from_signal_sections(names)
+        self._apply_auto_y_range()
+        self._update_selected_controls()
+
+    def delete_selected_derived_curve(self):
+        var_name = self.selected_var_name
+        if not var_name or not self._is_derived_curve(var_name):
+            return
+
+        dependents = self._derived_dependents(var_name)
+        if dependents:
+            dependent_text = "\n".join(f"- {name}" for name in dependents)
+            message = (
+                f"Derived curve '{var_name}' is used by:\n"
+                f"{dependent_text}\n\n"
+                "Force delete will also delete these dependent derived curves. Continue?"
+            )
+        else:
+            message = f"Delete derived curve '{var_name}'?"
+
+        reply = QMessageBox.question(
+            self,
+            "Delete derived curve",
+            message,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._delete_derived_curves([var_name] + dependents)
 
     def _curve_pen_width(self, var_name):
         return 4 if var_name == self.selected_var_name and self.selected_curve_focus_active else 2
@@ -1850,7 +2882,10 @@ class PlotWindow(QWidget):
         box.setLayout(grid)
         info = {"box": box, "grid": grid, "items": []}
         self.signal_export_sections[section] = info
-        self.signal_export_section_order.append(section)
+        if section == "Derived":
+            self.signal_export_section_order.insert(0, section)
+        else:
+            self.signal_export_section_order.append(section)
         self._relayout_signal_export_sections()
         return info
 
@@ -1888,29 +2923,11 @@ class PlotWindow(QWidget):
             self.signal_export_container.adjustSize()
 
     def _clear_derived_curves(self):
-        derived_names = list(self.derived_curve_sources.keys())
-        for var_name in derived_names:
-            ctrl = self.var_controls.pop(var_name, None)
-            if ctrl is not None:
-                ctrl.setParent(None)
-                ctrl.deleteLater()
-
-            curve = self.curves.pop(var_name, None)
-            if curve is not None:
-                self.plot_widget.removeItem(curve)
-
-            self.colors.pop(var_name, None)
-            self.default_colors.pop(var_name, None)
-            self.curve_transforms.pop(var_name, None)
-            if var_name in self.signal_variables:
-                self.signal_variables.remove(var_name)
-            if self.selected_var_name == var_name:
-                self.selected_var_name = None
-                self.selected_curve_focus_active = False
-
-        self.derived_curve_sources = {}
-        self.derived_curve_children = {}
-        self._update_selected_controls()
+        derived_names = [
+            name for name, spec in self.curve_specs.items()
+            if spec.get("kind") == "expr"
+        ]
+        self._delete_derived_curves(derived_names)
 
     def _clear_dynamic_signal_controls(self):
         self._clear_derived_curves()

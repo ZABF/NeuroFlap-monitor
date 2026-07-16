@@ -74,7 +74,7 @@ class _DummyDataModel:
     def __init__(self):
         self.records = []
 
-    def add_data(self, src, unix_timestamp, src_timestamp, data):
+    def add_data(self, src, unix_timestamp, src_timestamp, data, **_kwargs):
         self.records.append((src, unix_timestamp, src_timestamp, dict(data)))
 
 

@@ -13,6 +13,7 @@ import MoCap.LuMo.LuMoSDKClient as LuMoSDKClient
 
 class DataReceiver:
     NF_SOURCE_PREFIX = "udp:nf:"
+    NF_CLOCK_SOURCE = "udp:nf:clock"
     NF_SCHEMA_RETRY_MS = 1000
     NF_CONNECT_RETRY_MS = 200
     NF_CONNECT_TIMEOUT_MS = 5000
@@ -682,7 +683,8 @@ class DataReceiver:
                 self.nf_packet_gap_count += 1
         self.nf_last_packet_seq = packet["packet_seq"]
 
-        # Offset estimate uses packet send_us; each sample source time is reconstructed by build_us - dt_us.
+        # Offset estimate uses one shared NF clock source. Each variable still keeps
+        # its own timestamp queue, but all NF variables share the packet send_us offset.
         build_us = int(packet["build_us"])
         send_timestamp_ms = packet["send_us"] / 1000.0
         for item in packet["items"]:
@@ -697,9 +699,15 @@ class DataReceiver:
             dt_us = int(item.get("dt_us", 0)) & 0xFFFF
             src_us = build_us - dt_us if build_us >= dt_us else 0
             src_timestamp_ms = src_us / 1000.0
-            unix_for_offset = unix_ts + (src_timestamp_ms - send_timestamp_ms)
             src = f"{self.NF_SOURCE_PREFIX}{desc['gid']}"
-            self.data_model.add_data(src, unix_for_offset, src_timestamp_ms, {desc["var_name"]: value})
+            self.data_model.add_data(
+                src,
+                unix_ts,
+                src_timestamp_ms,
+                {desc["var_name"]: value},
+                offset_src=self.NF_CLOCK_SOURCE,
+                offset_timestamp=send_timestamp_ms,
+            )
 
     def _process_udp_packet(self, data, unix_ts, meta):
         remote_addr = meta.get("remote_addr")

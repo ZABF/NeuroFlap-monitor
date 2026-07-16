@@ -7,6 +7,7 @@ from typing import Deque, Dict, Optional, Tuple
 @dataclass
 class SourceBucket:
     src: str
+    offset_src: Optional[str] = None
     src_timestamp: Deque[float] = field(default_factory=deque)
     recon_timestamp: Deque[float] = field(default_factory=deque)
     session: Deque[int] = field(default_factory=deque)
@@ -59,26 +60,56 @@ class DataModel:
         self.ensure_source(var_bucket.src)
         var_bucket.value.append(float(value))
 
-    def update_source_timestamp(self, src: str, unix_timestamp: float, src_timestamp: float) -> None:
+    def update_source_timestamp(
+        self,
+        src: str,
+        unix_timestamp: float,
+        src_timestamp: float,
+        *,
+        offset_src: Optional[str] = None,
+        offset_timestamp: Optional[float] = None,
+    ) -> None:
         source_bucket = self.ensure_source(src)
-        if (
-            source_bucket.last_src_timestamp is not None
-            and abs(src_timestamp - source_bucket.last_src_timestamp) > self.JUMP_THRESHOLD_MS
-        ):
-            source_bucket.current_session += 1
-        source_bucket.last_src_timestamp = src_timestamp
+        clock_src = offset_src or src
+        clock_timestamp = float(src_timestamp if offset_timestamp is None else offset_timestamp)
+        clock_bucket = self.ensure_source(clock_src)
+        source_bucket.offset_src = clock_src
 
-        offset_key = (src, source_bucket.current_session)
-        current_offset = unix_timestamp - src_timestamp
+        if (
+            clock_bucket.last_src_timestamp is not None
+            and abs(clock_timestamp - clock_bucket.last_src_timestamp) > self.JUMP_THRESHOLD_MS
+        ):
+            clock_bucket.current_session += 1
+        clock_bucket.last_src_timestamp = clock_timestamp
+        if clock_bucket is not source_bucket:
+            source_bucket.last_src_timestamp = src_timestamp
+
+        offset_key = (clock_src, clock_bucket.current_session)
+        current_offset = unix_timestamp - clock_timestamp
         last_offset = self.offsets.get(offset_key)
         if last_offset is None or current_offset < last_offset:
             self.offsets[offset_key] = current_offset
 
         recon_timestamp = src_timestamp + self.offsets[offset_key]
-        self.add_timestamp(src, src_timestamp, recon_timestamp, source_bucket.current_session)
+        self.add_timestamp(src, src_timestamp, recon_timestamp, clock_bucket.current_session)
 
-    def add_data(self, src: str, unix_timestamp: float, src_timestamp: float, data) -> None:
-        self.update_source_timestamp(src, unix_timestamp, src_timestamp)
+    def add_data(
+        self,
+        src: str,
+        unix_timestamp: float,
+        src_timestamp: float,
+        data,
+        *,
+        offset_src: Optional[str] = None,
+        offset_timestamp: Optional[float] = None,
+    ) -> None:
+        self.update_source_timestamp(
+            src,
+            unix_timestamp,
+            src_timestamp,
+            offset_src=offset_src,
+            offset_timestamp=offset_timestamp,
+        )
         for key, value in data.items():
             self.add_value(key, src, value)
 
@@ -95,6 +126,7 @@ class DataModel:
             var_bucket = self.ensure_var(var, src)
 
         self.offsets[(src, 1)] = 0.0
+        source_bucket.offset_src = src
         source_bucket.current_session = 1
         source_bucket.last_src_timestamp = float(timestamps[count - 1])
         for i in range(count):
@@ -117,21 +149,21 @@ class DataModel:
         if count == 0:
             return [], []
 
-        recon_ts = list(source_bucket.recon_timestamp)[:count]
+        src_ts = list(source_bucket.src_timestamp)[:count]
+        sessions = list(source_bucket.session)[:count]
+        offset_src = source_bucket.offset_src or var_bucket.src
+        timestamps = [
+            src_t + self.offsets.get((offset_src, session_id), 0.0)
+            for src_t, session_id in zip(src_ts, sessions)
+        ]
         if series_time_ms is not None and series_time_ms >= 0:
-            cutoff = recon_ts[-1] - series_time_ms
-            start_idx = bisect_left(recon_ts, cutoff)
+            cutoff = timestamps[-1] - series_time_ms
+            start_idx = bisect_left(timestamps, cutoff)
         else:
             start_idx = 0
 
-        src_ts = list(source_bucket.src_timestamp)[start_idx:count]
-        sessions = list(source_bucket.session)[start_idx:count]
         values = list(var_bucket.value)[start_idx:count]
-        timestamps = [
-            src_t + self.offsets.get((var_bucket.src, session_id), 0.0)
-            for src_t, session_id in zip(src_ts, sessions)
-        ]
-        return timestamps, values
+        return timestamps[start_idx:count], values
 
     def get_series_fast(self, var: str, series_time_ms: float):
         del series_time_ms
@@ -162,6 +194,7 @@ class DataModel:
             source_bucket.src_timestamp.clear()
             source_bucket.recon_timestamp.clear()
             source_bucket.session.clear()
+            source_bucket.offset_src = None
             source_bucket.last_src_timestamp = None
             source_bucket.current_session = 1
 
