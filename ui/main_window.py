@@ -322,9 +322,9 @@ class PlotWindow(QWidget):
         self.nf_port_input = QLineEdit("28080")
         self.nf_port_input.setFixedWidth(80)
         self.nf_connect_btn = QPushButton("Connect")
-        self.nf_connect_btn.clicked.connect(self.connect_nfv1)
+        self.nf_connect_btn.clicked.connect(self.connect_nfv3)
         self.nf_disconnect_btn = QPushButton("Disconnect")
-        self.nf_disconnect_btn.clicked.connect(self.disconnect_nfv1)
+        self.nf_disconnect_btn.clicked.connect(self.disconnect_nfv3)
         self.nf_status_label = QLabel("● Disconnected")
         self.nf_status_label.setStyleSheet("color: #808080;")
         self.nf_local_ip_label = QLabel("0.0.0.0")
@@ -333,12 +333,12 @@ class PlotWindow(QWidget):
 
         # ===== 鍙橀噺鍕鹃€夊尯鍩?=====
         self.var_controls = {}
-        self.signal_export_grid = None
-        self.signal_export_scroll = None
-        self.signal_export_container = None
-        self.signal_export_count = 0
-        self.signal_export_sections = {}
-        self.signal_export_section_order = []
+        self.dataflow_export_grid = None
+        self.dataflow_export_scroll = None
+        self.dataflow_export_container = None
+        self.dataflow_export_count = 0
+        self.dataflow_export_sections = {}
+        self.dataflow_export_section_order = []
         self.tf_signal_grid = None
         self.tf_signal_count = 0
         self.mocap_signal_grid = None
@@ -380,22 +380,22 @@ class PlotWindow(QWidget):
         self.tf_signal_grid = tf_signal_grid
 
         # Dynamic signal controls from ESP32 schema response.
-        signal_export_scroll = QScrollArea()
-        signal_export_scroll.setWidgetResizable(False)
-        signal_export_scroll.setFrameShape(QFrame.NoFrame)
-        signal_export_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        signal_export_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        signal_export_container = QWidget()
-        signal_export_grid = QGridLayout(signal_export_container)
-        signal_export_grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        signal_export_grid.setSizeConstraint(QLayout.SetMinimumSize)
-        signal_export_grid.setContentsMargins(0, 0, 0, 0)
-        signal_export_grid.setHorizontalSpacing(8)
-        signal_export_grid.setVerticalSpacing(8)
-        signal_export_scroll.setWidget(signal_export_container)
-        self.signal_export_scroll = signal_export_scroll
-        self.signal_export_container = signal_export_container
-        self.signal_export_grid = signal_export_grid
+        dataflow_export_scroll = QScrollArea()
+        dataflow_export_scroll.setWidgetResizable(False)
+        dataflow_export_scroll.setFrameShape(QFrame.NoFrame)
+        dataflow_export_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        dataflow_export_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        dataflow_export_container = QWidget()
+        dataflow_export_grid = QGridLayout(dataflow_export_container)
+        dataflow_export_grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        dataflow_export_grid.setSizeConstraint(QLayout.SetMinimumSize)
+        dataflow_export_grid.setContentsMargins(0, 0, 0, 0)
+        dataflow_export_grid.setHorizontalSpacing(8)
+        dataflow_export_grid.setVerticalSpacing(8)
+        dataflow_export_scroll.setWidget(dataflow_export_container)
+        self.dataflow_export_scroll = dataflow_export_scroll
+        self.dataflow_export_container = dataflow_export_container
+        self.dataflow_export_grid = dataflow_export_grid
 
         # MoCap fixed variables.
         mocap_signal_grid = QGridLayout()
@@ -495,23 +495,23 @@ class PlotWindow(QWidget):
         neuroflap_page_layout = QVBoxLayout(neuroflap_page)
         neuroflap_page_layout.setContentsMargins(4, 4, 4, 4)
         neuroflap_page_layout.setSpacing(3)
-        nfv1_ctrl_layout = QHBoxLayout()
-        nfv1_ctrl_layout.setContentsMargins(0, 0, 0, 0)
-        nfv1_ctrl_layout.setSpacing(6)
-        nfv1_ctrl_layout.addWidget(QLabel("Local IP:"))
-        nfv1_ctrl_layout.addWidget(self.nf_local_ip_label)
-        nfv1_ctrl_layout.addWidget(QLabel("ESP32 IP:"))
-        nfv1_ctrl_layout.addWidget(self.nf_ip_input)
-        nfv1_ctrl_layout.addWidget(QLabel("Port:"))
-        nfv1_ctrl_layout.addWidget(self.nf_port_input)
-        nfv1_ctrl_layout.addWidget(self.nf_connect_btn)
-        nfv1_ctrl_layout.addWidget(self.nf_disconnect_btn)
-        nfv1_ctrl_layout.addWidget(self.nf_status_label)
-        nfv1_ctrl_layout.addStretch()
-        neuroflap_page_layout.addLayout(nfv1_ctrl_layout)
+        nfv3_ctrl_layout = QHBoxLayout()
+        nfv3_ctrl_layout.setContentsMargins(0, 0, 0, 0)
+        nfv3_ctrl_layout.setSpacing(6)
+        nfv3_ctrl_layout.addWidget(QLabel("Local IP:"))
+        nfv3_ctrl_layout.addWidget(self.nf_local_ip_label)
+        nfv3_ctrl_layout.addWidget(QLabel("ESP32 IP:"))
+        nfv3_ctrl_layout.addWidget(self.nf_ip_input)
+        nfv3_ctrl_layout.addWidget(QLabel("Port:"))
+        nfv3_ctrl_layout.addWidget(self.nf_port_input)
+        nfv3_ctrl_layout.addWidget(self.nf_connect_btn)
+        nfv3_ctrl_layout.addWidget(self.nf_disconnect_btn)
+        nfv3_ctrl_layout.addWidget(self.nf_status_label)
+        nfv3_ctrl_layout.addStretch()
+        neuroflap_page_layout.addLayout(nfv3_ctrl_layout)
         neuroflap_page_layout.addWidget(self.nf_busy_label)
-        neuroflap_page_layout.addWidget(QLabel("ESP32 Signal Export (Dynamic):"))
-        neuroflap_page_layout.addWidget(signal_export_scroll, 1)
+        neuroflap_page_layout.addWidget(QLabel("ESP32 Dataflow Export (Dynamic):"))
+        neuroflap_page_layout.addWidget(dataflow_export_scroll, 1)
 
         bota_page = QWidget()
         bota_page_layout = QVBoxLayout(bota_page)
@@ -705,7 +705,7 @@ class PlotWindow(QWidget):
 
         self.plot_state = PlotState.IDLE
         self.last_plot_state = PlotState.IDLE
-        self.update_nfv1_status()
+        self.update_nfv3_status()
 
     def toggle_mocap(self):
         # HACK: multi rigid
@@ -781,7 +781,7 @@ class PlotWindow(QWidget):
             self.data_receiver.transport_enabled = False
             print("Transport disenable ")
 
-    def connect_nfv1(self):
+    def connect_nfv3(self):
         target_ip = self.nf_ip_input.text().strip()
         if not target_ip:
             QMessageBox.warning(self, "Input Error", "ESP32 IP cannot be empty.")
@@ -791,15 +791,15 @@ class PlotWindow(QWidget):
         except ValueError:
             QMessageBox.warning(self, "Input Error", "Port must be an integer.")
             return
-        self.data_receiver.connect_nfv1(target_ip, target_port)
-        self.update_nfv1_status()
+        self.data_receiver.connect_nfv3(target_ip, target_port)
+        self.update_nfv3_status()
 
-    def disconnect_nfv1(self):
-        self.data_receiver.disconnect_nfv1()
-        self.update_nfv1_status()
+    def disconnect_nfv3(self):
+        self.data_receiver.disconnect_nfv3()
+        self.update_nfv3_status()
 
-    def update_nfv1_status(self):
-        status = self.data_receiver.get_nfv1_status()
+    def update_nfv3_status(self):
+        status = self.data_receiver.get_nfv3_status()
         state = status.get("state", "disconnected")
         local_ip = status.get("local_ip", "0.0.0.0")
         self.nf_local_ip_label.setText(f"{local_ip}")
@@ -833,7 +833,7 @@ class PlotWindow(QWidget):
 
     def update_misc_tasks(self):
         self.update_bota_status_label()
-        self.update_nfv1_status()
+        self.update_nfv3_status()
         self.refresh_serial_ports()
 
     def update_bota_status_label(self):
@@ -1090,7 +1090,7 @@ class PlotWindow(QWidget):
             for name, data in series.items()
             if name not in self.curves
         ]
-        self.register_signal_export_descriptors(descriptors)
+        self.register_dataflow_export_descriptors(descriptors)
 
         all_timestamps = []
         source_prefix = f"csv:{os.path.basename(path)}:"
@@ -2348,7 +2348,7 @@ class PlotWindow(QWidget):
             checked=True,
             grid=None,
             columns=1,
-            count_attr="signal_export_count",
+            count_attr="dataflow_export_count",
             create_control=True,
         ):
             return
@@ -2356,11 +2356,11 @@ class PlotWindow(QWidget):
         self.curve_specs[name] = {"kind": "expr", "expr": expr, "ast": ast}
         self.dynamic_signal_sections[name] = "Derived"
 
-        section_info = self._get_or_create_signal_export_section("Derived")
+        section_info = self._get_or_create_dataflow_export_section("Derived")
         if name not in section_info["items"]:
             section_info["items"].append(name)
-        self._relayout_signal_export_section_items("Derived")
-        self._relayout_signal_export_sections()
+        self._relayout_dataflow_export_section_items("Derived")
+        self._relayout_dataflow_export_sections()
 
         base_color = self.colors.get(self.selected_var_name, self.get_default_color(name))
         derived_color = self._lighten_rgb(base_color)
@@ -2409,8 +2409,8 @@ class PlotWindow(QWidget):
 
     def _remove_names_from_signal_sections(self, names):
         names = set(names)
-        for section in list(self.signal_export_section_order):
-            info = self.signal_export_sections.get(section)
+        for section in list(self.dataflow_export_section_order):
+            info = self.dataflow_export_sections.get(section)
             if not info:
                 continue
 
@@ -2423,12 +2423,12 @@ class PlotWindow(QWidget):
                 if box is not None:
                     box.setParent(None)
                     box.deleteLater()
-                self.signal_export_sections.pop(section, None)
-                self.signal_export_section_order.remove(section)
+                self.dataflow_export_sections.pop(section, None)
+                self.dataflow_export_section_order.remove(section)
             else:
-                self._relayout_signal_export_section_items(section)
+                self._relayout_dataflow_export_section_items(section)
 
-        self._relayout_signal_export_sections()
+        self._relayout_dataflow_export_sections()
 
     def _delete_derived_curves(self, names):
         names = [
@@ -2867,9 +2867,9 @@ class PlotWindow(QWidget):
             create_control=show_control,
         )
 
-    def _get_or_create_signal_export_section(self, section_name):
+    def _get_or_create_dataflow_export_section(self, section_name):
         section = (section_name or "Other").strip() or "Other"
-        info = self.signal_export_sections.get(section)
+        info = self.dataflow_export_sections.get(section)
         if info is not None:
             return info
 
@@ -2881,12 +2881,12 @@ class PlotWindow(QWidget):
         grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         box.setLayout(grid)
         info = {"box": box, "grid": grid, "items": []}
-        self.signal_export_sections[section] = info
+        self.dataflow_export_sections[section] = info
         if section == "Derived":
-            self.signal_export_section_order.insert(0, section)
+            self.dataflow_export_section_order.insert(0, section)
         else:
-            self.signal_export_section_order.append(section)
-        self._relayout_signal_export_sections()
+            self.dataflow_export_section_order.append(section)
+        self._relayout_dataflow_export_sections()
         return info
 
     @staticmethod
@@ -2896,20 +2896,20 @@ class PlotWindow(QWidget):
         while layout.count():
             layout.takeAt(0)
 
-    def _relayout_signal_export_sections(self):
-        if self.signal_export_grid is None:
+    def _relayout_dataflow_export_sections(self):
+        if self.dataflow_export_grid is None:
             return
-        self._detach_layout_items(self.signal_export_grid)
-        for idx, section in enumerate(self.signal_export_section_order):
-            info = self.signal_export_sections.get(section)
+        self._detach_layout_items(self.dataflow_export_grid)
+        for idx, section in enumerate(self.dataflow_export_section_order):
+            info = self.dataflow_export_sections.get(section)
             if not info:
                 continue
-            self.signal_export_grid.addWidget(info["box"], 0, idx, alignment=Qt.AlignTop | Qt.AlignLeft)
-        if self.signal_export_container is not None:
-            self.signal_export_container.adjustSize()
+            self.dataflow_export_grid.addWidget(info["box"], 0, idx, alignment=Qt.AlignTop | Qt.AlignLeft)
+        if self.dataflow_export_container is not None:
+            self.dataflow_export_container.adjustSize()
 
-    def _relayout_signal_export_section_items(self, section_name):
-        info = self.signal_export_sections.get(section_name)
+    def _relayout_dataflow_export_section_items(self, section_name):
+        info = self.dataflow_export_sections.get(section_name)
         if not info:
             return
         grid = info["grid"]
@@ -2919,8 +2919,8 @@ class PlotWindow(QWidget):
             if ctrl is None:
                 continue
             grid.addWidget(ctrl, idx, 0, alignment=Qt.AlignLeft)
-        if self.signal_export_container is not None:
-            self.signal_export_container.adjustSize()
+        if self.dataflow_export_container is not None:
+            self.dataflow_export_container.adjustSize()
 
     def _clear_derived_curves(self):
         derived_names = [
@@ -2951,7 +2951,7 @@ class PlotWindow(QWidget):
                 self.selected_var_name = None
                 self.selected_curve_focus_active = False
 
-        for info in self.signal_export_sections.values():
+        for info in self.dataflow_export_sections.values():
             box = info.get("box")
             if box is not None:
                 box.setParent(None)
@@ -2959,15 +2959,15 @@ class PlotWindow(QWidget):
 
         self.dynamic_signal_variables = []
         self.dynamic_signal_sections = {}
-        self.signal_export_sections = {}
-        self.signal_export_section_order = []
-        self.signal_export_count = 0
-        self._detach_layout_items(self.signal_export_grid)
-        if self.signal_export_container is not None:
-            self.signal_export_container.adjustSize()
+        self.dataflow_export_sections = {}
+        self.dataflow_export_section_order = []
+        self.dataflow_export_count = 0
+        self._detach_layout_items(self.dataflow_export_grid)
+        if self.dataflow_export_container is not None:
+            self.dataflow_export_container.adjustSize()
         self._update_selected_controls()
 
-    def register_signal_export_descriptors(self, descriptors):
+    def register_dataflow_export_descriptors(self, descriptors):
         added = []
         changed_sections = set()
         for desc in descriptors:
@@ -2982,7 +2982,7 @@ class PlotWindow(QWidget):
                     checked=checked,
                     grid=None,
                     columns=1,
-                    count_attr="signal_export_count",
+                    count_attr="dataflow_export_count",
                 ):
                     added.append(var_name)
             elif var_name not in self.var_controls:
@@ -2998,7 +2998,7 @@ class PlotWindow(QWidget):
             if last_section == section:
                 continue
             if last_section:
-                last_info = self.signal_export_sections.get(last_section)
+                last_info = self.dataflow_export_sections.get(last_section)
                 if last_info and var_name in last_info.get("items", []):
                     last_info["items"].remove(var_name)
                     changed_sections.add(last_section)
@@ -3006,21 +3006,21 @@ class PlotWindow(QWidget):
             ctrl = self.var_controls.get(var_name)
             if ctrl is None:
                 continue
-            section_info = self._get_or_create_signal_export_section(section)
+            section_info = self._get_or_create_dataflow_export_section(section)
             if var_name not in section_info["items"]:
                 section_info["items"].append(var_name)
             changed_sections.add(section)
 
         for section in changed_sections:
-            self._relayout_signal_export_section_items(section)
+            self._relayout_dataflow_export_section_items(section)
         if changed_sections:
-            self._relayout_signal_export_sections()
+            self._relayout_dataflow_export_sections()
 
         return added
 
-    def register_signal_export_variables(self, names):
+    def register_dataflow_export_variables(self, names):
         descriptors = [{"var_name": name, "section": "Other"} for name in names]
-        return self.register_signal_export_descriptors(descriptors)
+        return self.register_dataflow_export_descriptors(descriptors)
 
     def set_curve_visibility(self, var_name, visible):
         if var_name in self.curves:
@@ -3050,13 +3050,13 @@ class PlotWindow(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._relayout_signal_export_sections()
-        for section in self.signal_export_section_order:
-            self._relayout_signal_export_section_items(section)
+        self._relayout_dataflow_export_sections()
+        for section in self.dataflow_export_section_order:
+            self._relayout_dataflow_export_section_items(section)
 
     def closeEvent(self, event):
         try:
-            self.data_receiver.disconnect_nfv1()
+            self.data_receiver.disconnect_nfv3()
             self.data_receiver.stop()
         except Exception:
             pass

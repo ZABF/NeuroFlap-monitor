@@ -7,7 +7,7 @@ import numpy as np
 
 from bota_lite import BotaSerialSensor
 from data_parser import DataParser
-from nfv1_parser import NFv1Parser
+from nfv3_parser import NFv3Parser
 import MoCap.LuMo.LuMoSDKClient as LuMoSDKClient
 
 
@@ -72,19 +72,17 @@ class DataReceiver:
         self.running = False
         self.pending_queue = deque()
         self.parser = DataParser()
-        self.nf_parser = NFv1Parser()
+        self.nf_parser = NFv3Parser()
         self.first_ft_received_flag = False
         self.first_udp_received_flag = False
 
         self.nf_schema = {}
         self.nf_schema_order = []
-        self.nf_schema_by_signal_no = {}
+        self.nf_schema_by_endpoint_no = {}
         self.nf_schema_generation = None
-        self.nf_schema_section_mask = 0
         self.nf_schema_chunks = {}
         self.nf_schema_chunk_total = 0
         self.nf_schema_chunk_generation = None
-        self.nf_schema_chunk_section_mask = 0
         self.nf_request_id = 0
         self.nf_last_schema_request_ms = 0.0
         self.nf_schema_req_sent_count = 0
@@ -174,7 +172,7 @@ class DataReceiver:
             pass
         return self.nf_local_ip
 
-    def connect_nfv1(self, target_ip=None, target_port=None):
+    def connect_nfv3(self, target_ip=None, target_port=None):
         if target_ip:
             self.udp_target_ip = target_ip
         if target_port:
@@ -184,13 +182,11 @@ class DataReceiver:
 
         self.nf_schema = {}
         self.nf_schema_order = []
-        self.nf_schema_by_signal_no = {}
+        self.nf_schema_by_endpoint_no = {}
         self.nf_schema_generation = None
-        self.nf_schema_section_mask = 0
         self.nf_schema_chunks = {}
         self.nf_schema_chunk_total = 0
         self.nf_schema_chunk_generation = None
-        self.nf_schema_chunk_section_mask = 0
         self.nf_schema_retry_active = False
         self.nf_next_schema_retry_ms = 0.0
 
@@ -209,7 +205,7 @@ class DataReceiver:
         self.nf_last_error = ""
         self._start_connect_attempt_(now_ms)
 
-    def disconnect_nfv1(self):
+    def disconnect_nfv3(self):
         self.nf_want_connected = False
         self.nf_connecting = False
         self.nf_connected = False
@@ -252,7 +248,7 @@ class DataReceiver:
                 max(float(self.NF_RECONNECT_MIN_MS), self.nf_reconnect_backoff_ms * 2.0),
             )
 
-    def get_nfv1_status(self):
+    def get_nfv3_status(self):
         state = "disconnected"
         if self.nf_connected:
             state = "connected"
@@ -273,7 +269,7 @@ class DataReceiver:
             "last_error": self.nf_last_error,
         }
 
-    def begin_nfv1_schema_sync(self):
+    def begin_nfv3_schema_sync(self):
         if not self.nf_connected:
             return
         if self.nf_schema_retry_active and not self.nf_schema_order:
@@ -286,13 +282,11 @@ class DataReceiver:
             return
         self.nf_schema = {}
         self.nf_schema_order = []
-        self.nf_schema_by_signal_no = {}
+        self.nf_schema_by_endpoint_no = {}
         self.nf_schema_generation = None
-        self.nf_schema_section_mask = 0
         self.nf_schema_chunks = {}
         self.nf_schema_chunk_total = 0
         self.nf_schema_chunk_generation = None
-        self.nf_schema_chunk_section_mask = 0
         self.nf_last_packet_seq = None
         self.nf_schema_retry_active = True
         self.nf_next_schema_retry_ms = 0.0
@@ -302,9 +296,9 @@ class DataReceiver:
             f"last_sync_ok_ts={int(self.nf_last_schema_sync_ok_ms)} "
             f"retry_active={int(self.nf_schema_retry_active)}"
         )
-        self._request_nfv1_schema(force=True)
+        self._request_nfv3_schema(force=True)
 
-    def _tick_nfv1_schema_retry(self):
+    def _tick_nfv3_schema_retry(self):
         if not self.nf_schema_retry_active:
             return
 
@@ -318,7 +312,7 @@ class DataReceiver:
             f"last_sync_ok_ts={int(self.nf_last_schema_sync_ok_ms)} "
             f"retry_active={int(self.nf_schema_retry_active)}"
         )
-        self._request_nfv1_schema(force=True)
+        self._request_nfv3_schema(force=True)
         self.nf_next_schema_retry_ms = now_ms + self.NF_SCHEMA_RETRY_MS
 
     def _start_bota(self):
@@ -497,7 +491,7 @@ class DataReceiver:
         packet = self.nf_parser.build_disconnect_request()
         return self._send_udp_packet(packet)
 
-    def _tick_nfv1_connection(self):
+    def _tick_nfv3_connection(self):
         now_ms = time.time() * 1000.0
 
         if self.nf_disconnect_burst_left > 0 and now_ms >= self.nf_next_disconnect_burst_ms:
@@ -541,7 +535,7 @@ class DataReceiver:
             self.nf_waiting_pong = True
             self.nf_next_ping_retry_ms = now_ms + self.NF_LINK_PING_RETRY_MS
 
-    def _request_nfv1_schema(self, force=False):
+    def _request_nfv3_schema(self, force=False):
         if not self.nf_connected:
             return False
 
@@ -567,9 +561,8 @@ class DataReceiver:
             print(f"NF schema request failed: {exc}")
             return False
 
-    def _handle_nfv1_schema_response(self, packet):
+    def _handle_nfv3_schema_response(self, packet):
         schema_generation = int(packet.get("schema_generation", 0)) & 0xFFFFFFFF
-        section_mask = int(packet.get("section_mask", 0)) & 0xFFFFFFFF
         chunk_total = packet["chunk_total"]
         chunk_index = packet["chunk_index"]
 
@@ -579,14 +572,12 @@ class DataReceiver:
         fresh_transfer = (
             chunk_index == 0
             or self.nf_schema_chunk_generation != schema_generation
-            or self.nf_schema_chunk_section_mask != section_mask
             or self.nf_schema_chunk_total != chunk_total
         )
         if fresh_transfer:
             self.nf_schema_chunks = {}
             self.nf_schema_chunk_total = chunk_total
             self.nf_schema_chunk_generation = schema_generation
-            self.nf_schema_chunk_section_mask = section_mask
 
         self.nf_schema_chunks[chunk_index] = packet["entries"]
         if len(self.nf_schema_chunks) != self.nf_schema_chunk_total:
@@ -600,81 +591,79 @@ class DataReceiver:
             entries.extend(chunk_entries)
 
         schema = {}
-        schema_by_signal_no = {}
+        schema_by_endpoint_no = {}
         self.nf_schema_order = []
         used_names = set()
         ordered_descriptors = []
         for entry in entries:
-            gid = entry["gid"]
-            base_name = entry["name"] or f"gid_{gid:08X}"
+            endpoint_no = int(entry["endpoint_no"])
+            endpoint_kind = int(entry.get("endpoint_kind", 0))
+            owner = entry.get("owner") or "Dataflow"
+            endpoint_name = entry.get("name") or f"endpoint_{endpoint_no}"
+            if endpoint_kind == 1:
+                base_name = f"{owner}.input.{endpoint_name}"
+                section = f"{owner}/Input"
+            elif endpoint_kind == 2:
+                base_name = f"{owner}.output.{endpoint_name}"
+                section = f"{owner}/Output"
+            else:
+                base_name = f"Dataflow.{endpoint_name}"
+                section = "Dataflow"
             var_name = base_name
             if var_name in used_names:
-                var_name = f"{base_name}[{gid:08X}]"
+                var_name = f"{base_name}[{endpoint_no}]"
             used_names.add(var_name)
-            section = entry.get("section") or "Other"
             desc = {
-                "gid": gid,
+                "endpoint_no": endpoint_no,
+                "endpoint_kind": endpoint_kind,
                 "scalar_type": entry["scalar_type"],
-                "name": entry["name"],
+                "task_id": entry.get("task_id", 0),
+                "owner": owner,
+                "name": endpoint_name,
                 "unit": entry["unit"],
                 "section": section,
                 "var_name": var_name,
             }
-            schema[gid] = desc
-            signal_no = len(self.nf_schema_order)
-            if signal_no < 256:
-                schema_by_signal_no[signal_no] = desc
+            schema[endpoint_no] = desc
+            schema_by_endpoint_no[endpoint_no] = desc
             self.nf_schema_order.append(desc)
-            ordered_descriptors.append(
-                {
-                    "gid": gid,
-                    "scalar_type": entry["scalar_type"],
-                    "name": entry["name"],
-                    "unit": entry["unit"],
-                    "section": section,
-                    "var_name": var_name,
-                }
-            )
+            ordered_descriptors.append(dict(desc))
 
         self.nf_schema = schema
-        self.nf_schema_by_signal_no = schema_by_signal_no
+        self.nf_schema_by_endpoint_no = schema_by_endpoint_no
         self.nf_schema_generation = schema_generation
-        self.nf_schema_section_mask = section_mask
         self.nf_schema_chunks = {}
         self.nf_schema_chunk_total = 0
         self.nf_schema_chunk_generation = None
-        self.nf_schema_chunk_section_mask = 0
         self.nf_schema_retry_active = False
         self.nf_next_schema_retry_ms = 0.0
         self.nf_last_schema_sync_ok_ms = time.time() * 1000.0
-        if hasattr(self.main_window, "register_signal_export_descriptors"):
-            self.main_window.register_signal_export_descriptors(ordered_descriptors)
+        if hasattr(self.main_window, "register_dataflow_export_descriptors"):
+            self.main_window.register_dataflow_export_descriptors(ordered_descriptors)
         else:
-            self.main_window.register_signal_export_variables(
+            self.main_window.register_dataflow_export_variables(
                 [item["var_name"] for item in ordered_descriptors]
             )
         print(
             "NF schema synced: "
             f"generation={schema_generation} "
-            f"section_mask=0x{section_mask:08X} "
             f"count={len(schema)} "
             f"schema_req_sent_count={self.nf_schema_req_sent_count} "
             f"last_sync_ok_ts={int(self.nf_last_schema_sync_ok_ms)}"
         )
 
-    def _process_nfv1_data(self, packet, unix_ts):
+    def _process_nfv3_data(self, packet, unix_ts):
         if not self.nf_connected:
             return
         packet_generation = int(packet.get("schema_generation", 0)) & 0xFFFFFFFF
-        if not self.nf_schema_by_signal_no or self.nf_schema_generation != packet_generation:
+        if not self.nf_schema_by_endpoint_no or self.nf_schema_generation != packet_generation:
             if not self.nf_schema_retry_active:
                 self.nf_schema_retry_active = True
                 self.nf_next_schema_retry_ms = 0.0
                 self.nf_schema_chunks = {}
                 self.nf_schema_chunk_total = 0
                 self.nf_schema_chunk_generation = None
-                self.nf_schema_chunk_section_mask = 0
-                self._request_nfv1_schema(force=True)
+                self._request_nfv3_schema(force=True)
             return
 
         if self.nf_last_packet_seq is not None:
@@ -688,18 +677,20 @@ class DataReceiver:
         build_us = int(packet["build_us"])
         send_timestamp_ms = packet["send_us"] / 1000.0
         for item in packet["items"]:
-            signal_no = int(item.get("signal_no", 0))
-            desc = self.nf_schema_by_signal_no.get(signal_no)
+            endpoint_no = int(item.get("endpoint_no", 0))
+            desc = self.nf_schema_by_endpoint_no.get(endpoint_no)
             if desc is None:
+                continue
+            if int(item.get("status", 0)) != 1:
                 continue
             value = self.nf_parser.raw_to_value(desc["scalar_type"], item["raw"])
             if value is None:
                 continue
 
-            dt_us = int(item.get("dt_us", 0)) & 0xFFFF
-            src_us = build_us - dt_us if build_us >= dt_us else 0
+            capture_age_us = int(item.get("capture_age_us", 0)) & 0xFFFFFFFF
+            src_us = build_us - capture_age_us if build_us >= capture_age_us else 0
             src_timestamp_ms = src_us / 1000.0
-            src = f"{self.NF_SOURCE_PREFIX}{desc['gid']}"
+            src = f"{self.NF_SOURCE_PREFIX}{endpoint_no}"
             self.data_model.add_data(
                 src,
                 unix_ts,
@@ -734,7 +725,7 @@ class DataReceiver:
             self.nf_next_reconnect_ms = 0.0
             self.nf_reconnect_backoff_ms = float(self.NF_RECONNECT_MIN_MS)
             self.nf_disconnect_burst_left = 0
-            self.begin_nfv1_schema_sync()
+            self.begin_nfv3_schema_sync()
             return
 
         if packet["type"] == "busy_ack":
@@ -757,16 +748,16 @@ class DataReceiver:
         if packet["type"] == "schema_resp":
             if not self.nf_connected:
                 return
-            self._handle_nfv1_schema_response(packet)
+            self._handle_nfv3_schema_response(packet)
             return
 
         if packet["type"] == "data":
-            self._process_nfv1_data(packet, unix_ts)
+            self._process_nfv3_data(packet, unix_ts)
 
     def process_data(self):
-        self._tick_nfv1_connection()
+        self._tick_nfv3_connection()
         if self.nf_connected:
-            self._tick_nfv1_schema_retry()
+            self._tick_nfv3_schema_retry()
 
         to_process = []
         while self.pending_queue:

@@ -1,9 +1,9 @@
 import struct
 
 
-class NFv1Parser:
+class NFv3Parser:
     MAGIC = 0x464E
-    VERSION = 2
+    VERSION = 3
 
     TYPE_DATA = 0x01
     TYPE_SCHEMA_REQ = 0x10
@@ -17,12 +17,14 @@ class NFv1Parser:
 
     # DATA: magic + ver + type + schema_generation + packet_seq + build_us + send_us + item_count
     DATA_HEADER_FMT = "<HBBIIQQH"
-    # DATA item: signal_no + dt_us16 + raw
-    DATA_ITEM_FMT = "<BHI"
+    # DATA item: endpoint_no + status + publish_age_us + capture_age_us + endpoint_seq + raw
+    DATA_ITEM_FMT = "<HBIIII"
     # SCHEMA_REQ: magic + ver + type + request_id
     SCHEMA_REQ_FMT = "<HBBI"
-    # SCHEMA_RESP: magic + ver + type + schema_generation + section_mask + chunk_index + chunk_total + entry_count
-    SCHEMA_RESP_HEADER_FMT = "<HBBIIHHH"
+    # SCHEMA_RESP: magic + ver + type + schema_generation + chunk_index + chunk_total + entry_count
+    SCHEMA_RESP_HEADER_FMT = "<HBBIHHH"
+    # endpoint_no + kind + scalar_type + task_id + owner/name/unit lengths
+    SCHEMA_ENTRY_PREFIX_FMT = "<HBBHBBB"
     # CTRL header: magic + ver + type
     CTRL_HEADER_FMT = "<HBB"
     # BUSY_ACK payload: owner_ip[4] + owner_port(u16)
@@ -110,11 +112,16 @@ class NFv1Parser:
         items = []
         offset = self.DATA_HEADER_SIZE
         for _ in range(item_count):
-            signal_no, dt_us, raw = struct.unpack_from(self.DATA_ITEM_FMT, data, offset)
+            endpoint_no, status, publish_age_us, capture_age_us, endpoint_seq, raw = struct.unpack_from(
+                self.DATA_ITEM_FMT, data, offset
+            )
             items.append(
                 {
-                    "signal_no": signal_no,
-                    "dt_us": dt_us,
+                    "endpoint_no": endpoint_no,
+                    "status": status,
+                    "publish_age_us": publish_age_us,
+                    "capture_age_us": capture_age_us,
+                    "endpoint_seq": endpoint_seq,
                     "raw": raw,
                 }
             )
@@ -134,7 +141,7 @@ class NFv1Parser:
         if len(data) < self.SCHEMA_RESP_HEADER_SIZE:
             return None
 
-        magic, version, packet_type, schema_generation, section_mask, chunk_index, chunk_total, entry_count = struct.unpack_from(
+        magic, version, packet_type, schema_generation, chunk_index, chunk_total, entry_count = struct.unpack_from(
             self.SCHEMA_RESP_HEADER_FMT, data, 0
         )
         if chunk_total == 0:
@@ -143,29 +150,34 @@ class NFv1Parser:
         entries = []
         offset = self.SCHEMA_RESP_HEADER_SIZE
         for _ in range(entry_count):
-            if (offset + 8) > len(data):
+            prefix_size = struct.calcsize(self.SCHEMA_ENTRY_PREFIX_FMT)
+            if (offset + prefix_size) > len(data):
                 return None
 
-            gid, scalar_type, name_len, unit_len, section_len = struct.unpack_from("<IBBBB", data, offset)
-            offset += 8
+            endpoint_no, endpoint_kind, scalar_type, task_id, owner_len, name_len, unit_len = struct.unpack_from(
+                self.SCHEMA_ENTRY_PREFIX_FMT, data, offset
+            )
+            offset += prefix_size
 
-            if (offset + name_len + unit_len + section_len) > len(data):
+            if (offset + owner_len + name_len + unit_len) > len(data):
                 return None
 
+            owner = data[offset:offset + owner_len].decode("utf-8", errors="ignore")
+            offset += owner_len
             name = data[offset:offset + name_len].decode("utf-8", errors="ignore")
             offset += name_len
             unit = data[offset:offset + unit_len].decode("utf-8", errors="ignore")
             offset += unit_len
-            section = data[offset:offset + section_len].decode("utf-8", errors="ignore")
-            offset += section_len
 
             entries.append(
                 {
-                    "gid": gid,
+                    "endpoint_no": endpoint_no,
+                    "endpoint_kind": endpoint_kind,
                     "scalar_type": scalar_type,
+                    "task_id": task_id,
+                    "owner": owner,
                     "name": name,
                     "unit": unit,
-                    "section": section or "Other",
                 }
             )
 
@@ -175,7 +187,6 @@ class NFv1Parser:
         return {
             "type": "schema_resp",
             "schema_generation": schema_generation,
-            "section_mask": section_mask,
             "chunk_index": chunk_index,
             "chunk_total": chunk_total,
             "entries": entries,

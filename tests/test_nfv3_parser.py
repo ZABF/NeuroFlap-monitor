@@ -1,12 +1,12 @@
 import struct
 import unittest
 
-from nfv1_parser import NFv1Parser
+from nfv3_parser import NFv3Parser
 
 
-class NFv1ParserTest(unittest.TestCase):
+class NFv3ParserTest(unittest.TestCase):
     def setUp(self):
-        self.parser = NFv1Parser()
+        self.parser = NFv3Parser()
 
     def test_parse_data_packet(self):
         header = struct.pack(
@@ -22,8 +22,8 @@ class NFv1ParserTest(unittest.TestCase):
         )
         items = b"".join(
             [
-                struct.pack(self.parser.DATA_ITEM_FMT, 4, 123, 0x3F800000),
-                struct.pack(self.parser.DATA_ITEM_FMT, 5, 456, 123),
+                struct.pack(self.parser.DATA_ITEM_FMT, 4, 1, 123, 45, 9, 0x3F800000),
+                struct.pack(self.parser.DATA_ITEM_FMT, 5, 2, 456, 78, 10, 123),
             ]
         )
 
@@ -36,26 +36,32 @@ class NFv1ParserTest(unittest.TestCase):
         self.assertEqual(packet["send_us"], 123456789)
         self.assertEqual(packet["item_count"], 2)
         self.assertEqual(len(packet["items"]), 2)
-        self.assertEqual(packet["items"][0]["signal_no"], 4)
-        self.assertEqual(packet["items"][0]["dt_us"], 123)
+        self.assertEqual(packet["items"][0]["endpoint_no"], 4)
+        self.assertEqual(packet["items"][0]["status"], 1)
+        self.assertEqual(packet["items"][0]["publish_age_us"], 123)
+        self.assertEqual(packet["items"][0]["capture_age_us"], 45)
+        self.assertEqual(packet["items"][0]["endpoint_seq"], 9)
         self.assertEqual(packet["items"][0]["raw"], 0x3F800000)
         self.assertEqual(self.parser.raw_to_value(self.parser.TYPE_F32, 0x3F800000), 1.0)
 
     def test_parse_schema_response_packet(self):
         entries = []
-        for gid, scalar_type, name, unit in (
-            (0x00010002, self.parser.TYPE_F32, b"pitch", b"deg"),
-            (0x00010003, self.parser.TYPE_U16, b"servo", b"us"),
+        for endpoint_no, kind, scalar_type, task_id, owner, name, unit in (
+            (2, 1, self.parser.TYPE_F32, 10, b"MadgwickTask", b"pitch", b"deg"),
+            (3, 3, self.parser.TYPE_F32, 0, b"Dataflow", b"clipped", b"deg"),
         ):
             entries.append(
                 struct.pack(
-                    "<IBBBB",
-                    gid,
+                    self.parser.SCHEMA_ENTRY_PREFIX_FMT,
+                    endpoint_no,
+                    kind,
                     scalar_type,
+                    task_id,
+                    len(owner),
                     len(name),
                     len(unit),
-                    0,
                 )
+                + owner
                 + name
                 + unit
             )
@@ -66,7 +72,6 @@ class NFv1ParserTest(unittest.TestCase):
             self.parser.VERSION,
             self.parser.TYPE_SCHEMA_RESP,
             5,
-            0x00007FFF,
             0,
             1,
             len(entries),
@@ -76,10 +81,11 @@ class NFv1ParserTest(unittest.TestCase):
         self.assertIsNotNone(packet)
         self.assertEqual(packet["type"], "schema_resp")
         self.assertEqual(packet["schema_generation"], 5)
-        self.assertEqual(packet["section_mask"], 0x00007FFF)
         self.assertEqual(packet["chunk_total"], 1)
         self.assertEqual(len(packet["entries"]), 2)
-        self.assertEqual(packet["entries"][0]["gid"], 0x00010002)
+        self.assertEqual(packet["entries"][0]["endpoint_no"], 2)
+        self.assertEqual(packet["entries"][0]["endpoint_kind"], 1)
+        self.assertEqual(packet["entries"][0]["owner"], "MadgwickTask")
         self.assertEqual(packet["entries"][0]["name"], "pitch")
         self.assertEqual(packet["entries"][0]["unit"], "deg")
 

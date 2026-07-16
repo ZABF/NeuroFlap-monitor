@@ -49,7 +49,7 @@ def make_gid(section, signal_id):
     return ((int(section) & 0xFFFF) << 16) | (int(signal_id) & 0xFFFF)
 
 
-class NFv1UdpSimulator:
+class NFv3UdpSimulator:
     def __init__(self, bind_ip, bind_port, target_ip, target_port, period_ms, duration_s=None, chunk_size=0):
         self.bind_ip = bind_ip
         self.bind_port = int(bind_port)
@@ -246,7 +246,7 @@ class NFv1UdpSimulator:
         self.sock.setblocking(False)
 
         print(
-            f"NFv1 simulator started: bind={self.bind_ip}:{self.bind_port}, "
+            f"NFv3 simulator started: bind={self.bind_ip}:{self.bind_port}, "
             f"target={self.target[0]}:{self.target[1]}, period={self.period_s * 1000:.1f}ms"
         )
         print("Press Ctrl+C to stop.")
@@ -280,11 +280,11 @@ class NFv1UdpSimulator:
             self.sock.close()
         except OSError:
             pass
-        print("NFv1 simulator stopped.")
+        print("NFv3 simulator stopped.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="NFv1 UDP simulator for NeuroFlap monitor")
+    parser = argparse.ArgumentParser(description="NFv3 UDP simulator for NeuroFlap monitor")
     parser.add_argument("--bind-ip", default="0.0.0.0", help="local bind ip")
     parser.add_argument("--bind-port", type=int, default=28090, help="local bind port")
     parser.add_argument("--target-ip", default="127.0.0.1", help="monitor udp listen ip")
@@ -299,7 +299,7 @@ def main():
     )
     args = parser.parse_args()
 
-    sim = NFv1UdpSimulator(
+    sim = NFv3UdpSimulator(
         bind_ip=args.bind_ip,
         bind_port=args.bind_port,
         target_ip=args.target_ip,
