@@ -23,145 +23,14 @@ from data_transporter_thread import DataTransporterThread
 from ui.variable_control import VariableControlItem
 from waveform_capture import WaveformCaptureWindow
 from enum import Enum
-
-
-class CurveExpressionError(ValueError):
-    pass
-
-
-class CurveExpressionParser:
-    def __init__(self, text):
-        self.text = text or ""
-        self.pos = 0
-
-    def parse(self):
-        node = self._parse_expr()
-        self._skip_ws()
-        if self.pos != len(self.text):
-            raise CurveExpressionError(f"Unexpected token at {self.pos}: {self.text[self.pos:]}")
-        return node
-
-    def _skip_ws(self):
-        while self.pos < len(self.text) and self.text[self.pos].isspace():
-            self.pos += 1
-
-    def _peek(self):
-        self._skip_ws()
-        return self.text[self.pos] if self.pos < len(self.text) else ""
-
-    def _consume(self, char):
-        if self._peek() != char:
-            raise CurveExpressionError(f"Expected '{char}' at {self.pos}")
-        self.pos += 1
-
-    def _parse_expr(self):
-        node = self._parse_term()
-        while True:
-            op = self._peek()
-            if op not in ("+", "-"):
-                return node
-            self.pos += 1
-            node = ("bin", op, node, self._parse_term())
-
-    def _parse_term(self):
-        node = self._parse_unary()
-        while True:
-            op = self._peek()
-            if op not in ("*", "/"):
-                return node
-            self.pos += 1
-            node = ("bin", op, node, self._parse_unary())
-
-    def _parse_unary(self):
-        op = self._peek()
-        if op in ("+", "-"):
-            self.pos += 1
-            return ("unary", op, self._parse_unary())
-        return self._parse_primary()
-
-    def _parse_primary(self):
-        ch = self._peek()
-        if not ch:
-            raise CurveExpressionError("Unexpected end of expression")
-        if ch == "(":
-            self.pos += 1
-            node = self._parse_expr()
-            self._consume(")")
-            return node
-        if ch == "[":
-            return self._parse_bracket_curve_ref()
-        if ch == "/":
-            return self._parse_curve_ref()
-        if ch.isdigit() or ch == ".":
-            return self._parse_number()
-        if ch.isalpha() or ch == "_":
-            return self._parse_call()
-        raise CurveExpressionError(f"Unexpected token at {self.pos}: {ch}")
-
-    def _parse_curve_ref(self):
-        self._consume("/")
-        start = self.pos
-        stop_chars = set("()+-*/, \t\r\n")
-        while self.pos < len(self.text) and self.text[self.pos] not in stop_chars:
-            self.pos += 1
-        name = self.text[start:self.pos].strip()
-        if not name:
-            raise CurveExpressionError(f"Missing curve name after '/' at {start}")
-        return ("ref", name)
-
-    def _parse_bracket_curve_ref(self):
-        self._consume("[")
-        start = self.pos
-        while self.pos < len(self.text) and self.text[self.pos] != "]":
-            self.pos += 1
-        if self.pos >= len(self.text):
-            raise CurveExpressionError(f"Missing closing ']' for curve reference at {start - 1}")
-        name = self.text[start:self.pos].strip()
-        self.pos += 1
-        if not name:
-            raise CurveExpressionError(f"Missing curve name inside brackets at {start}")
-        return ("ref", name)
-
-    def _parse_number(self):
-        start = self.pos
-        saw_digit = False
-        while self.pos < len(self.text) and self.text[self.pos].isdigit():
-            saw_digit = True
-            self.pos += 1
-        if self.pos < len(self.text) and self.text[self.pos] == ".":
-            self.pos += 1
-            while self.pos < len(self.text) and self.text[self.pos].isdigit():
-                saw_digit = True
-                self.pos += 1
-        if self.pos < len(self.text) and self.text[self.pos] in ("e", "E"):
-            exp_pos = self.pos
-            self.pos += 1
-            if self.pos < len(self.text) and self.text[self.pos] in ("+", "-"):
-                self.pos += 1
-            exp_digits = self.pos
-            while self.pos < len(self.text) and self.text[self.pos].isdigit():
-                self.pos += 1
-            if exp_digits == self.pos:
-                self.pos = exp_pos
-        if not saw_digit:
-            raise CurveExpressionError(f"Invalid number at {start}")
-        return ("num", float(self.text[start:self.pos]))
-
-    def _parse_call(self):
-        start = self.pos
-        while self.pos < len(self.text) and (self.text[self.pos].isalnum() or self.text[self.pos] == "_"):
-            self.pos += 1
-        name = self.text[start:self.pos]
-        self._consume("(")
-        args = []
-        if self._peek() != ")":
-            while True:
-                args.append(self._parse_expr())
-                if self._peek() != ",":
-                    break
-                self.pos += 1
-        self._consume(")")
-        return ("call", name, args)
+from ui.curve_expression import (
+    CurveExpressionError,
+    CurveExpressionParser,
+    clip_scalar,
+    clip_series,
+    expression_validation_errors,
+    resolve_clip_bounds,
+)
 
 '''
 CURRENT STATE  |    start           stop            clear
@@ -1736,6 +1605,30 @@ class PlotWindow(QWidget):
                     return self._series_value([], [])
                 value = self._eval_curve_expr(args[0], eval_stack)
                 return self._apply_unary_function_value(name, value)
+            if name == "clip":
+                if len(args) not in (2, 3):
+                    return self._series_value([], [])
+                value = self._eval_curve_expr(args[0], eval_stack)
+                lower_or_limit = self._eval_curve_expr(args[1], eval_stack)
+                upper = self._eval_curve_expr(args[2], eval_stack) if len(args) == 3 else None
+                if not self._is_scalar_value(lower_or_limit):
+                    return self._series_value([], [])
+                if upper is not None and not self._is_scalar_value(upper):
+                    return self._series_value([], [])
+                bounds = resolve_clip_bounds(
+                    lower_or_limit["value"],
+                    upper["value"] if upper is not None else None,
+                )
+                if bounds is None:
+                    return self._series_value([], [])
+                lower, upper_value = bounds
+                if self._is_scalar_value(value):
+                    clipped = clip_scalar(value["value"], lower, upper_value)
+                    return self._scalar_value(clipped) if clipped is not None else self._series_value([], [])
+                if self._is_series_value(value):
+                    ts, vs = clip_series(value.get("ts", []), value.get("vs", []), lower, upper_value)
+                    return self._series_value(ts, vs)
+                return self._series_value([], [])
             if name == "joint_tau":
                 if len(args) != 7:
                     return self._series_value([], [])
@@ -1967,45 +1860,7 @@ class PlotWindow(QWidget):
 
     @staticmethod
     def _expr_validation_errors(node):
-        if node is None:
-            return ["Empty expression"]
-        kind = node[0]
-        if kind in ("num", "ref"):
-            return []
-        if kind == "unary":
-            return PlotWindow._expr_validation_errors(node[2])
-        if kind == "bin":
-            return (
-                PlotWindow._expr_validation_errors(node[2]) +
-                PlotWindow._expr_validation_errors(node[3])
-            )
-        if kind == "call":
-            name = node[1].lower()
-            if name == "soomth":
-                name = "smooth"
-            args = node[2]
-            errors = []
-            if name == "d":
-                if len(args) != 1:
-                    errors.append("d() expects 1 argument")
-            elif name == "smooth":
-                if len(args) != 2:
-                    errors.append("smooth() expects 2 arguments")
-            elif name == "sg":
-                if len(args) != 4:
-                    errors.append("sg() expects 4 arguments")
-            elif name == "sign":
-                if len(args) != 1:
-                    errors.append("sign() expects 1 argument")
-            elif name == "joint_tau":
-                if len(args) != 7:
-                    errors.append("joint_tau() expects 7 arguments")
-            else:
-                errors.append(f"Unknown function: {node[1]}")
-            for arg in args:
-                errors.extend(PlotWindow._expr_validation_errors(arg))
-            return errors
-        return [f"Unknown expression node: {kind}"]
+        return expression_validation_errors(node)
 
     def _direct_derived_dependents(self, var_name):
         dependents = []
@@ -2068,6 +1923,8 @@ class PlotWindow(QWidget):
             return f"{suffix}_{ast[2][0][1]}"
         if ast[0] == "call" and ast[1].lower() == "sign" and len(ast[2]) == 1 and ast[2][0][0] == "ref":
             return f"sign_{ast[2][0][1]}"
+        if ast[0] == "call" and ast[1].lower() == "clip" and len(ast[2]) >= 1 and ast[2][0][0] == "ref":
+            return f"clip_{ast[2][0][1]}"
         if ast[0] == "call" and ast[1].lower() == "joint_tau" and len(ast[2]) >= 1 and ast[2][0][0] == "ref":
             return f"joint_tau_{ast[2][0][1]}"
         return self._next_derived_name()
@@ -2192,6 +2049,7 @@ class PlotWindow(QWidget):
         sg1_btn = QPushButton("sg1()")
         sg2_btn = QPushButton("sg2()")
         sign_btn = QPushButton("sign()")
+        clip_btn = QPushButton("clip()")
         joint_tau_btn = QPushButton("joint_tau()")
         operator_buttons = []
         for label, token in (("+", " + "), ("-", " - "), ("*", " * "), ("/", " / "), ("(", "("), (")", ")")):
@@ -2241,6 +2099,12 @@ class PlotWindow(QWidget):
                 None if editing else name_edit.setText(self._derive_name_from_expr(expr_edit.text()))
             )
         )
+        clip_btn.clicked.connect(
+            lambda: (
+                self._insert_expr_wrapped(expr_edit, "clip({}, 100)", current_variable_ref() or selected_ref),
+                None if editing else name_edit.setText(self._derive_name_from_expr(expr_edit.text()))
+            )
+        )
         joint_tau_btn.clicked.connect(
             lambda: (
                 self._insert_expr_wrapped(
@@ -2268,6 +2132,7 @@ class PlotWindow(QWidget):
         function_layout.addWidget(sg1_btn)
         function_layout.addWidget(sg2_btn)
         function_layout.addWidget(sign_btn)
+        function_layout.addWidget(clip_btn)
         function_layout.addWidget(joint_tau_btn)
         function_layout.addStretch(1)
 
