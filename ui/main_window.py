@@ -31,6 +31,7 @@ from ui.curve_expression import (
     expression_validation_errors,
     resolve_clip_bounds,
 )
+from ui.curve_state import ActiveDataSource, expression_refs, resolve_derived_health
 
 '''
 CURRENT STATE  |    start           stop            clear
@@ -42,7 +43,8 @@ STOPPING -> redraw current plot data -> STOPPED
 CLEARING -> (clear all points) -> IDLE
 
 Plot data pipeline:
-DataModel source -> curve transform -> time-window clip -> PlotWidget.
+DataModel source -> referenced-curve transform -> derived expression ->
+derived-curve transform -> time-window clip -> PlotWidget.
 AutoX controls the clip window rule. Pan/zoom controls the ViewBox and exits
 AutoX, but does not rewrite t_now_line. Pause exits AutoX/AutoY and freezes
 t_now_line; resume restores the Auto states from before pause.
@@ -111,6 +113,11 @@ class PlotWindow(QWidget):
         self.default_colors = {}  # 榛樿棰滆壊
         self.curve_transforms = {}
         self.curve_specs = {}
+        self.curve_visibility = {}
+        self.active_data_source = ActiveDataSource.none()
+        self.available_raw_variables = set()
+        self.derived_health = {}
+        self._live_activation_requested = False
         self.selected_var_name = None
         self.selected_curve_focus_active = False
         self.selected_hover_point = None
@@ -135,6 +142,8 @@ class PlotWindow(QWidget):
         self.rigid_wing1_id = "Rigid_Wing_L"
         self.rigid_wing2_id = "Rigid_Wing_R"
         static_variables = self.tf_variables + [name for name, _ in self.mocap_variable_templates]
+        self.static_variable_names = set(static_variables)
+        self.available_raw_variables = set(self.static_variable_names)
         self.data_model = DataModel(static_variables)
         # self.data_transporter = None
         self.data_transporter = DataTransporter(self.esp32_ip, self.esp32_port)
@@ -199,6 +208,8 @@ class PlotWindow(QWidget):
         self.nf_local_ip_label = QLabel("0.0.0.0")
         self.nf_busy_label = QLabel("")
         self.nf_busy_label.setVisible(False)
+        self.active_source_label = QLabel(self.active_data_source.label)
+        self.active_source_label.setToolTip(self.active_data_source.detail)
 
         # ===== 鍙橀噺鍕鹃€夊尯鍩?=====
         self.var_controls = {}
@@ -379,7 +390,11 @@ class PlotWindow(QWidget):
         nfv3_ctrl_layout.addStretch()
         neuroflap_page_layout.addLayout(nfv3_ctrl_layout)
         neuroflap_page_layout.addWidget(self.nf_busy_label)
-        neuroflap_page_layout.addWidget(QLabel("ESP32 Dataflow Export (Dynamic):"))
+        dataflow_source_layout = QHBoxLayout()
+        dataflow_source_layout.addWidget(QLabel("ESP32 Dataflow Export (Dynamic):"))
+        dataflow_source_layout.addWidget(self.active_source_label)
+        dataflow_source_layout.addStretch()
+        neuroflap_page_layout.addLayout(dataflow_source_layout)
         neuroflap_page_layout.addWidget(dataflow_export_scroll, 1)
 
         bota_page = QWidget()
@@ -660,10 +675,12 @@ class PlotWindow(QWidget):
         except ValueError:
             QMessageBox.warning(self, "Input Error", "Port must be an integer.")
             return
+        self._live_activation_requested = True
         self.data_receiver.connect_nfv3(target_ip, target_port)
         self.update_nfv3_status()
 
     def disconnect_nfv3(self):
+        self._live_activation_requested = False
         self.data_receiver.disconnect_nfv3()
         self.update_nfv3_status()
 
@@ -942,22 +959,66 @@ class PlotWindow(QWidget):
             if data["timestamps"] and len(data["timestamps"]) == len(data["values"])
         }
 
+    def _set_active_data_source(self, source):
+        self.active_data_source = source
+        self.active_source_label.setText(source.label)
+        self.active_source_label.setToolTip(source.detail)
+
+    def _set_available_raw_variables(self, names):
+        self.available_raw_variables = {str(name) for name in names if str(name)}
+        self._refresh_derived_health()
+
+    def _live_raw_variable_names(self, descriptors):
+        names = set(self.tf_variables)
+        names.update(name for name, _visible in self.mocap_variable_templates)
+        for desc in descriptors:
+            name = (desc.get("var_name") or desc.get("name") or "").strip()
+            if name:
+                names.add(name)
+        return names
+
+    def _reset_live_time_window(self):
+        now = time.time() * 1000.0
+        self.reception_start_time = now
+        self.window_now = now
+        self.window_start = now - self.fixed_window_seconds * 1000.0
+        self.now_line.setValue(self.window_now)
+        self.begin_line.setValue(self.reception_start_time)
+        self.x_axis.set_start_time(self.reception_start_time)
+        for curve in self.curves.values():
+            curve.setData([], [])
+
+    def activate_live_dataflow_export_descriptors(self, descriptors, host, port):
+        if self.active_data_source.kind != "live" and not self._live_activation_requested:
+            return False
+
+        source = ActiveDataSource.live(host, port)
+        source_changed = source != self.active_data_source
+        if source_changed:
+            self.data_model.clear()
+            self._reset_live_time_window()
+
+        self._set_active_data_source(source)
+        self._set_available_raw_variables(self._live_raw_variable_names(descriptors))
+        self.register_dataflow_export_descriptors(descriptors)
+        self._live_activation_requested = False
+        self.refresh_all_curves(visible_only=True)
+        return True
+
     def _load_imported_series(self, path, series):
         if self.plot_state == PlotState.RUNNING:
             self.toggle_reception()
 
-        self._clear_dynamic_signal_controls()
+        self._live_activation_requested = False
+        self.data_receiver.set_data_ingestion_enabled(False)
         self.data_model.clear()
-        self.curve_transforms.clear()
         self._hide_selected_hover_point()
-        self.selected_var_name = None
-        self.selected_curve_focus_active = False
-        self._update_selected_controls()
+        self._set_active_data_source(ActiveDataSource.replay(path))
+        self._set_available_raw_variables(series.keys())
 
         descriptors = [
             {"var_name": name, "section": data.get("section") or "Ungrouped"}
             for name, data in series.items()
-            if name not in self.curves
         ]
         self.register_dataflow_export_descriptors(descriptors)
 
@@ -971,12 +1032,6 @@ class PlotWindow(QWidget):
                 values=data["values"],
             )
             all_timestamps.extend(data["timestamps"])
-            ctrl = self.var_controls.get(var_name)
-            if ctrl is not None:
-                ctrl.checkbox.setChecked(False)
-            curve = self.curves.get(var_name)
-            if curve is not None:
-                curve.setVisible(False)
 
         if all_timestamps:
             self.reception_start_time = min(all_timestamps)
@@ -1194,9 +1249,23 @@ class PlotWindow(QWidget):
     def _is_derived_curve(self, var_name):
         return self.curve_specs.get(var_name, {}).get("kind") == "expr"
 
+    def _refresh_derived_health(self):
+        self.derived_health = resolve_derived_health(
+            self.curve_specs,
+            self.available_raw_variables,
+        )
+        for name, health in self.derived_health.items():
+            ctrl = self.var_controls.get(name)
+            if ctrl is not None:
+                ctrl.set_invalid_state("" if health.valid else health.message)
+        self._update_selected_controls()
+
     def _curve_source_data(self, var_name, eval_stack=None):
         spec = self.curve_specs.get(var_name)
         if spec and spec.get("kind") == "expr":
+            health = self.derived_health.get(var_name)
+            if health is not None and not health.valid:
+                return [], []
             value = self._eval_curve_expr(spec.get("ast"), eval_stack or ())
             if value.get("kind") == "series":
                 return value.get("ts", []), value.get("vs", [])
@@ -1752,7 +1821,11 @@ class PlotWindow(QWidget):
         color = self.colors.get(var_name, (64, 64, 64)) if has_selection else (48, 48, 48)
 
         self._updating_selected_controls = True
-        self.selected_plot_value.setText(var_name if has_selection else "-")
+        health = self.derived_health.get(var_name) if is_derived else None
+        invalid_message = health.message if health is not None and not health.valid else ""
+        self.selected_plot_value.setText(f"{var_name} !" if invalid_message else (var_name if has_selection else "-"))
+        self.selected_plot_value.setToolTip(invalid_message)
+        self.selected_plot_value.setStyleSheet("color: #d00000;" if invalid_message else "")
         self._update_selected_color_button(color)
         self.selected_color_btn.setEnabled(has_selection)
         self.selected_visible_check.setEnabled(has_selection)
@@ -1840,23 +1913,7 @@ class PlotWindow(QWidget):
 
     @staticmethod
     def _expr_refs(node):
-        if node is None:
-            return set()
-        kind = node[0]
-        if kind == "ref":
-            return {node[1]}
-        if kind == "num":
-            return set()
-        if kind == "unary":
-            return PlotWindow._expr_refs(node[2])
-        if kind == "bin":
-            return PlotWindow._expr_refs(node[2]) | PlotWindow._expr_refs(node[3])
-        if kind == "call":
-            refs = set()
-            for arg in node[2]:
-                refs |= PlotWindow._expr_refs(arg)
-            return refs
-        return set()
+        return expression_refs(node)
 
     @staticmethod
     def _expr_validation_errors(node):
@@ -2235,6 +2292,7 @@ class PlotWindow(QWidget):
         if ctrl is not None:
             ctrl.set_color(derived_color)
 
+        self._refresh_derived_health()
         self._update_curve_pen(name)
         self.refresh_curve(name)
         self.select_curve(name)
@@ -2244,6 +2302,7 @@ class PlotWindow(QWidget):
             return
 
         self.curve_specs[name] = {"kind": "expr", "expr": expr, "ast": ast}
+        self._refresh_derived_health()
         self.refresh_all_curves(visible_only=True)
         self._apply_auto_y_range()
         self._set_selected_curve_focus_active(True)
@@ -2263,6 +2322,7 @@ class PlotWindow(QWidget):
         self.default_colors.pop(var_name, None)
         self.curve_transforms.pop(var_name, None)
         self.curve_specs.pop(var_name, None)
+        self.curve_visibility.pop(var_name, None)
         self.dynamic_signal_sections.pop(var_name, None)
 
         if var_name in self.signal_variables:
@@ -2307,6 +2367,7 @@ class PlotWindow(QWidget):
             self._remove_curve_objects(var_name)
 
         self._remove_names_from_signal_sections(names)
+        self._refresh_derived_health()
         self._apply_auto_y_range()
         self._update_selected_controls()
 
@@ -2699,16 +2760,19 @@ class PlotWindow(QWidget):
         if not var_name or var_name in self.curves:
             return False
 
-        color = self.get_default_color(var_name)
+        default_color = self.default_colors.get(var_name, self.get_default_color(var_name))
+        color = self.colors.get(var_name, default_color)
+        visible = self.curve_visibility.get(var_name, bool(checked))
         curve = self.plot_widget.plot(pen=pg.mkPen(color=color, width=2), name=var_name)
-        curve.setVisible(bool(checked))
+        curve.setVisible(visible)
         self._connect_curve_click(curve, var_name)
         self.curves[var_name] = curve
         self.colors[var_name] = color
-        self.default_colors[var_name] = color
+        self.default_colors[var_name] = default_color
+        self.curve_visibility[var_name] = visible
 
         if create_control:
-            ctrl = VariableControlItem(var_name, color, color, checked=bool(checked))
+            ctrl = VariableControlItem(var_name, color, default_color, checked=visible)
             self._connect_variable_control(ctrl)
             self.var_controls[var_name] = ctrl
 
@@ -2787,59 +2851,76 @@ class PlotWindow(QWidget):
         if self.dataflow_export_container is not None:
             self.dataflow_export_container.adjustSize()
 
-    def _clear_derived_curves(self):
-        derived_names = [
-            name for name, spec in self.curve_specs.items()
-            if spec.get("kind") == "expr"
-        ]
-        self._delete_derived_curves(derived_names)
+    def _remove_empty_dataflow_export_section(self, section):
+        info = self.dataflow_export_sections.get(section)
+        if not info or info.get("items") or section == "Derived":
+            return
+        box = info.get("box")
+        if box is not None:
+            box.setParent(None)
+            box.deleteLater()
+        self.dataflow_export_sections.pop(section, None)
+        if section in self.dataflow_export_section_order:
+            self.dataflow_export_section_order.remove(section)
 
-    def _clear_dynamic_signal_controls(self):
-        self._clear_derived_curves()
-        dynamic_names = list(self.dynamic_signal_variables)
-        for var_name in dynamic_names:
-            ctrl = self.var_controls.pop(var_name, None)
-            if ctrl is not None:
-                ctrl.setParent(None)
-                ctrl.deleteLater()
+    def _remove_dynamic_raw_variable(self, var_name):
+        ctrl = self.var_controls.pop(var_name, None)
+        if ctrl is not None:
+            ctrl.setParent(None)
+            ctrl.deleteLater()
 
-            curve = self.curves.pop(var_name, None)
-            if curve is not None:
-                self.plot_widget.removeItem(curve)
+        curve = self.curves.pop(var_name, None)
+        if curve is not None:
+            self.plot_widget.removeItem(curve)
 
-            self.colors.pop(var_name, None)
-            self.default_colors.pop(var_name, None)
-            self.curve_transforms.pop(var_name, None)
-            if var_name in self.signal_variables:
-                self.signal_variables.remove(var_name)
-            if self.selected_var_name == var_name:
-                self.selected_var_name = None
-                self.selected_curve_focus_active = False
+        if var_name in self.signal_variables:
+            self.signal_variables.remove(var_name)
+        if self.selected_var_name == var_name:
+            self.selected_var_name = None
+            self.selected_curve_focus_active = False
+            self._hide_selected_hover_point()
 
-        for info in self.dataflow_export_sections.values():
-            box = info.get("box")
-            if box is not None:
-                box.setParent(None)
-                box.deleteLater()
-
-        self.dynamic_signal_variables = []
-        self.dynamic_signal_sections = {}
-        self.dataflow_export_sections = {}
-        self.dataflow_export_section_order = []
-        self.dataflow_export_count = 0
-        self._detach_layout_items(self.dataflow_export_grid)
-        if self.dataflow_export_container is not None:
-            self.dataflow_export_container.adjustSize()
-        self._update_selected_controls()
+        section = self.dynamic_signal_sections.pop(var_name, None)
+        info = self.dataflow_export_sections.get(section)
+        if info and var_name in info.get("items", []):
+            info["items"].remove(var_name)
+            self._relayout_dataflow_export_section_items(section)
+            self._remove_empty_dataflow_export_section(section)
 
     def register_dataflow_export_descriptors(self, descriptors):
-        added = []
-        changed_sections = set()
+        normalized = []
+        seen = set()
         for desc in descriptors:
             var_name = (desc.get("var_name") or desc.get("name") or "").strip()
-            if not var_name:
+            if not var_name or var_name in seen:
                 continue
-            section = (desc.get("section") or "Other").strip() or "Other"
+            seen.add(var_name)
+            normalized.append({
+                **desc,
+                "var_name": var_name,
+                "section": (desc.get("section") or "Other").strip() or "Other",
+            })
+
+        display_names = [
+            desc["var_name"]
+            for desc in normalized
+            if (
+                not self._is_derived_curve(desc["var_name"]) and
+                desc["var_name"] not in self.static_variable_names
+            )
+        ]
+        display_name_set = set(display_names)
+        for var_name in list(self.dynamic_signal_variables):
+            if var_name not in display_name_set:
+                self._remove_dynamic_raw_variable(var_name)
+
+        added = []
+        changed_sections = set()
+        for desc in normalized:
+            var_name = desc["var_name"]
+            if self._is_derived_curve(var_name) or var_name in self.static_variable_names:
+                continue
+            section = desc["section"]
             checked = False
             if var_name not in self.curves:
                 if self._register_variable(
@@ -2852,12 +2933,11 @@ class PlotWindow(QWidget):
                     added.append(var_name)
             elif var_name not in self.var_controls:
                 color = self.colors.get(var_name, self.get_default_color(var_name))
-                ctrl = VariableControlItem(var_name, color, color, checked=self.curves[var_name].isVisible())
+                default_color = self.default_colors.get(var_name, color)
+                visible = self.curve_visibility.get(var_name, self.curves[var_name].isVisible())
+                ctrl = VariableControlItem(var_name, color, default_color, checked=visible)
                 self._connect_variable_control(ctrl)
                 self.var_controls[var_name] = ctrl
-
-            if var_name not in self.dynamic_signal_variables:
-                self.dynamic_signal_variables.append(var_name)
 
             last_section = self.dynamic_signal_sections.get(var_name)
             if last_section == section:
@@ -2867,6 +2947,7 @@ class PlotWindow(QWidget):
                 if last_info and var_name in last_info.get("items", []):
                     last_info["items"].remove(var_name)
                     changed_sections.add(last_section)
+                    self._remove_empty_dataflow_export_section(last_section)
             self.dynamic_signal_sections[var_name] = section
             ctrl = self.var_controls.get(var_name)
             if ctrl is None:
@@ -2876,10 +2957,12 @@ class PlotWindow(QWidget):
                 section_info["items"].append(var_name)
             changed_sections.add(section)
 
+        self.dynamic_signal_variables = display_names
+        self.dataflow_export_count = len(display_names)
         for section in changed_sections:
             self._relayout_dataflow_export_section_items(section)
-        if changed_sections:
-            self._relayout_dataflow_export_sections()
+        self._relayout_dataflow_export_sections()
+        self._refresh_derived_health()
 
         return added
 
@@ -2889,6 +2972,7 @@ class PlotWindow(QWidget):
 
     def set_curve_visibility(self, var_name, visible):
         if var_name in self.curves:
+            self.curve_visibility[var_name] = bool(visible)
             self.curves[var_name].setVisible(visible)
             self._sync_variable_control_visibility(var_name, visible)
             if visible:
