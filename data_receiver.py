@@ -75,6 +75,7 @@ class DataReceiver:
         self.nf_parser = NFv1Parser()
         self.first_ft_received_flag = False
         self.first_udp_received_flag = False
+        self.data_ingestion_enabled = True
 
         self.nf_schema = {}
         self.nf_schema_order = []
@@ -111,6 +112,9 @@ class DataReceiver:
         self.nf_busy_owner_port = 0
         self.nf_last_error = ""
         self.nf_local_ip = "0.0.0.0"
+
+    def set_data_ingestion_enabled(self, enabled):
+        self.data_ingestion_enabled = bool(enabled)
 
     def start(self):
         if self.running:
@@ -647,7 +651,15 @@ class DataReceiver:
         self.nf_schema_retry_active = False
         self.nf_next_schema_retry_ms = 0.0
         self.nf_last_schema_sync_ok_ms = time.time() * 1000.0
-        if hasattr(self.main_window, "register_signal_export_descriptors"):
+        if hasattr(self.main_window, "activate_live_signal_export_descriptors"):
+            activated = self.main_window.activate_live_signal_export_descriptors(
+                ordered_descriptors,
+                self.udp_target_ip,
+                self.udp_target_port,
+            )
+            if activated:
+                self.set_data_ingestion_enabled(True)
+        elif hasattr(self.main_window, "register_signal_export_descriptors"):
             self.main_window.register_signal_export_descriptors(ordered_descriptors)
         else:
             self.main_window.register_signal_export_variables(
@@ -675,6 +687,9 @@ class DataReceiver:
                 self.nf_schema_chunk_generation = None
                 self.nf_schema_chunk_section_mask = 0
                 self._request_nfv1_schema(force=True)
+            return
+
+        if not self.data_ingestion_enabled:
             return
 
         if self.nf_last_packet_seq is not None:
@@ -778,6 +793,9 @@ class DataReceiver:
         for data_source, data, unix_ts, meta in to_process:
             if data_source == "udp":
                 self._process_udp_packet(data, unix_ts, meta)
+                continue
+
+            if not self.data_ingestion_enabled:
                 continue
 
             if data_source == "ft":

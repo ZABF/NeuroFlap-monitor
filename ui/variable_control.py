@@ -26,6 +26,13 @@ class VariableControlItem(QWidget):
         self.checkbox.stateChanged.connect(self._emit_visibility)
         layout.addWidget(self.checkbox)
 
+        self.health_indicator = QLabel("!")
+        self.health_indicator.setFixedWidth(10)
+        self.health_indicator.setAlignment(Qt.AlignCenter)
+        self.health_indicator.setStyleSheet("color: #d00000; font-weight: bold;")
+        self.health_indicator.setVisible(False)
+        layout.addWidget(self.health_indicator)
+
         self.label = QLabel(var_name)
         self.label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._apply_label_style(color)
@@ -71,6 +78,16 @@ class VariableControlItem(QWidget):
     def set_color(self, rgb):
         self.color = rgb
         self._apply_label_style(rgb)
+
+    def set_invalid_state(self, message=""):
+        message = str(message or "").strip()
+        invalid = bool(message)
+        self.health_indicator.setVisible(invalid)
+        tooltip = f"Derived curve unavailable\n{message}" if invalid else ""
+        self.setToolTip(tooltip)
+        self.checkbox.setToolTip(tooltip)
+        self.health_indicator.setToolTip(tooltip)
+        self.label.setToolTip(tooltip)
 
     def change_color(self):
         dialog = QColorDialog(QColor(*self.color), self.window())
