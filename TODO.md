@@ -16,7 +16,7 @@
 
 - Added selected-plot visibility and derived expression controls.
   - `Visible` mirrors the curve visibility checkbox and also works for derived curves.
-  - `Derived...` creates expression curves such as `d(/AttRoll)`, `smooth(/AttRoll, 100)`, and `/A - /B`.
+  - `Derived...` creates expression curves such as `d(/AttRoll)`, `smooth(/AttRoll, 100)`, `clip(/AttRoll, 20)`, and `/A - /B`.
   - Derived curves expose `Edit` and `Delete`; delete lists dependent derived curves and can force-delete them together.
   - Derived curves are collected in the `Derived` group and can be transformed again.
   - Binary curve operations align to the left operand timestamp and linearly interpolate the right operand.
