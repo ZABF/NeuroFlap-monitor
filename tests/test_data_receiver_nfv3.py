@@ -65,9 +65,15 @@ class _DummyMainWindow:
     def __init__(self):
         self.data_transporter = _DummyTransporter()
         self.esp32_ip = "127.0.0.1"
+        self.activate_live = True
+        self.live_descriptors = []
 
     def register_dataflow_export_variables(self, _names):
         return None
+
+    def activate_live_dataflow_export_descriptors(self, descriptors, _host, _port):
+        self.live_descriptors = list(descriptors)
+        return self.activate_live
 
 
 class _DummyDataModel:
@@ -163,6 +169,39 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
         self.assertEqual(self.receiver.nf_schema_by_endpoint_no[12]["var_name"], "MadgwickTask.output.yaw")
         self.assertEqual(self.receiver.nf_schema_by_endpoint_no[7]["var_name"], "AttRlsTask.input.roll")
         self.assertEqual(self.receiver.nf_schema_by_endpoint_no[31]["var_name"], "Dataflow.armed")
+        self.assertEqual(len(self.window.live_descriptors), 3)
+
+    def test_replay_gate_drops_signal_samples_but_keeps_schema_processing(self):
+        self.receiver.set_data_ingestion_enabled(False)
+        packet = self._build_data_packet(12, [(0, 11)])
+
+        self.receiver._process_nfv3_data(packet, unix_ts=1000.0)
+
+        self.assertEqual(self.model.records, [])
+        self.assertEqual(self.receiver.nf_schema_generation, 1)
+
+    def test_schema_activation_can_reenable_live_ingestion(self):
+        self.receiver.set_data_ingestion_enabled(False)
+        packet = {
+            "schema_generation": 2,
+            "chunk_index": 0,
+            "chunk_total": 1,
+            "entries": [
+                {
+                    "endpoint_no": 5,
+                    "endpoint_kind": 2,
+                    "scalar_type": self.parser.TYPE_U32,
+                    "task_id": 1,
+                    "owner": "Task",
+                    "name": "a",
+                    "unit": "",
+                },
+            ],
+        }
+
+        self.receiver._handle_nfv3_schema_response(packet)
+
+        self.assertTrue(self.receiver.data_ingestion_enabled)
 
     def test_data_with_unknown_schema_generation_is_dropped_and_requests_schema(self):
         packet = self._build_data_packet(20, [(0, 99)])
