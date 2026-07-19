@@ -62,7 +62,7 @@ class PlotState(Enum):
 class PlotWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Monitor v2.4.0")
+        self.setWindowTitle("Monitor v3.0.0")
 
         self.tf_variables = ["F_X", "F_Y", "F_Z", "T_X", "T_Y", "T_Z"]
         self.mocap_variable_templates = [
