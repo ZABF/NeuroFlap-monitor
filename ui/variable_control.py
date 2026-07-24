@@ -2,6 +2,8 @@ from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import QWidget, QHBoxLayout, QCheckBox, QLabel, QMenu, QColorDialog, QSizePolicy
 from PyQt5.QtCore import QEvent, Qt, pyqtSignal
 
+from ui.theme import ERROR_HEX, readable_curve_text_color
+
 
 class VariableControlItem(QWidget):
     selected = pyqtSignal(str)
@@ -9,11 +11,13 @@ class VariableControlItem(QWidget):
     color_changed = pyqtSignal(str, tuple)
     transform_reset_requested = pyqtSignal(str)
 
-    def __init__(self, var_name, color, default_color, checked=True):
+    def __init__(self, var_name, color, default_color, checked=True, display_name=None, unit=""):
         super().__init__()
         self.var_name = var_name
         self.color = color
         self.default_color = default_color
+        self.display_name = str(display_name or var_name)
+        self.unit = str(unit or "")
 
         layout = QHBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -29,14 +33,17 @@ class VariableControlItem(QWidget):
         self.health_indicator = QLabel("!")
         self.health_indicator.setFixedWidth(10)
         self.health_indicator.setAlignment(Qt.AlignCenter)
-        self.health_indicator.setStyleSheet("color: #d00000; font-weight: bold;")
+        self.health_indicator.setStyleSheet(f"color: {ERROR_HEX}; font-weight: bold;")
         self.health_indicator.setVisible(False)
         layout.addWidget(self.health_indicator)
 
-        self.label = QLabel(var_name)
+        self.label = QLabel(self.display_name)
         self.label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._reserve_label_width()
         self._apply_label_style(color)
         self.label.setWordWrap(False)
+        tooltip = var_name if not self.unit else f"{var_name} [{self.unit}]"
+        self.label.setToolTip(tooltip)
         self.label.setContextMenuPolicy(3)
         self.label.customContextMenuRequested.connect(self.show_context_menu)
         self.label.installEventFilter(self)
@@ -49,7 +56,12 @@ class VariableControlItem(QWidget):
         self.visibility_changed.emit(self.var_name, self.checkbox.isChecked())
 
     def _apply_label_style(self, rgb):
-        self.label.setStyleSheet(f"color: rgb{rgb};")
+        text_rgb = readable_curve_text_color(rgb)
+        self.label.setStyleSheet(f"color: rgb{text_rgb};")
+
+    def _reserve_label_width(self):
+        width = self.label.fontMetrics().horizontalAdvance(self.display_name) + 2
+        self.label.setMinimumWidth(width)
 
     def show_context_menu(self, pos):
         menu = QMenu(self)
@@ -78,6 +90,14 @@ class VariableControlItem(QWidget):
     def set_color(self, rgb):
         self.color = rgb
         self._apply_label_style(rgb)
+
+    def set_display(self, display_name, unit=""):
+        self.display_name = str(display_name or self.var_name)
+        self.unit = str(unit or "")
+        self.label.setText(self.display_name)
+        self._reserve_label_width()
+        tooltip = self.var_name if not self.unit else f"{self.var_name} [{self.unit}]"
+        self.label.setToolTip(tooltip)
 
     def set_invalid_state(self, message=""):
         message = str(message or "").strip()

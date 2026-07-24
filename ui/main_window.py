@@ -2,9 +2,10 @@ from PyQt5.QtGui import QColor, QPen
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QCheckBox, QLabel, QSpinBox, QGridLayout, QMessageBox, QLineEdit, QComboBox, QFrame, QTabWidget, QGroupBox,
-    QScrollArea, QLayout, QColorDialog, QDoubleSpinBox, QFileDialog, QDialog, QDialogButtonBox, QFormLayout
+    QScrollArea, QColorDialog, QDoubleSpinBox, QFileDialog, QDialog, QDialogButtonBox, QFormLayout,
+    QAbstractSpinBox
 )
-from PyQt5.QtCore import QEvent, QPointF, QTimer, Qt
+from PyQt5.QtCore import QEvent, QPointF, QSettings, QTimer, Qt
 from bisect import bisect_left
 import csv
 import math
@@ -20,6 +21,16 @@ from ui.RelativeTimeAxis import RelativeTimeAxis
 from data_model import DataModel
 from data_receiver import DataReceiver
 from data_transporter_thread import DataTransporterThread
+from ui.reorderable_section_container import ReorderableSectionContainer
+from ui.task_variable_group import TaskVariableGroup, task_display_order
+from ui.theme import (
+    CURVE_OUTLINE,
+    ERROR_HEX,
+    PLOT_BG_HEX,
+    curve_needs_outline,
+    set_section_kind,
+    set_semantic_state,
+)
 from ui.variable_control import VariableControlItem
 from waveform_capture import WaveformCaptureWindow
 from enum import Enum
@@ -60,9 +71,20 @@ class PlotState(Enum):
 
 
 class PlotWindow(QWidget):
-    def __init__(self):
+    SECTION_ORDER_SETTINGS_KEY = "dataflow/section_order_v1"
+
+    def __init__(self, persist_layout=True):
         super().__init__()
         self.setWindowTitle("Monitor v3.0.0")
+        self._layout_settings = QSettings("NeuroFlap", "Monitor") if persist_layout else None
+        saved_section_order = (
+            self._layout_settings.value(self.SECTION_ORDER_SETTINGS_KEY, [])
+            if self._layout_settings is not None
+            else []
+        )
+        if isinstance(saved_section_order, str):
+            saved_section_order = [saved_section_order]
+        self._custom_section_order = [str(section) for section in saved_section_order]
 
         self.tf_variables = ["F_X", "F_Y", "F_Z", "T_X", "T_Y", "T_Z"]
         self.mocap_variable_templates = [
@@ -104,6 +126,7 @@ class PlotWindow(QWidget):
 
         # 缁樺浘绐楀彛
         self.plot_widget = pg.PlotWidget()
+        self.plot_widget.setBackground(PLOT_BG_HEX)
         self.plot_widget.showGrid(x=True, y=True)
         self.plot_widget.enableAutoRange(axis=1, enable=False)
         self.view_box = self.plot_widget.getViewBox()
@@ -182,14 +205,14 @@ class PlotWindow(QWidget):
         # ===== 涓嬮儴鎺ユ敹鎺у埗鍖?=====
 
         self.toggle_reception_btn = QPushButton("Start Receive")
-        self.toggle_reception_btn.setStyleSheet("background-color: orange")
+        set_semantic_state(self.toggle_reception_btn, "warning")
         self.toggle_reception_btn.clicked.connect(self.toggle_reception)
 
         self.clear_btn = QPushButton("Clear Plot")
         self.clear_btn.clicked.connect(self.clear_data)
 
         self.auto_scale_btn = QPushButton("Auto Scale")
-        self.auto_scale_btn.setStyleSheet("background-color: lightblue")
+        set_semantic_state(self.auto_scale_btn, "accent")
         self.auto_scale_btn.clicked.connect(self.auto_scale_all)
 
         self.open_capture_btn = QPushButton("Waveform Capture")
@@ -204,7 +227,7 @@ class PlotWindow(QWidget):
         self.nf_disconnect_btn = QPushButton("Disconnect")
         self.nf_disconnect_btn.clicked.connect(self.disconnect_nfv3)
         self.nf_status_label = QLabel("● Disconnected")
-        self.nf_status_label.setStyleSheet("color: #808080;")
+        set_semantic_state(self.nf_status_label, "muted")
         self.nf_local_ip_label = QLabel("0.0.0.0")
         self.nf_busy_label = QLabel("")
         self.nf_busy_label.setVisible(False)
@@ -219,6 +242,9 @@ class PlotWindow(QWidget):
         self.dataflow_export_count = 0
         self.dataflow_export_sections = {}
         self.dataflow_export_section_order = []
+        self.dynamic_signal_descriptors = {}
+        self.task_variable_groups = {}
+        self.task_latency_vars = {}
         self.tf_signal_grid = None
         self.tf_signal_count = 0
         self.mocap_signal_grid = None
@@ -240,13 +266,13 @@ class PlotWindow(QWidget):
         self.refresh_serial_ports()
 
         self.toggle_bota_btn = QPushButton("Connect Sensor")
-        self.toggle_bota_btn.setStyleSheet("background-color: orange")
+        set_semantic_state(self.toggle_bota_btn, "warning")
         self.toggle_bota_btn.setCheckable(True)
         self.toggle_bota_btn.clicked.connect(self.toggle_bota_connection)
 
         # Bias 璁剧疆鎸夐挳
         self.bias_button = QPushButton("Bias")
-        self.bias_button.setStyleSheet("background-color: lightblue")
+        set_semantic_state(self.bias_button, "accent")
         self.bias_button.clicked.connect(self.data_receiver.set_ft_bias)
         # self.bias_button.clicked.connect(self.data_receiver.set_ft_bias)  # 鍋囪浣犲湪 data_receiver 涓畾涔変簡 set_ft_bias 鏂规硶
 
@@ -265,13 +291,9 @@ class PlotWindow(QWidget):
         dataflow_export_scroll.setFrameShape(QFrame.NoFrame)
         dataflow_export_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         dataflow_export_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        dataflow_export_container = QWidget()
-        dataflow_export_grid = QGridLayout(dataflow_export_container)
-        dataflow_export_grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        dataflow_export_grid.setSizeConstraint(QLayout.SetMinimumSize)
-        dataflow_export_grid.setContentsMargins(0, 0, 0, 0)
-        dataflow_export_grid.setHorizontalSpacing(8)
-        dataflow_export_grid.setVerticalSpacing(8)
+        dataflow_export_container = ReorderableSectionContainer()
+        dataflow_export_container.order_changed.connect(self._set_custom_section_order)
+        dataflow_export_grid = dataflow_export_container.grid
         dataflow_export_scroll.setWidget(dataflow_export_container)
         self.dataflow_export_scroll = dataflow_export_scroll
         self.dataflow_export_container = dataflow_export_container
@@ -312,7 +334,7 @@ class PlotWindow(QWidget):
         mocap_rx_layout.addStretch()
 
         self.R_MoCap_button = QPushButton("Receive from MoCap")
-        self.R_MoCap_button.setStyleSheet("background-color: orange")
+        set_semantic_state(self.R_MoCap_button, "warning")
         self.R_MoCap_button.setCheckable(True)
         self.R_MoCap_button.clicked.connect(self.toggle_mocap)
         mocap_rx_layout.addWidget(self.R_MoCap_button)
@@ -338,7 +360,7 @@ class PlotWindow(QWidget):
         mocap_tx_layout.addStretch()
 
         self.T_Esp32_button = QPushButton("Transport to ESP32")
-        self.T_Esp32_button.setStyleSheet("background-color: orange")
+        set_semantic_state(self.T_Esp32_button, "warning")
         self.T_Esp32_button.setCheckable(True)
         self.T_Esp32_button.clicked.connect(self.toggle_transport)
         mocap_tx_layout.addWidget(self.T_Esp32_button)
@@ -387,14 +409,14 @@ class PlotWindow(QWidget):
         nfv3_ctrl_layout.addWidget(self.nf_connect_btn)
         nfv3_ctrl_layout.addWidget(self.nf_disconnect_btn)
         nfv3_ctrl_layout.addWidget(self.nf_status_label)
+        nfv3_ctrl_layout.addWidget(self.active_source_label)
         nfv3_ctrl_layout.addStretch()
+        self.reset_section_layout_btn = QPushButton("Reset layout")
+        self.reset_section_layout_btn.clicked.connect(self.reset_section_layout)
+        nfv3_ctrl_layout.addWidget(self.reset_section_layout_btn)
+        self.nfv3_ctrl_layout = nfv3_ctrl_layout
         neuroflap_page_layout.addLayout(nfv3_ctrl_layout)
         neuroflap_page_layout.addWidget(self.nf_busy_label)
-        dataflow_source_layout = QHBoxLayout()
-        dataflow_source_layout.addWidget(QLabel("ESP32 Dataflow Export (Dynamic):"))
-        dataflow_source_layout.addWidget(self.active_source_label)
-        dataflow_source_layout.addStretch()
-        neuroflap_page_layout.addLayout(dataflow_source_layout)
         neuroflap_page_layout.addWidget(dataflow_export_scroll, 1)
 
         bota_page = QWidget()
@@ -413,6 +435,9 @@ class PlotWindow(QWidget):
         mocap_page_layout.addStretch()
 
         tab_widget = QTabWidget()
+        tab_widget.setDocumentMode(True)
+        tab_widget.tabBar().setDrawBase(False)
+        tab_widget.tabBar().setExpanding(False)
         tab_widget.addTab(neuroflap_page, "NeuroFlap")
         tab_widget.addTab(bota_page, "Bota FT")
         tab_widget.addTab(mocap_page, "MoCap")
@@ -472,18 +497,21 @@ class PlotWindow(QWidget):
         self.selected_phase_spin.setDecimals(3)
         self.selected_phase_spin.setSingleStep(10.0)
         self.selected_phase_spin.setSuffix(" ms")
+        self.selected_phase_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self.selected_phase_spin.valueChanged.connect(self._selected_transform_changed)
 
         self.selected_offset_spin = QDoubleSpinBox()
         self.selected_offset_spin.setRange(-1000000000.0, 1000000000.0)
         self.selected_offset_spin.setDecimals(6)
         self.selected_offset_spin.setSingleStep(1.0)
+        self.selected_offset_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self.selected_offset_spin.valueChanged.connect(self._selected_transform_changed)
 
         self.selected_scale_spin = QDoubleSpinBox()
         self.selected_scale_spin.setRange(-1000000000.0, 1000000000.0)
         self.selected_scale_spin.setDecimals(6)
         self.selected_scale_spin.setSingleStep(0.1)
+        self.selected_scale_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self.selected_scale_spin.valueChanged.connect(self._selected_transform_changed)
 
         self.selected_reset_btn = QPushButton("Reset")
@@ -570,7 +598,7 @@ class PlotWindow(QWidget):
         # 瀹氭椂鍣ㄧ敤浜庡埛鏂板厜鏍?
         self.axis_timer = QTimer()
         self.axis_timer.timeout.connect(self.update_cursor)
-        self.axis_timer.start(5)
+        self.axis_timer.start(20)
 
         # 瀹氭椂鍣ㄧ敤浜庡畾鏃跺鐞嗘暟鎹?
         self.data_timer = QTimer()
@@ -600,13 +628,13 @@ class PlotWindow(QWidget):
         if self.R_MoCap_button.isChecked():
             # Start
             self.R_MoCap_button.setText("Receiving...")
-            self.R_MoCap_button.setStyleSheet("background-color: lightgreen")
+            set_semantic_state(self.R_MoCap_button, "active")
             # 鍙戣捣杩炴帴骞跺湪杩炴帴鎴愬姛鍚庡惎鍔ㄦ帴鏀剁嚎绋?
             self.data_receiver.connect_mocap()
         else:
             # Stop
             self.R_MoCap_button.setText("Receive from MoCap")
-            self.R_MoCap_button.setStyleSheet("background-color: orange")
+            set_semantic_state(self.R_MoCap_button, "warning")
             self.data_receiver.disconnect_mocap()
 
     def toggle_transport(self):
@@ -652,7 +680,7 @@ class PlotWindow(QWidget):
         if self.T_Esp32_button.isChecked():
             # Start Transport
             self.T_Esp32_button.setText("Transporting...")
-            self.T_Esp32_button.setStyleSheet("background-color: lightgreen")
+            set_semantic_state(self.T_Esp32_button, "active")
 
             # 寮€鍚彂閫佸紑鍏筹紙鐢?DataReceiver 浣跨敤锛?
             self.data_receiver.transport_enabled = True
@@ -660,7 +688,7 @@ class PlotWindow(QWidget):
         else:
             # Stop Transport
             self.T_Esp32_button.setText("Transport to ESP32")
-            self.T_Esp32_button.setStyleSheet("background-color: orange")
+            set_semantic_state(self.T_Esp32_button, "warning")
             # 鍏抽棴鍙戦€佸紑鍏筹紝蹇呰鏃朵篃鍋滅嚎绋?
             self.data_receiver.transport_enabled = False
             print("Transport disenable ")
@@ -692,26 +720,26 @@ class PlotWindow(QWidget):
 
         if state == "connected":
             self.nf_status_label.setText("● Connected")
-            self.nf_status_label.setStyleSheet("color: #2ca02c;")
+            set_semantic_state(self.nf_status_label, "success")
         elif state == "connecting":
             self.nf_status_label.setText("● Connecting")
-            self.nf_status_label.setStyleSheet("color: #f0ad4e;")
+            set_semantic_state(self.nf_status_label, "warning")
         elif state == "busy":
             self.nf_status_label.setText("● Busy")
-            self.nf_status_label.setStyleSheet("color: #d9534f;")
+            set_semantic_state(self.nf_status_label, "error")
         else:
             self.nf_status_label.setText("● Disconnected")
-            self.nf_status_label.setStyleSheet("color: #808080;")
+            set_semantic_state(self.nf_status_label, "muted")
 
         busy_ip = status.get("busy_owner_ip", "")
         busy_port = int(status.get("busy_owner_port", 0))
         if busy_ip:
             self.nf_busy_label.setText(f"Occupied by: {busy_ip}:{busy_port}")
-            self.nf_busy_label.setStyleSheet("color: #d9534f;")
+            set_semantic_state(self.nf_busy_label, "error")
         else:
             last_error = status.get("last_error", "")
             self.nf_busy_label.setText(last_error if last_error else "")
-            self.nf_busy_label.setStyleSheet("color: #666666;")
+            set_semantic_state(self.nf_busy_label, "muted")
         self.nf_busy_label.setVisible(bool(self.nf_busy_label.text()))
 
         self.nf_connect_btn.setEnabled(state != "connected")
@@ -726,11 +754,11 @@ class PlotWindow(QWidget):
         state = self.data_receiver.bota_state
         self.bota_status_label.setText("State: " + state)
         if state == "Disconnect":
-            self.bota_status_label.setStyleSheet("color: Red;")
+            set_semantic_state(self.bota_status_label, "error")
         elif state == "Connecting...":
-            self.bota_status_label.setStyleSheet("color: Orange;")
+            set_semantic_state(self.bota_status_label, "warning")
         elif state == "Connected":
-            self.bota_status_label.setStyleSheet("color: Green;")
+            set_semantic_state(self.bota_status_label, "success")
 
     def refresh_serial_ports(self):
         """Refresh available serial ports."""
@@ -755,14 +783,14 @@ class PlotWindow(QWidget):
             if selected_port:
                 self.data_receiver.connect_ft(selected_port)
                 self.toggle_bota_btn.setText("Disconnect Sensor")
-                self.toggle_bota_btn.setStyleSheet("background-color: lightblue")
+                set_semantic_state(self.toggle_bota_btn, "active")
             else:
                 QMessageBox.warning(self, "No Port Selected", "Please select a serial port.")
                 self.toggle_bota_btn.setChecked(False)
         else:
             self.data_receiver.disconnect_ft()
             self.toggle_bota_btn.setText("Connect Sensor")
-            self.toggle_bota_btn.setStyleSheet("background-color: orange")
+            set_semantic_state(self.toggle_bota_btn, "warning")
 
     def export_csv(self):
         """Export raw source data to a monitor-importable CSV."""
@@ -806,6 +834,21 @@ class PlotWindow(QWidget):
             return "MoCap"
         return "Ungrouped"
 
+    def _csv_descriptor_fields(self, var_name):
+        desc = self.dynamic_signal_descriptors.get(var_name, {})
+        return [
+            desc.get("category", ""),
+            desc.get("descriptor_kind", ""),
+            desc.get("task_id", ""),
+            desc.get("direction", ""),
+            desc.get("owner", ""),
+            desc.get("display_name", ""),
+            desc.get("task_order", ""),
+            desc.get("slot", ""),
+            desc.get("group_order", ""),
+            1 if desc.get("hidden_control", False) else 0,
+        ]
+
     def _write_monitor_csv(self, final_path):
         series = []
         for var_name in self.signal_variables:
@@ -826,7 +869,14 @@ class PlotWindow(QWidget):
             writer = csv.writer(fp)
             writer.writerow(["#NFMonitorCSV", "2"])
             for var_name, _ts, _vs in series:
-                writer.writerow(["#var", var_name, self._csv_group_for_var(var_name), ""])
+                desc = self.dynamic_signal_descriptors.get(var_name, {})
+                writer.writerow([
+                    "#var",
+                    var_name,
+                    self._csv_group_for_var(var_name),
+                    desc.get("unit", ""),
+                    *self._csv_descriptor_fields(var_name),
+                ])
             writer.writerow(headers)
             for row_idx in range(max_rows):
                 row = []
@@ -911,9 +961,28 @@ class PlotWindow(QWidget):
                         section = row[2].strip()
                         unit = row[3].strip() if len(row) >= 4 else ""
                         if var_name:
+                            def field(index, default=""):
+                                return row[index].strip() if len(row) > index else default
+
+                            def int_field(index):
+                                try:
+                                    return int(field(index))
+                                except (TypeError, ValueError):
+                                    return None
+
                             metadata[var_name] = {
                                 "section": section or "Ungrouped",
                                 "unit": unit,
+                                "category": field(4),
+                                "descriptor_kind": field(5),
+                                "task_id": int_field(6),
+                                "direction": int_field(7),
+                                "owner": field(8),
+                                "display_name": field(9),
+                                "task_order": int_field(10),
+                                "slot": int_field(11),
+                                "group_order": int_field(12),
+                                "hidden_control": field(13) == "1",
                             }
                     elif tag == "#group" and len(row) >= 3:
                         var_name = row[1].strip()
@@ -937,8 +1006,7 @@ class PlotWindow(QWidget):
                 var_name: {
                     "timestamps": [],
                     "values": [],
-                    "section": metadata.get(var_name, {}).get("section", "Ungrouped"),
-                    "unit": metadata.get(var_name, {}).get("unit", ""),
+                    **metadata.get(var_name, {"section": "Ungrouped", "unit": ""}),
                 }
                 for var_name, _ti, _vi in pairs
             }
@@ -1016,10 +1084,29 @@ class PlotWindow(QWidget):
         self._set_active_data_source(ActiveDataSource.replay(path))
         self._set_available_raw_variables(series.keys())
 
-        descriptors = [
-            {"var_name": name, "section": data.get("section") or "Ungrouped"}
-            for name, data in series.items()
-        ]
+        descriptors = []
+        for name, data in series.items():
+            desc = {
+                "var_name": name,
+                "section": data.get("section") or "Ungrouped",
+                "unit": data.get("unit", ""),
+            }
+            for key in (
+                "category",
+                "descriptor_kind",
+                "task_id",
+                "direction",
+                "owner",
+                "display_name",
+                "task_order",
+                "slot",
+                "group_order",
+                "hidden_control",
+            ):
+                value = data.get(key)
+                if value not in (None, ""):
+                    desc[key] = value
+            descriptors.append(desc)
         self.register_dataflow_export_descriptors(descriptors)
 
         all_timestamps = []
@@ -1032,6 +1119,9 @@ class PlotWindow(QWidget):
                 values=data["values"],
             )
             all_timestamps.extend(data["timestamps"])
+            desc = self.dynamic_signal_descriptors.get(var_name, {})
+            if desc.get("descriptor_kind") == "task_latency" and data["values"]:
+                self.update_task_latency(desc["task_id"], data["values"][-1])
 
         if all_timestamps:
             self.reception_start_time = min(all_timestamps)
@@ -1050,7 +1140,7 @@ class PlotWindow(QWidget):
         self.plot_widget.enableAutoRange(axis=1, enable=False)
         self.plot_state = PlotState.STOPPED
         self.toggle_reception_btn.setText("Resume")
-        self.toggle_reception_btn.setStyleSheet("background-color: orange")
+        set_semantic_state(self.toggle_reception_btn, "warning")
         self.refresh_all_curves(visible_only=True)
 
     def update_capture_plot(self):
@@ -1191,7 +1281,7 @@ class PlotWindow(QWidget):
             self.auto_x.setChecked(True)
             self.auto_y.setChecked(True)
             self.toggle_reception_btn.setText("Pause")
-            self.toggle_reception_btn.setStyleSheet("background-color: lightblue")
+            set_semantic_state(self.toggle_reception_btn, "accent")
             self.plot_state = PlotState.RUNNING
             return
 
@@ -1205,20 +1295,20 @@ class PlotWindow(QWidget):
             self._set_auto_checkboxes_silent(False, False)
             self.plot_widget.enableAutoRange(axis=1, enable=False)
             self.toggle_reception_btn.setText("Disable...")
-            self.toggle_reception_btn.setStyleSheet("background-color: gray")
+            set_semantic_state(self.toggle_reception_btn, "inactive")
             self.plot_state = PlotState.STOPPING
 
             self.update_plot()
 
             self.toggle_reception_btn.setText("Resume")
-            self.toggle_reception_btn.setStyleSheet("background-color: orange")
+            set_semantic_state(self.toggle_reception_btn, "warning")
             self.plot_state = PlotState.STOPPED
             return
 
         if self.plot_state == PlotState.STOPPED:
             print(self.plot_state)
             self.toggle_reception_btn.setText("Pause")
-            self.toggle_reception_btn.setStyleSheet("background-color: lightblue")
+            set_semantic_state(self.toggle_reception_btn, "accent")
             self.auto_scroll_enabled = bool(self.auto_scroll_enabled_before_pause)
             self.auto_y_enabled = bool(self.auto_y_enabled_before_pause)
             self._set_auto_checkboxes_silent(self.auto_scroll_enabled, self.auto_y_enabled)
@@ -1758,6 +1848,20 @@ class PlotWindow(QWidget):
         return clipped_ts, clipped_vs
 
     def _curve_plot_data(self, var_name):
+        if not self._is_derived_curve(var_name):
+            window_start, window_end = self._clip_window_range()
+            transform = self._get_curve_transform(var_name)
+            phase_ms = float(transform.get("phase_ms", 0.0))
+            ts, vs = self.data_model.get_series_between(
+                var_name,
+                window_start - phase_ms,
+                window_end - phase_ms,
+            )
+            if not ts:
+                return [], []
+            ts, vs = self._transform_curve_data(var_name, ts, vs)
+            return self._clip_curve_to_time_window(ts, vs)
+
         ts, vs = self._curve_full_transformed_data(var_name)
         if not ts:
             return [], []
@@ -1797,7 +1901,7 @@ class PlotWindow(QWidget):
 
     @staticmethod
     def _value_style(is_active):
-        return "color: #d00000;" if is_active else ""
+        return f"color: {ERROR_HEX};" if is_active else ""
 
     def _update_transform_control_styles(self, transform, has_selection):
         if not has_selection:
@@ -1825,7 +1929,7 @@ class PlotWindow(QWidget):
         invalid_message = health.message if health is not None and not health.valid else ""
         self.selected_plot_value.setText(f"{var_name} !" if invalid_message else (var_name if has_selection else "-"))
         self.selected_plot_value.setToolTip(invalid_message)
-        self.selected_plot_value.setStyleSheet("color: #d00000;" if invalid_message else "")
+        self.selected_plot_value.setStyleSheet(f"color: {ERROR_HEX};" if invalid_message else "")
         self._update_selected_color_button(color)
         self.selected_color_btn.setEnabled(has_selection)
         self.selected_visible_check.setEnabled(has_selection)
@@ -2408,7 +2512,12 @@ class PlotWindow(QWidget):
             return
         color = self.colors.get(var_name, self.get_default_color(var_name))
         style = Qt.DashLine if self._is_derived_curve(var_name) else Qt.SolidLine
-        curve.setPen(pg.mkPen(color=color, width=self._curve_pen_width(var_name), style=style))
+        width = self._curve_pen_width(var_name)
+        curve.setPen(pg.mkPen(color=color, width=width, style=style))
+        if curve_needs_outline(color):
+            curve.setShadowPen(pg.mkPen(color=CURVE_OUTLINE, width=width + 2, style=style))
+        else:
+            curve.setShadowPen(None)
 
     def _sync_variable_control_visibility(self, var_name, visible):
         ctrl = self.var_controls.get(var_name)
@@ -2436,8 +2545,22 @@ class PlotWindow(QWidget):
         self.selected_curve_focus_active = active
         if self.selected_var_name in self.curves:
             self._update_curve_pen(self.selected_var_name)
+        self._sync_task_latency_selection()
         if not active:
             self._hide_selected_hover_point()
+
+    def _sync_task_latency_selection(self):
+        for task_id, group in self.task_variable_groups.items():
+            selected = (
+                self.selected_curve_focus_active
+                and self.selected_var_name == self.task_latency_vars.get(task_id)
+            )
+            group.set_latency_selected(selected)
+
+    def update_task_latency(self, task_id, latency_us):
+        group = self.task_variable_groups.get(int(task_id))
+        if group is not None:
+            group.update_latency(latency_us)
 
     def select_curve(self, var_name):
         if var_name not in self.curves:
@@ -2451,6 +2574,7 @@ class PlotWindow(QWidget):
             self._update_curve_pen(previous)
             self._hide_selected_hover_point()
         self._update_curve_pen(var_name)
+        self._sync_task_latency_selection()
         self._update_selected_controls()
         self._update_selected_hover_point()
         self.plot_widget.setFocus()
@@ -2547,7 +2671,7 @@ class PlotWindow(QWidget):
     def _update_selected_coord_label(self, x_value, y_value):
         t_s = (float(x_value) - self.reception_start_time) / 1000.0
         self.selected_coord_value.setText(f"({t_s:.3f} s, {float(y_value):.3f})")
-        self.selected_coord_value.setStyleSheet("color: #d00000;")
+        self.selected_coord_value.setStyleSheet(f"color: {ERROR_HEX};")
 
     def _show_selected_hover_point(self, x_value, y_value):
         self.selected_hover_point = (x_value, y_value)
@@ -2747,8 +2871,10 @@ class PlotWindow(QWidget):
         # IDLE:
         self.plot_state = PlotState.IDLE
         self.data_model.clear()
+        for group in self.task_variable_groups.values():
+            group.reset_latency()
         self.toggle_reception_btn.setText("Start Receive")
-        self.toggle_reception_btn.setStyleSheet("background-color: orange")
+        set_semantic_state(self.toggle_reception_btn, "warning")
 
     def _connect_variable_control(self, ctrl):
         ctrl.selected.connect(self.select_curve)
@@ -2756,7 +2882,17 @@ class PlotWindow(QWidget):
         ctrl.color_changed.connect(self.set_curve_color)
         ctrl.transform_reset_requested.connect(self.reset_curve_transform)
 
-    def _register_variable(self, var_name, checked, grid, columns, count_attr, create_control=True):
+    def _register_variable(
+        self,
+        var_name,
+        checked,
+        grid,
+        columns,
+        count_attr,
+        create_control=True,
+        display_name=None,
+        unit="",
+    ):
         if not var_name or var_name in self.curves:
             return False
 
@@ -2770,9 +2906,17 @@ class PlotWindow(QWidget):
         self.colors[var_name] = color
         self.default_colors[var_name] = default_color
         self.curve_visibility[var_name] = visible
+        self._update_curve_pen(var_name)
 
         if create_control:
-            ctrl = VariableControlItem(var_name, color, default_color, checked=visible)
+            ctrl = VariableControlItem(
+                var_name,
+                color,
+                default_color,
+                checked=visible,
+                display_name=display_name,
+                unit=unit,
+            )
             self._connect_variable_control(ctrl)
             self.var_controls[var_name] = ctrl
 
@@ -2796,25 +2940,59 @@ class PlotWindow(QWidget):
             create_control=show_control,
         )
 
-    def _get_or_create_dataflow_export_section(self, section_name):
+    def _get_or_create_dataflow_export_section(self, section_name, category=None, order=0):
         section = (section_name or "Other").strip() or "Other"
+        category = category or ("derived" if section == "Derived" else "dataflow")
         info = self.dataflow_export_sections.get(section)
         if info is not None:
+            info["order"] = int(order)
+            info["category"] = category
+            set_section_kind(info["box"], category)
             return info
 
         box = QGroupBox(section)
+        set_section_kind(box, category)
         grid = QGridLayout()
         grid.setContentsMargins(6, 6, 6, 6)
         grid.setHorizontalSpacing(4)
         grid.setVerticalSpacing(2)
         grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         box.setLayout(grid)
-        info = {"box": box, "grid": grid, "items": []}
+        info = {
+            "box": box,
+            "grid": grid,
+            "items": [],
+            "category": category,
+            "order": int(order),
+        }
         self.dataflow_export_sections[section] = info
-        if section == "Derived":
-            self.dataflow_export_section_order.insert(0, section)
-        else:
-            self.dataflow_export_section_order.append(section)
+        self.dataflow_export_section_order.append(section)
+        self._relayout_dataflow_export_sections()
+        return info
+
+    def _get_or_create_task_export_section(self, desc):
+        section = desc["section"]
+        task_id = int(desc["task_id"])
+        task_name = str(desc.get("owner") or f"Task{task_id}")
+        latency_var_name = self.task_latency_vars.get(task_id, f"{task_name}.latency_us")
+        info = self.dataflow_export_sections.get(section)
+        if info is not None:
+            info["order"] = int(desc.get("task_order", task_id))
+            info["box"].set_identity(task_name, latency_var_name)
+            return info
+
+        box = TaskVariableGroup(task_id, task_name, latency_var_name)
+        box.latency_selected.connect(self.select_curve)
+        info = {
+            "box": box,
+            "items": [],
+            "category": "task",
+            "order": int(desc.get("task_order", task_id)),
+            "task_id": task_id,
+        }
+        self.dataflow_export_sections[section] = info
+        self.dataflow_export_section_order.append(section)
+        self.task_variable_groups[task_id] = box
         self._relayout_dataflow_export_sections()
         return info
 
@@ -2828,19 +3006,82 @@ class PlotWindow(QWidget):
     def _relayout_dataflow_export_sections(self):
         if self.dataflow_export_grid is None:
             return
-        self._detach_layout_items(self.dataflow_export_grid)
-        for idx, section in enumerate(self.dataflow_export_section_order):
-            info = self.dataflow_export_sections.get(section)
-            if not info:
-                continue
-            self.dataflow_export_grid.addWidget(info["box"], 0, idx, alignment=Qt.AlignTop | Qt.AlignLeft)
+        category_order = {"derived": 0, "dataflow": 1, "task": 2}
+
+        def section_sort_key(section):
+            info = self.dataflow_export_sections[section]
+            category = info.get("category")
+            if category == "task":
+                task_id = int(info.get("task_id", 0xFFFF))
+                task_category, task_order = task_display_order(task_id)
+                return (category_order["task"], task_category, task_order, section)
+            return (
+                category_order.get(category, 1),
+                int(info.get("order", 0)),
+                0,
+                section,
+            )
+
+        default_order = sorted(
+            self.dataflow_export_sections,
+            key=section_sort_key,
+        )
+        custom_order = [
+            section for section in self._custom_section_order if section in self.dataflow_export_sections
+        ]
+        custom_order.extend(section for section in default_order if section not in custom_order)
+        self.dataflow_export_section_order = custom_order
+
+        widgets = {
+            section: info["box"]
+            for section, info in self.dataflow_export_sections.items()
+            if info.get("box") is not None
+        }
+        self.dataflow_export_container.set_sections(self.dataflow_export_section_order, widgets)
         if self.dataflow_export_container is not None:
             self.dataflow_export_container.adjustSize()
+
+    def _set_custom_section_order(self, order):
+        known = [str(section) for section in order if section in self.dataflow_export_sections]
+        self._custom_section_order = known
+        if self._layout_settings is not None:
+            self._layout_settings.setValue(self.SECTION_ORDER_SETTINGS_KEY, known)
+            self._layout_settings.sync()
+        self._relayout_dataflow_export_sections()
+
+    def reset_section_layout(self):
+        self._custom_section_order = []
+        if self._layout_settings is not None:
+            self._layout_settings.remove(self.SECTION_ORDER_SETTINGS_KEY)
+            self._layout_settings.sync()
+        self._relayout_dataflow_export_sections()
 
     def _relayout_dataflow_export_section_items(self, section_name):
         info = self.dataflow_export_sections.get(section_name)
         if not info:
             return
+        if info.get("category") == "task":
+            inputs = []
+            outputs = []
+            for var_name in info.get("items", []):
+                desc = self.dynamic_signal_descriptors.get(var_name, {})
+                if desc.get("descriptor_kind") != "task_port":
+                    continue
+                ctrl = self.var_controls.get(var_name)
+                if ctrl is None:
+                    continue
+                target = inputs if int(desc.get("direction", 0)) == 0 else outputs
+                target.append((int(desc.get("slot", 0)), ctrl))
+            inputs.sort(key=lambda item: item[0])
+            outputs.sort(key=lambda item: item[0])
+            info["box"].set_port_controls(
+                [control for _slot, control in inputs],
+                [control for _slot, control in outputs],
+            )
+            if self.dataflow_export_container is not None:
+                self.dataflow_export_container.adjustSize()
+            return
+
         grid = info["grid"]
         self._detach_layout_items(grid)
         for idx, var_name in enumerate(info.get("items", [])):
@@ -2862,6 +3103,10 @@ class PlotWindow(QWidget):
         self.dataflow_export_sections.pop(section, None)
         if section in self.dataflow_export_section_order:
             self.dataflow_export_section_order.remove(section)
+        if info.get("category") == "task":
+            task_id = int(info.get("task_id", -1))
+            self.task_variable_groups.pop(task_id, None)
+            self.task_latency_vars.pop(task_id, None)
 
     def _remove_dynamic_raw_variable(self, var_name):
         ctrl = self.var_controls.pop(var_name, None)
@@ -2880,6 +3125,7 @@ class PlotWindow(QWidget):
             self.selected_curve_focus_active = False
             self._hide_selected_hover_point()
 
+        self.dynamic_signal_descriptors.pop(var_name, None)
         section = self.dynamic_signal_sections.pop(var_name, None)
         info = self.dataflow_export_sections.get(section)
         if info and var_name in info.get("items", []):
@@ -2890,18 +3136,22 @@ class PlotWindow(QWidget):
     def register_dataflow_export_descriptors(self, descriptors):
         normalized = []
         seen = set()
-        for desc in descriptors:
+        for descriptor_order, desc in enumerate(descriptors):
             var_name = (desc.get("var_name") or desc.get("name") or "").strip()
             if not var_name or var_name in seen:
                 continue
             seen.add(var_name)
+            section = (desc.get("section") or "Other").strip() or "Other"
             normalized.append({
                 **desc,
                 "var_name": var_name,
-                "section": (desc.get("section") or "Other").strip() or "Other",
+                "section": section,
+                "category": desc.get("category") or ("derived" if section == "Derived" else "dataflow"),
+                "display_name": desc.get("display_name") or desc.get("name") or var_name,
+                "group_order": int(desc.get("group_order", descriptor_order)),
             })
 
-        display_names = [
+        dynamic_names = [
             desc["var_name"]
             for desc in normalized
             if (
@@ -2909,10 +3159,13 @@ class PlotWindow(QWidget):
                 desc["var_name"] not in self.static_variable_names
             )
         ]
-        display_name_set = set(display_names)
+        dynamic_name_set = set(dynamic_names)
         for var_name in list(self.dynamic_signal_variables):
-            if var_name not in display_name_set:
+            if var_name not in dynamic_name_set:
                 self._remove_dynamic_raw_variable(var_name)
+
+        for group in self.task_variable_groups.values():
+            group.reset_latency()
 
         added = []
         changed_sections = set()
@@ -2920,7 +3173,12 @@ class PlotWindow(QWidget):
             var_name = desc["var_name"]
             if self._is_derived_curve(var_name) or var_name in self.static_variable_names:
                 continue
+            self.dynamic_signal_descriptors[var_name] = dict(desc)
             section = desc["section"]
+            category = desc["category"]
+            hidden_control = bool(desc.get("hidden_control", False))
+            if desc.get("descriptor_kind") == "task_latency":
+                self.task_latency_vars[int(desc["task_id"])] = var_name
             checked = False
             if var_name not in self.curves:
                 if self._register_variable(
@@ -2929,40 +3187,61 @@ class PlotWindow(QWidget):
                     grid=None,
                     columns=1,
                     count_attr="dataflow_export_count",
+                    create_control=not hidden_control,
+                    display_name=desc["display_name"],
+                    unit=desc.get("unit", ""),
                 ):
                     added.append(var_name)
+            elif hidden_control:
+                ctrl = self.var_controls.pop(var_name, None)
+                if ctrl is not None:
+                    ctrl.setParent(None)
+                    ctrl.deleteLater()
             elif var_name not in self.var_controls:
                 color = self.colors.get(var_name, self.get_default_color(var_name))
                 default_color = self.default_colors.get(var_name, color)
                 visible = self.curve_visibility.get(var_name, self.curves[var_name].isVisible())
-                ctrl = VariableControlItem(var_name, color, default_color, checked=visible)
+                ctrl = VariableControlItem(
+                    var_name,
+                    color,
+                    default_color,
+                    checked=visible,
+                    display_name=desc["display_name"],
+                    unit=desc.get("unit", ""),
+                )
                 self._connect_variable_control(ctrl)
                 self.var_controls[var_name] = ctrl
+            else:
+                self.var_controls[var_name].set_display(desc["display_name"], desc.get("unit", ""))
 
             last_section = self.dynamic_signal_sections.get(var_name)
-            if last_section == section:
-                continue
-            if last_section:
+            if last_section and last_section != section:
                 last_info = self.dataflow_export_sections.get(last_section)
                 if last_info and var_name in last_info.get("items", []):
                     last_info["items"].remove(var_name)
                     changed_sections.add(last_section)
                     self._remove_empty_dataflow_export_section(last_section)
             self.dynamic_signal_sections[var_name] = section
-            ctrl = self.var_controls.get(var_name)
-            if ctrl is None:
-                continue
-            section_info = self._get_or_create_dataflow_export_section(section)
+            if category == "task":
+                section_info = self._get_or_create_task_export_section(desc)
+            else:
+                section_info = self._get_or_create_dataflow_export_section(
+                    section,
+                    category=category,
+                    order=desc.get("group_order", 0),
+                )
             if var_name not in section_info["items"]:
                 section_info["items"].append(var_name)
             changed_sections.add(section)
 
-        self.dynamic_signal_variables = display_names
-        self.dataflow_export_count = len(display_names)
+        self.dynamic_signal_variables = dynamic_names
+        self.dataflow_export_count = len(dynamic_names)
         for section in changed_sections:
             self._relayout_dataflow_export_section_items(section)
         self._relayout_dataflow_export_sections()
         self._refresh_derived_health()
+        self._sync_task_latency_selection()
+        self._update_selected_controls()
 
         return added
 

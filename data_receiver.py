@@ -79,11 +79,12 @@ class DataReceiver:
 
         self.nf_schema = {}
         self.nf_schema_order = []
-        self.nf_schema_by_endpoint_no = {}
+        self.nf_schema_by_key = {}
         self.nf_schema_generation = None
         self.nf_schema_chunks = {}
         self.nf_schema_chunk_total = 0
         self.nf_schema_chunk_generation = None
+        self.nf_schema_chunk_entry_total = 0
         self.nf_request_id = 0
         self.nf_last_schema_request_ms = 0.0
         self.nf_schema_req_sent_count = 0
@@ -184,13 +185,7 @@ class DataReceiver:
         if not self.running:
             self.start()
 
-        self.nf_schema = {}
-        self.nf_schema_order = []
-        self.nf_schema_by_endpoint_no = {}
-        self.nf_schema_generation = None
-        self.nf_schema_chunks = {}
-        self.nf_schema_chunk_total = 0
-        self.nf_schema_chunk_generation = None
+        self._clear_nfv3_schema_()
         self.nf_schema_retry_active = False
         self.nf_next_schema_retry_ms = 0.0
 
@@ -284,13 +279,7 @@ class DataReceiver:
                 f"retry_active={int(self.nf_schema_retry_active)}"
             )
             return
-        self.nf_schema = {}
-        self.nf_schema_order = []
-        self.nf_schema_by_endpoint_no = {}
-        self.nf_schema_generation = None
-        self.nf_schema_chunks = {}
-        self.nf_schema_chunk_total = 0
-        self.nf_schema_chunk_generation = None
+        self._clear_nfv3_schema_()
         self.nf_last_packet_seq = None
         self.nf_schema_retry_active = True
         self.nf_next_schema_retry_ms = 0.0
@@ -301,6 +290,17 @@ class DataReceiver:
             f"retry_active={int(self.nf_schema_retry_active)}"
         )
         self._request_nfv3_schema(force=True)
+
+    def _clear_nfv3_schema_(self):
+        self.nf_schema = {}
+        self.nf_schema_order = []
+        self.nf_schema_by_key = {}
+        self.nf_schema_generation = None
+        self.nf_schema_chunks = {}
+        self.nf_schema_chunk_total = 0
+        self.nf_schema_chunk_generation = None
+        self.nf_schema_chunk_entry_total = 0
+        self.nf_parser.clear_schema()
 
     def _tick_nfv3_schema_retry(self):
         if not self.nf_schema_retry_active:
@@ -567,21 +567,23 @@ class DataReceiver:
 
     def _handle_nfv3_schema_response(self, packet):
         schema_generation = int(packet.get("schema_generation", 0)) & 0xFFFFFFFF
-        chunk_total = packet["chunk_total"]
-        chunk_index = packet["chunk_index"]
+        chunk_total = int(packet["chunk_total"])
+        chunk_index = int(packet["chunk_index"])
+        total_entries = int(packet.get("total_entries", 0))
 
-        if chunk_total == 0:
+        if chunk_total == 0 or total_entries == 0:
             return
 
         fresh_transfer = (
-            chunk_index == 0
-            or self.nf_schema_chunk_generation != schema_generation
+            self.nf_schema_chunk_generation != schema_generation
             or self.nf_schema_chunk_total != chunk_total
+            or self.nf_schema_chunk_entry_total != total_entries
         )
         if fresh_transfer:
             self.nf_schema_chunks = {}
             self.nf_schema_chunk_total = chunk_total
             self.nf_schema_chunk_generation = schema_generation
+            self.nf_schema_chunk_entry_total = total_entries
 
         self.nf_schema_chunks[chunk_index] = packet["entries"]
         if len(self.nf_schema_chunks) != self.nf_schema_chunk_total:
@@ -594,51 +596,132 @@ class DataReceiver:
                 return
             entries.extend(chunk_entries)
 
+        if len(entries) != self.nf_schema_chunk_entry_total:
+            self.nf_schema_chunks = {}
+            return
+        if not self.nf_parser.install_schema(schema_generation, entries):
+            self.nf_schema_chunks = {}
+            return
+
         schema = {}
-        schema_by_endpoint_no = {}
+        schema_by_key = {}
         self.nf_schema_order = []
         used_names = set()
         ordered_descriptors = []
-        for entry in entries:
-            endpoint_no = int(entry["endpoint_no"])
-            endpoint_kind = int(entry.get("endpoint_kind", 0))
-            owner = entry.get("owner") or "Dataflow"
-            endpoint_name = entry.get("name") or f"endpoint_{endpoint_no}"
-            if endpoint_kind == 1:
-                base_name = f"{owner}.input.{endpoint_name}"
-                section = f"{owner}/Input"
-            elif endpoint_kind == 2:
-                base_name = f"{owner}.output.{endpoint_name}"
-                section = f"{owner}/Output"
-            else:
-                base_name = f"Dataflow.{endpoint_name}"
-                section = "Dataflow"
+        task_order_by_id = {}
+        dataflow_group_order = {}
+
+        def add_descriptor(key, desc, base_name, suffix):
             var_name = base_name
             if var_name in used_names:
-                var_name = f"{base_name}[{endpoint_no}]"
+                var_name = f"{base_name}[{suffix}]"
             used_names.add(var_name)
-            desc = {
-                "endpoint_no": endpoint_no,
-                "endpoint_kind": endpoint_kind,
-                "scalar_type": entry["scalar_type"],
-                "task_id": entry.get("task_id", 0),
-                "owner": owner,
-                "name": endpoint_name,
-                "unit": entry["unit"],
-                "section": section,
-                "var_name": var_name,
-            }
-            schema[endpoint_no] = desc
-            schema_by_endpoint_no[endpoint_no] = desc
+            desc["var_name"] = var_name
+            schema[key] = desc
+            schema_by_key[key] = desc
             self.nf_schema_order.append(desc)
             ordered_descriptors.append(dict(desc))
 
+        for entry in entries:
+            if int(entry.get("entry_kind", 0)) != self.nf_parser.SCHEMA_KIND_TASK:
+                continue
+            task_id = int(entry["task_id"])
+            owner = entry.get("name") or f"Task{task_id}"
+            task_order = len(task_order_by_id)
+            task_order_by_id[task_id] = task_order
+            add_descriptor(
+                ("task_latency", task_id),
+                {
+                    "descriptor_kind": "task_latency",
+                    "category": "task",
+                    "task_id": task_id,
+                    "task_order": task_order,
+                    "owner": owner,
+                    "name": "latency_us",
+                    "display_name": "latency_us",
+                    "unit": "us",
+                    "section": f"Task/{task_id}",
+                    "source": f"{self.NF_SOURCE_PREFIX}task:{task_id}:latency",
+                    "hidden_control": True,
+                },
+                f"{owner}.latency_us",
+                task_id,
+            )
+
+        for entry in entries:
+            entry_kind = int(entry.get("entry_kind", 0))
+            if entry_kind == self.nf_parser.SCHEMA_KIND_TASK:
+                continue
+
+            if entry_kind == self.nf_parser.SCHEMA_KIND_TASK_PORT:
+                task_id = int(entry["task_id"])
+                direction = int(entry["direction"])
+                slot = int(entry["slot"])
+                task = self.nf_parser.schema_tasks.get(task_id, {})
+                owner = task.get("name") or f"Task{task_id}"
+                endpoint_name = entry.get("name") or f"port_{slot}"
+                if direction == self.nf_parser.PORT_INPUT:
+                    direction_name = "input"
+                else:
+                    direction_name = "output"
+                key = ("task", task_id, direction, slot)
+                base_name = f"{owner}.{direction_name}.{endpoint_name}"
+                source = f"{self.NF_SOURCE_PREFIX}task:{task_id}:{direction}:{slot}"
+                desc = {
+                    "entry_kind": entry_kind,
+                    "descriptor_kind": "task_port",
+                    "category": "task",
+                    "task_id": task_id,
+                    "task_order": task_order_by_id.get(task_id, task_id),
+                    "direction": direction,
+                    "slot": slot,
+                    "scalar_type": int(entry["scalar_type"]),
+                    "timestamp_group": int(entry["timestamp_group"]),
+                    "owner": owner,
+                    "name": endpoint_name,
+                    "display_name": endpoint_name,
+                    "unit": entry.get("unit", ""),
+                    "section": f"Task/{task_id}",
+                    "source": source,
+                }
+            elif entry_kind == self.nf_parser.SCHEMA_KIND_DATA_NODE:
+                node_no = int(entry["node_no"])
+                group = entry.get("group") or "Dataflow"
+                if group not in dataflow_group_order:
+                    dataflow_group_order[group] = len(dataflow_group_order)
+                endpoint_name = entry.get("name") or f"node_{node_no}"
+                key = ("node", node_no)
+                base_name = f"Dataflow.{endpoint_name}"
+                source = f"{self.NF_SOURCE_PREFIX}node:{node_no}"
+                desc = {
+                    "entry_kind": entry_kind,
+                    "descriptor_kind": "data_node",
+                    "category": "dataflow",
+                    "group": group,
+                    "group_order": dataflow_group_order[group],
+                    "node_no": node_no,
+                    "node_id": int(entry["node_id"]),
+                    "scalar_type": int(entry["scalar_type"]),
+                    "owner": "Dataflow",
+                    "name": endpoint_name,
+                    "display_name": endpoint_name,
+                    "unit": entry.get("unit", ""),
+                    "section": f"Dataflow/{group}",
+                    "source": source,
+                }
+            else:
+                continue
+
+            suffix = desc.get("node_no", desc.get("slot", 0))
+            add_descriptor(key, desc, base_name, suffix)
+
         self.nf_schema = schema
-        self.nf_schema_by_endpoint_no = schema_by_endpoint_no
+        self.nf_schema_by_key = schema_by_key
         self.nf_schema_generation = schema_generation
         self.nf_schema_chunks = {}
         self.nf_schema_chunk_total = 0
         self.nf_schema_chunk_generation = None
+        self.nf_schema_chunk_entry_total = 0
         self.nf_schema_retry_active = False
         self.nf_next_schema_retry_ms = 0.0
         self.nf_last_schema_sync_ok_ms = time.time() * 1000.0
@@ -668,13 +751,17 @@ class DataReceiver:
         if not self.nf_connected:
             return
         packet_generation = int(packet.get("schema_generation", 0)) & 0xFFFFFFFF
-        if not self.nf_schema_by_endpoint_no or self.nf_schema_generation != packet_generation:
+        if (
+            not packet.get("schema_available", False)
+            or self.nf_schema_generation != packet_generation
+        ):
             if not self.nf_schema_retry_active:
                 self.nf_schema_retry_active = True
                 self.nf_next_schema_retry_ms = 0.0
                 self.nf_schema_chunks = {}
                 self.nf_schema_chunk_total = 0
                 self.nf_schema_chunk_generation = None
+                self.nf_schema_chunk_entry_total = 0
                 self._request_nfv3_schema(force=True)
             return
 
@@ -687,33 +774,78 @@ class DataReceiver:
                 self.nf_packet_gap_count += 1
         self.nf_last_packet_seq = packet["packet_seq"]
 
-        # Offset estimate uses one shared NF clock source. Each variable still keeps
-        # its own timestamp queue, but all NF variables share the packet send_us offset.
-        build_us = int(packet["build_us"])
-        send_timestamp_ms = packet["send_us"] / 1000.0
-        for item in packet["items"]:
-            endpoint_no = int(item.get("endpoint_no", 0))
-            desc = self.nf_schema_by_endpoint_no.get(endpoint_no)
-            if desc is None:
-                continue
-            if int(item.get("status", 0)) != 1:
-                continue
-            value = self.nf_parser.raw_to_value(desc["scalar_type"], item["raw"])
-            if value is None:
-                continue
+        packet_time_us = int(packet["packet_time_us"])
+        packet_timestamp_ms = packet_time_us / 1000.0
 
-            capture_age_us = int(item.get("capture_age_us", 0)) & 0xFFFFFFFF
-            src_us = build_us - capture_age_us if build_us >= capture_age_us else 0
-            src_timestamp_ms = src_us / 1000.0
-            src = f"{self.NF_SOURCE_PREFIX}{endpoint_no}"
+        def publish(key, raw, capture_age_us):
+            desc = self.nf_schema_by_key.get(key)
+            if desc is None:
+                return
+            capture_age_us = int(capture_age_us) & 0xFFFFFFFF
+            if capture_age_us == self.nf_parser.INVALID_AGE_US:
+                return
+            value = self.nf_parser.raw_to_value(desc["scalar_type"], raw)
+            if value is None:
+                return
+            src_us = packet_time_us - capture_age_us if packet_time_us >= capture_age_us else 0
             self.data_model.add_data(
-                src,
+                desc["source"],
                 unix_ts,
-                src_timestamp_ms,
+                src_us / 1000.0,
                 {desc["var_name"]: value},
                 offset_src=self.NF_CLOCK_SOURCE,
-                offset_timestamp=send_timestamp_ms,
+                offset_timestamp=packet_timestamp_ms,
             )
+
+        def publish_latency(task_id, input_age_us, output_age_us):
+            desc = self.nf_schema_by_key.get(("task_latency", task_id))
+            if desc is None:
+                return
+            input_age_us = int(input_age_us) & 0xFFFFFFFF
+            output_age_us = int(output_age_us) & 0xFFFFFFFF
+            if (
+                input_age_us == self.nf_parser.INVALID_AGE_US
+                or output_age_us == self.nf_parser.INVALID_AGE_US
+                or input_age_us < output_age_us
+                or packet_time_us < input_age_us
+            ):
+                return
+            latency_us = input_age_us - output_age_us
+            input_time_us = packet_time_us - input_age_us
+            self.data_model.add_data(
+                desc["source"],
+                unix_ts,
+                input_time_us / 1000.0,
+                {desc["var_name"]: float(latency_us)},
+                offset_src=self.NF_CLOCK_SOURCE,
+                offset_timestamp=packet_timestamp_ms,
+            )
+            if hasattr(self.main_window, "update_task_latency"):
+                self.main_window.update_task_latency(task_id, latency_us)
+
+        for frame in packet["task_frames"]:
+            task_id = int(frame["task_id"])
+            flags = int(frame["flags"])
+            publish_latency(task_id, frame["input_age_us"], frame["output_age_us"])
+            if flags & self.nf_parser.TASK_FLAG_INPUTS_VALID:
+                for item in frame["inputs"]:
+                    publish(
+                        ("task", task_id, self.nf_parser.PORT_INPUT, int(item["slot"])),
+                        item["raw"],
+                        item["capture_age_us"],
+                    )
+            if flags & self.nf_parser.TASK_FLAG_OUTPUTS_VALID:
+                for item in frame["outputs"]:
+                    publish(
+                        ("task", task_id, self.nf_parser.PORT_OUTPUT, int(item["slot"])),
+                        item["raw"],
+                        item["capture_age_us"],
+                    )
+
+        for frame in packet["node_frames"]:
+            if int(frame.get("status", 0)) != 1:
+                continue
+            publish(("node", int(frame["node_no"])), frame["raw"], frame["publish_age_us"])
 
     def _process_udp_packet(self, data, unix_ts, meta):
         remote_addr = meta.get("remote_addr")

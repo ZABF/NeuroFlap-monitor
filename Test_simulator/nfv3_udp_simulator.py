@@ -7,25 +7,36 @@ import time
 
 
 MAGIC = 0x464E
-VERSION = 2
+VERSION = 3
 
 TYPE_DATA = 0x01
 TYPE_SCHEMA_REQ = 0x10
 TYPE_SCHEMA_RESP = 0x11
+TYPE_CONNECT_REQ = 0x20
+TYPE_CONNECT_ACK = 0x21
+TYPE_BUSY_ACK = 0x22
+TYPE_LINK_PING = 0x23
+TYPE_LINK_PONG = 0x24
+TYPE_DISCONNECT_REQ = 0x25
+
+SCHEMA_KIND_TASK = 1
+SCHEMA_KIND_TASK_PORT = 2
+SCHEMA_KIND_DATA_NODE = 3
+PORT_INPUT = 0
+PORT_OUTPUT = 1
+DEFAULT_TIMESTAMP_GROUP = 0xFF
 
 TYPE_BOOL = 1
-TYPE_U8 = 2
 TYPE_U16 = 3
-TYPE_U32 = 4
-TYPE_I32 = 5
 TYPE_F32 = 6
 
-DATA_HEADER_FMT = "<HBBIIQQH"
-DATA_ITEM_FMT = "<BHI"
+DATA_HEADER_FMT = "<HBBIIQHH"
+TASK_FRAME_HEADER_FMT = "<HBII"
+NODE_FRAME_FMT = "<HBII"
 SCHEMA_REQ_FMT = "<HBBI"
-SCHEMA_RESP_HEADER_FMT = "<HBBIIHHH"
-SCHEMA_ENTRY_PREFIX_FMT = "<IBBBB"
-
+SCHEMA_RESP_HEADER_FMT = "<HBBIHHHH"
+SCHEMA_ENTRY_HEADER_FMT = "<BH"
+CTRL_HEADER_FMT = "<HBB"
 MAX_PAYLOAD = 1200
 
 
@@ -33,114 +44,99 @@ def f32_to_raw(value):
     return struct.unpack("<I", struct.pack("<f", float(value)))[0]
 
 
-def u16_to_raw(value):
-    return int(value) & 0xFFFF
-
-
-def u32_to_raw(value):
-    return int(value) & 0xFFFFFFFF
-
-
-def bool_to_raw(value):
-    return 1 if value else 0
-
-
-def make_gid(section, signal_id):
-    return ((int(section) & 0xFFFF) << 16) | (int(signal_id) & 0xFFFF)
+def schema_entry(kind, payload):
+    return struct.pack(SCHEMA_ENTRY_HEADER_FMT, kind, len(payload)) + payload
 
 
 class NFv3UdpSimulator:
-    def __init__(self, bind_ip, bind_port, target_ip, target_port, period_ms, duration_s=None, chunk_size=0):
+    def __init__(self, bind_ip, bind_port, period_ms, duration_s=None):
         self.bind_ip = bind_ip
         self.bind_port = int(bind_port)
-        self.target = (target_ip, int(target_port))
         self.period_s = max(0.001, float(period_ms) / 1000.0)
         self.duration_s = float(duration_s) if duration_s is not None else None
-        self.chunk_size = int(chunk_size)
         self.sock = None
         self.stop_event = threading.Event()
         self.schema_generation = 1
-        self.section_mask = 0xFFFFFFFF
         self.packet_seq = 0
         self.send_count = 0
         self.last_stat_ts = time.time()
-        self.last_raw_by_signal_no = {}
+        self.active_client = None
+        self.schema_entries = self._make_schema_entries()
 
-        # GID stays stable as (section << 16) | id; DATA signal_no follows schema order.
-        self.schema = [
-            {"gid": make_gid(1, 10), "type": TYPE_F32, "name": "roll_6", "unit": "deg", "section": "Att"},
-            {"gid": make_gid(1, 11), "type": TYPE_F32, "name": "pitch", "unit": "deg", "section": "Att"},
-            {"gid": make_gid(1, 12), "type": TYPE_F32, "name": "yaw", "unit": "deg", "section": "Att"},
-            {"gid": make_gid(0, 20), "type": TYPE_U16, "name": "pwm1", "unit": "us", "section": "Actuator"},
-            {"gid": make_gid(0, 21), "type": TYPE_U16, "name": "pwm2", "unit": "us", "section": "Actuator"},
-            {"gid": make_gid(4, 30), "type": TYPE_U32, "name": "loop_hz", "unit": "hz", "section": "Control"},
-            {"gid": make_gid(4, 31), "type": TYPE_BOOL, "name": "armed", "unit": "", "section": "Control"},
+    def _make_schema_entries(self):
+        task_name = b"SimTask"
+        task = schema_entry(
+            SCHEMA_KIND_TASK,
+            struct.pack("<HBBBBB", 5, 2, 2, 0, 1, len(task_name)) + task_name,
+        )
+
+        def port(direction, slot, scalar_type, timestamp_group, name, unit=b""):
+            name = name.encode()
+            payload = struct.pack(
+                "<HBBBBBB",
+                5,
+                direction,
+                slot,
+                scalar_type,
+                timestamp_group,
+                len(name),
+                len(unit),
+            ) + name + unit
+            return schema_entry(SCHEMA_KIND_TASK_PORT, payload)
+
+        group = b"sim"
+        node_name = b"armed"
+        node_payload = struct.pack(
+            "<HHBBBB",
+            0,
+            1,
+            TYPE_BOOL,
+            len(group),
+            len(node_name),
+            0,
+        ) + group + node_name
+        return [
+            task,
+            port(PORT_INPUT, 0, TYPE_F32, DEFAULT_TIMESTAMP_GROUP, "roll", b"deg"),
+            port(PORT_INPUT, 1, TYPE_F32, DEFAULT_TIMESTAMP_GROUP, "pitch", b"deg"),
+            port(PORT_OUTPUT, 0, TYPE_U16, DEFAULT_TIMESTAMP_GROUP, "pwm_left", b"us"),
+            port(PORT_OUTPUT, 1, TYPE_U16, 0, "pwm_right", b"us"),
+            schema_entry(SCHEMA_KIND_DATA_NODE, node_payload),
         ]
 
-    def _build_schema_chunks(self):
+    def _schema_packets(self):
         chunks = []
-        current_entries = []
+        current = []
         current_size = struct.calcsize(SCHEMA_RESP_HEADER_FMT)
-
-        for entry in self.schema:
-            name_bytes = entry["name"].encode("utf-8")
-            unit_bytes = entry["unit"].encode("utf-8")
-            section_bytes = entry["section"].encode("utf-8")
-            entry_size = struct.calcsize(SCHEMA_ENTRY_PREFIX_FMT) + len(name_bytes) + len(unit_bytes) + len(section_bytes)
-            if entry_size > (MAX_PAYLOAD - struct.calcsize(SCHEMA_RESP_HEADER_FMT)):
-                raise ValueError("schema entry too large for one UDP packet")
-
-            if current_entries and (current_size + entry_size > MAX_PAYLOAD):
-                chunks.append(current_entries)
-                current_entries = []
+        for entry in self.schema_entries:
+            if current and current_size + len(entry) > MAX_PAYLOAD:
+                chunks.append(current)
+                current = []
                 current_size = struct.calcsize(SCHEMA_RESP_HEADER_FMT)
-
-            current_entries.append((entry, name_bytes, unit_bytes, section_bytes))
-            current_size += entry_size
-
-        if current_entries or not chunks:
-            chunks.append(current_entries)
+            current.append(entry)
+            current_size += len(entry)
+        chunks.append(current)
 
         packets = []
-        chunk_total = len(chunks)
         for chunk_index, chunk in enumerate(chunks):
-            packet = bytearray(
-                struct.pack(
-                    SCHEMA_RESP_HEADER_FMT,
-                    MAGIC,
-                    VERSION,
-                    TYPE_SCHEMA_RESP,
-                    self.schema_generation & 0xFFFFFFFF,
-                    self.section_mask & 0xFFFFFFFF,
-                    chunk_index,
-                    chunk_total,
-                    len(chunk),
-                )
+            header = struct.pack(
+                SCHEMA_RESP_HEADER_FMT,
+                MAGIC,
+                VERSION,
+                TYPE_SCHEMA_RESP,
+                self.schema_generation,
+                chunk_index,
+                len(chunks),
+                len(chunk),
+                len(self.schema_entries),
             )
-            for entry, name_bytes, unit_bytes, section_bytes in chunk:
-                packet.extend(
-                    struct.pack(
-                        SCHEMA_ENTRY_PREFIX_FMT,
-                        entry["gid"],
-                        entry["type"],
-                        len(name_bytes),
-                        len(unit_bytes),
-                        len(section_bytes),
-                    )
-                )
-                packet.extend(name_bytes)
-                packet.extend(unit_bytes)
-                packet.extend(section_bytes)
-            packets.append(bytes(packet))
+            packets.append(header + b"".join(chunk))
         return packets
 
-    def _send_schema_response(self, remote_addr):
-        packets = self._build_schema_chunks()
-        for packet in packets:
-            self.sock.sendto(packet, remote_addr)
-        print(f"[schema] response sent to {remote_addr[0]}:{remote_addr[1]}, chunks={len(packets)}")
+    def _send_control(self, packet_type, remote_addr):
+        self.sock.sendto(struct.pack(CTRL_HEADER_FMT, MAGIC, VERSION, packet_type), remote_addr)
 
-    def _try_handle_control_packets(self):
+    def _handle_packets(self):
         while True:
             try:
                 data, remote_addr = self.sock.recvfrom(2048)
@@ -148,171 +144,114 @@ class NFv3UdpSimulator:
                 return
             except OSError:
                 return
-
-            if len(data) != struct.calcsize(SCHEMA_REQ_FMT):
+            if len(data) < 4:
+                continue
+            magic, version, packet_type = struct.unpack_from(CTRL_HEADER_FMT, data)
+            if magic != MAGIC or version != VERSION:
                 continue
 
-            magic, version, packet_type, request_id = struct.unpack(SCHEMA_REQ_FMT, data)
-            if magic != MAGIC or version != VERSION or packet_type != TYPE_SCHEMA_REQ:
+            if packet_type == TYPE_CONNECT_REQ:
+                if self.active_client is None or self.active_client == remote_addr:
+                    self.active_client = remote_addr
+                    self._send_control(TYPE_CONNECT_ACK, remote_addr)
+                    print(f"[link] connected {remote_addr[0]}:{remote_addr[1]}")
+                else:
+                    owner_ip = socket.inet_aton(self.active_client[0])
+                    busy = struct.pack(CTRL_HEADER_FMT, MAGIC, VERSION, TYPE_BUSY_ACK)
+                    busy += struct.pack("<4sH", owner_ip, self.active_client[1])
+                    self.sock.sendto(busy, remote_addr)
                 continue
 
-            print(f"[schema] request from {remote_addr[0]}:{remote_addr[1]}, request_id={request_id}")
-            self._send_schema_response(remote_addr)
-
-    def _build_data_packets(self, now_s):
-        build_us = time.monotonic_ns() // 1000
-        send_us = build_us
-
-        roll = 30.0 * math.sin(2.0 * math.pi * 0.5 * now_s)
-        pitch = 20.0 * math.cos(2.0 * math.pi * 0.6 * now_s)
-        yaw = 90.0 * math.sin(2.0 * math.pi * 0.2 * now_s)
-        pwm1 = 1500 + int(200 * math.sin(2.0 * math.pi * 2.0 * now_s))
-        pwm2 = 1500 + int(200 * math.cos(2.0 * math.pi * 2.0 * now_s))
-        loop_hz = 1000
-        armed = (int(now_s) % 4) < 2
-
-        values = [
-            (0, f32_to_raw(roll)),
-            (1, f32_to_raw(pitch)),
-            (2, f32_to_raw(yaw)),
-            (3, u16_to_raw(pwm1)),
-            (4, u16_to_raw(pwm2)),
-            (5, u32_to_raw(loop_hz)),
-            (6, bool_to_raw(armed)),
-        ]
-
-        changed_values = []
-        for signal_no, raw in values:
-            last_raw = self.last_raw_by_signal_no.get(signal_no)
-            if last_raw is not None and last_raw == raw:
+            if remote_addr != self.active_client:
                 continue
-            self.last_raw_by_signal_no[signal_no] = raw
-            changed_values.append((signal_no, raw))
+            if packet_type == TYPE_LINK_PING:
+                self._send_control(TYPE_LINK_PONG, remote_addr)
+            elif packet_type == TYPE_DISCONNECT_REQ:
+                self.active_client = None
+                print("[link] disconnected")
+            elif packet_type == TYPE_SCHEMA_REQ and len(data) == struct.calcsize(SCHEMA_REQ_FMT):
+                request_id = struct.unpack(SCHEMA_REQ_FMT, data)[3]
+                for packet in self._schema_packets():
+                    self.sock.sendto(packet, remote_addr)
+                print(f"[schema] request_id={request_id}, entries={len(self.schema_entries)}")
 
-        if not changed_values:
-            return []
+    def _data_packet(self, elapsed_s):
+        packet_time_us = time.monotonic_ns() // 1000
+        roll = 30.0 * math.sin(2.0 * math.pi * 0.5 * elapsed_s)
+        pitch = 20.0 * math.cos(2.0 * math.pi * 0.6 * elapsed_s)
+        pwm_left = 1500 + int(200 * math.sin(2.0 * math.pi * 2.0 * elapsed_s))
+        pwm_right = 1500 + int(200 * math.cos(2.0 * math.pi * 2.0 * elapsed_s))
+        armed = (int(elapsed_s) % 4) < 2
 
-        if self.chunk_size > 0:
-            chunk_size = self.chunk_size
-        else:
-            chunk_size = len(changed_values)
-
-        packets = []
-        for offset in range(0, len(changed_values), chunk_size):
-            chunk = changed_values[offset:offset + chunk_size]
-            packet = bytearray(
-                struct.pack(
-                    DATA_HEADER_FMT,
-                    MAGIC,
-                    VERSION,
-                    TYPE_DATA,
-                    self.schema_generation & 0xFFFFFFFF,
-                    self.packet_seq & 0xFFFFFFFF,
-                    build_us & 0xFFFFFFFFFFFFFFFF,
-                    send_us & 0xFFFFFFFFFFFFFFFF,
-                    len(chunk),
-                )
-            )
-            for signal_no, raw in chunk:
-                packet.extend(
-                    struct.pack(
-                        DATA_ITEM_FMT,
-                        signal_no & 0xFF,
-                        0,
-                        raw & 0xFFFFFFFF,
-                    )
-                )
-
-            packets.append(bytes(packet))
-            self.packet_seq = (self.packet_seq + 1) & 0xFFFFFFFF
-
-        return packets
+        header = struct.pack(
+            DATA_HEADER_FMT,
+            MAGIC,
+            VERSION,
+            TYPE_DATA,
+            self.schema_generation,
+            self.packet_seq,
+            packet_time_us,
+            1,
+            1,
+        )
+        flags = 0x07
+        task = struct.pack(TASK_FRAME_HEADER_FMT, 5, flags, 100, 50)
+        task += struct.pack(
+            "<IIII",
+            f32_to_raw(roll),
+            f32_to_raw(pitch),
+            pwm_left & 0xFFFF,
+            pwm_right & 0xFFFF,
+        )
+        task += struct.pack("<I", 25)
+        node = struct.pack(NODE_FRAME_FMT, 0, 1, 10, 1 if armed else 0)
+        self.packet_seq = (self.packet_seq + 1) & 0xFFFFFFFF
+        return header + task + node
 
     def run(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            self.sock.bind((self.bind_ip, self.bind_port))
-        except OSError as exc:
-            # Common on Windows when previous process still owns the port.
-            if getattr(exc, "winerror", None) == 10048:
-                print(
-                    f"[warn] bind {self.bind_ip}:{self.bind_port} failed (in use), "
-                    "fallback to ephemeral port."
-                )
-                self.sock.bind((self.bind_ip, 0))
-                self.bind_port = int(self.sock.getsockname()[1])
-            else:
-                raise
+        self.sock.bind((self.bind_ip, self.bind_port))
         self.sock.setblocking(False)
-
         print(
-            f"NFv3 simulator started: bind={self.bind_ip}:{self.bind_port}, "
-            f"target={self.target[0]}:{self.target[1]}, period={self.period_s * 1000:.1f}ms"
+            f"NFv3 simulator listening on {self.bind_ip}:{self.bind_port}, "
+            f"period={self.period_s * 1000:.1f}ms"
         )
-        print("Press Ctrl+C to stop.")
 
         start = time.monotonic()
         next_send = start
         while not self.stop_event.is_set():
-            if self.duration_s is not None and (time.monotonic() - start) >= self.duration_s:
-                self.stop_event.set()
-                continue
-
-            self._try_handle_control_packets()
-
+            if self.duration_s is not None and time.monotonic() - start >= self.duration_s:
+                break
+            self._handle_packets()
             now = time.monotonic()
-            if now >= next_send:
-                elapsed = now - start
-                packets = self._build_data_packets(elapsed)
-                for packet in packets:
-                    self.sock.sendto(packet, self.target)
-                    self.send_count += 1
-                next_send += self.period_s
+            if self.active_client is not None and now >= next_send:
+                self.sock.sendto(self._data_packet(now - start), self.active_client)
+                self.send_count += 1
+                next_send = now + self.period_s
+            elif self.active_client is None:
+                next_send = now
 
-            wall_now = time.time()
-            if wall_now - self.last_stat_ts >= 1.0:
-                print(f"[data] sent_packets={self.send_count}, next_seq={self.packet_seq}")
-                self.last_stat_ts = wall_now
-
+            if time.time() - self.last_stat_ts >= 1.0:
+                print(f"[data] client={self.active_client}, sent_packets={self.send_count}")
+                self.last_stat_ts = time.time()
             time.sleep(0.001)
 
-        try:
-            self.sock.close()
-        except OSError:
-            pass
-        print("NFv3 simulator stopped.")
+        self.sock.close()
+        print("NFv3 simulator stopped")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="NFv3 UDP simulator for NeuroFlap monitor")
-    parser.add_argument("--bind-ip", default="0.0.0.0", help="local bind ip")
-    parser.add_argument("--bind-port", type=int, default=28090, help="local bind port")
-    parser.add_argument("--target-ip", default="127.0.0.1", help="monitor udp listen ip")
-    parser.add_argument("--target-port", type=int, default=28080, help="monitor udp listen port")
-    parser.add_argument("--period-ms", type=float, default=20.0, help="DATA send period in ms")
-    parser.add_argument("--duration-s", type=float, default=None, help="optional run duration in seconds")
-    parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=0,
-        help="DATA items per packet; 0 means all items in one packet",
-    )
+    parser = argparse.ArgumentParser(description="Compact NFv3 UDP simulator")
+    parser.add_argument("--bind-ip", default="0.0.0.0")
+    parser.add_argument("--bind-port", type=int, default=28090)
+    parser.add_argument("--period-ms", type=float, default=20.0)
+    parser.add_argument("--duration-s", type=float, default=None)
     args = parser.parse_args()
-
-    sim = NFv3UdpSimulator(
-        bind_ip=args.bind_ip,
-        bind_port=args.bind_port,
-        target_ip=args.target_ip,
-        target_port=args.target_port,
-        period_ms=args.period_ms,
-        duration_s=args.duration_s,
-        chunk_size=args.chunk_size,
-    )
-
+    simulator = NFv3UdpSimulator(args.bind_ip, args.bind_port, args.period_ms, args.duration_s)
     try:
-        sim.run()
+        simulator.run()
     except KeyboardInterrupt:
-        sim.stop_event.set()
+        simulator.stop_event.set()
 
 
 if __name__ == "__main__":

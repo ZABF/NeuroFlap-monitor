@@ -6,6 +6,8 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import QTimer
 import pyqtgraph as pg
 
+from ui.theme import PLOT_BG_HEX, curve_label_style
+
 
 # ------------------------- peak helpers -------------------------
 def parabolic_peak(ts, vs, i):
@@ -151,7 +153,7 @@ class WaveformCaptureWindow(QWidget):
     def __init__(self, main_window):
         super().__init__()
         self.main_window = main_window
-        self.signal_names = list(main_window.fixed_variables)
+        self.signal_names = list(main_window.signal_variables)
 
         # Reference Signal default: 'pwm1' if present (case-insensitive), else first
         self.reference_signal = self._default_ref_name(self.signal_names)
@@ -186,6 +188,7 @@ class WaveformCaptureWindow(QWidget):
         layout.addLayout(self._create_signal_checkboxes())
 
         self.plot_widget = pg.PlotWidget()
+        self.plot_widget.setBackground(PLOT_BG_HEX)
         self.plot_widget.showGrid(x=True, y=True)
         self.plot_widget.setLabel('left', 'magnitude')
         self.plot_widget.setLabel('bottom', 'Time', units='ms')
@@ -244,7 +247,7 @@ class WaveformCaptureWindow(QWidget):
             box = QCheckBox(name)
             box.setChecked(False)
             rgb = self.main_window.get_default_color(name)  # (r,g,b)
-            box.setStyleSheet(f"color: rgb{rgb};")
+            box.setStyleSheet(curve_label_style(rgb, "QCheckBox"))
             self.target_checks[name] = box
             layout.addWidget(box, i // columns, i % columns)
         return layout
@@ -294,12 +297,12 @@ class WaveformCaptureWindow(QWidget):
     def update_reference_periods(self, force=False):
         if not self.isVisible():
             return
-        ts, vs = self.main_window.data_model.get_series(self.reference_signal)
+        ts, vs = self.main_window.data_model.get_series_tail(
+            self.reference_signal,
+            5000,
+        )
         if len(ts) < 10:
             return
-        # Light downsampling of incoming history
-        ts = ts[-5000:]
-        vs = vs[-5000:]
         if not force and self.last_ref_ts == ts[-1]:
             return
         self.last_ref_ts = ts[-1]
@@ -361,7 +364,7 @@ class WaveformCaptureWindow(QWidget):
         # Load only recent process_time_s window (converted to ts units), then cap to 5000 pts
         data = {}
         for name in targets:
-            ts, vs = self.main_window.data_model.get_series(name)
+            ts, vs = self.main_window.data_model.get_series_tail(name, 5000)
             ts = np.asarray(ts, dtype=float); vs = np.asarray(vs, dtype=float)
             if ts.size:
                 span = self._seconds_to_ts_units(ts, self.process_time_s)
@@ -369,9 +372,6 @@ class WaveformCaptureWindow(QWidget):
                 m = ts >= cutoff
                 if np.count_nonzero(m) >= 3:
                     ts, vs = ts[m], vs[m]
-            # cap for plotting
-            if ts.size > 5000:
-                ts = ts[-5000:]; vs = vs[-5000:]
             data[name] = (ts, vs)
 
         self.process_and_plot(data)

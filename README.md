@@ -57,7 +57,7 @@ Dataflow export protocol reference:
 
 ## Troubleshooting
 
-- No endpoint list/data:
+- No TaskIO/DataNode variable list or data:
   - Check firmware `SysDataflowExportTask` is started.
   - Check ESP32 IP/port in NeuroFlap tab.
   - Verify monitor status is `Connected` (not `Disconnected`/`Busy`).

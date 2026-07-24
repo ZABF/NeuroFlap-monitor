@@ -1,25 +1,34 @@
-﻿from bisect import bisect_left
-from collections import deque
+﻿from array import array
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
-from typing import Deque, Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple
+
+
+def _double_array():
+    return array("d")
+
+
+def _session_array():
+    return array("I")
 
 
 @dataclass
 class SourceBucket:
     src: str
     offset_src: Optional[str] = None
-    src_timestamp: Deque[float] = field(default_factory=deque)
-    recon_timestamp: Deque[float] = field(default_factory=deque)
-    session: Deque[int] = field(default_factory=deque)
+    src_timestamp: array = field(default_factory=_double_array)
+    recon_timestamp: array = field(default_factory=_double_array)
+    session: array = field(default_factory=_session_array)
     last_src_timestamp: Optional[float] = None
     current_session: int = 1
+    reconstruction_dirty: bool = False
 
 
 @dataclass
 class VarBucket:
     var: str
     src: str
-    value: Deque[float] = field(default_factory=deque)
+    value: array = field(default_factory=_double_array)
 
 
 class DataModel:
@@ -73,7 +82,9 @@ class DataModel:
         clock_src = offset_src or src
         clock_timestamp = float(src_timestamp if offset_timestamp is None else offset_timestamp)
         clock_bucket = self.ensure_source(clock_src)
-        source_bucket.offset_src = clock_src
+        if source_bucket.offset_src != clock_src:
+            source_bucket.offset_src = clock_src
+            source_bucket.reconstruction_dirty = True
 
         if (
             clock_bucket.last_src_timestamp is not None
@@ -89,6 +100,9 @@ class DataModel:
         last_offset = self.offsets.get(offset_key)
         if last_offset is None or current_offset < last_offset:
             self.offsets[offset_key] = current_offset
+            for bucket in self.sources.values():
+                if (bucket.offset_src or bucket.src) == clock_src:
+                    bucket.reconstruction_dirty = True
 
         recon_timestamp = src_timestamp + self.offsets[offset_key]
         self.add_timestamp(src, src_timestamp, recon_timestamp, clock_bucket.current_session)
@@ -129,6 +143,7 @@ class DataModel:
         source_bucket.offset_src = src
         source_bucket.current_session = 1
         source_bucket.last_src_timestamp = float(timestamps[count - 1])
+        source_bucket.reconstruction_dirty = False
         for i in range(count):
             ts = float(timestamps[i])
             source_bucket.src_timestamp.append(ts)
@@ -136,52 +151,105 @@ class DataModel:
             source_bucket.session.append(1)
             var_bucket.value.append(float(values[i]))
 
-    def get_series(self, var: str, series_time_ms: float):
+    def _series_storage(self, var: str):
         var_bucket = self.vars.get(var)
         if not var_bucket or not var_bucket.src:
-            return [], []
+            return None
 
         source_bucket = self.sources.get(var_bucket.src)
         if not source_bucket or not source_bucket.src_timestamp:
-            return [], []
+            return None
 
-        count = min(len(var_bucket.value), len(source_bucket.src_timestamp), len(source_bucket.session))
+        self._ensure_reconstructed(source_bucket)
+        count = min(
+            len(var_bucket.value),
+            len(source_bucket.recon_timestamp),
+            len(source_bucket.session),
+        )
         if count == 0:
-            return [], []
+            return None
+        return var_bucket, source_bucket, count
 
-        src_ts = list(source_bucket.src_timestamp)[:count]
-        sessions = list(source_bucket.session)[:count]
-        offset_src = source_bucket.offset_src or var_bucket.src
-        timestamps = [
-            src_t + self.offsets.get((offset_src, session_id), 0.0)
-            for src_t, session_id in zip(src_ts, sessions)
-        ]
+    def _ensure_reconstructed(self, source_bucket: SourceBucket) -> None:
+        count = min(len(source_bucket.src_timestamp), len(source_bucket.session))
+        if (
+            not source_bucket.reconstruction_dirty
+            and len(source_bucket.recon_timestamp) == count
+        ):
+            return
+
+        offset_src = source_bucket.offset_src or source_bucket.src
+        source_bucket.recon_timestamp = array(
+            "d",
+            (
+                source_bucket.src_timestamp[index]
+                + self.offsets.get((offset_src, source_bucket.session[index]), 0.0)
+                for index in range(count)
+            ),
+        )
+        source_bucket.reconstruction_dirty = False
+
+    @staticmethod
+    def _series_slice(var_bucket, source_bucket, start_idx, end_idx):
+        return (
+            source_bucket.recon_timestamp[start_idx:end_idx].tolist(),
+            var_bucket.value[start_idx:end_idx].tolist(),
+        )
+
+    def get_series(self, var: str, series_time_ms: float = None):
+        storage = self._series_storage(var)
+        if storage is None:
+            return [], []
+        var_bucket, source_bucket, count = storage
+
         if series_time_ms is not None and series_time_ms >= 0:
-            cutoff = timestamps[-1] - series_time_ms
-            start_idx = bisect_left(timestamps, cutoff)
+            cutoff = source_bucket.recon_timestamp[count - 1] - series_time_ms
+            start_idx = bisect_left(source_bucket.recon_timestamp, cutoff, 0, count)
         else:
             start_idx = 0
+        return self._series_slice(var_bucket, source_bucket, start_idx, count)
 
-        values = list(var_bucket.value)[start_idx:count]
-        return timestamps[start_idx:count], values
+    def get_series_between(self, var: str, start_ms=None, end_ms=None):
+        """Return a time slice without materializing the complete history."""
+        storage = self._series_storage(var)
+        if storage is None:
+            return [], []
+        var_bucket, source_bucket, count = storage
+
+        start_idx = 0
+        end_idx = count
+        if start_ms is not None:
+            start_idx = bisect_left(
+                source_bucket.recon_timestamp,
+                float(start_ms),
+                0,
+                count,
+            )
+        if end_ms is not None:
+            end_idx = bisect_right(
+                source_bucket.recon_timestamp,
+                float(end_ms),
+                start_idx,
+                count,
+            )
+        return self._series_slice(var_bucket, source_bucket, start_idx, end_idx)
+
+    def get_series_tail(self, var: str, max_samples: int):
+        """Return at most the newest max_samples without copying older history."""
+        storage = self._series_storage(var)
+        if storage is None or max_samples <= 0:
+            return [], []
+        var_bucket, source_bucket, count = storage
+        start_idx = max(0, count - int(max_samples))
+        return self._series_slice(var_bucket, source_bucket, start_idx, count)
 
     def get_series_fast(self, var: str, series_time_ms: float):
         del series_time_ms
-        var_bucket = self.vars.get(var)
-        if not var_bucket or not var_bucket.src:
+        storage = self._series_storage(var)
+        if storage is None:
             return [], []
-
-        source_bucket = self.sources.get(var_bucket.src)
-        if not source_bucket or not source_bucket.src_timestamp:
-            return [], []
-
-        count = min(len(var_bucket.value), len(source_bucket.src_timestamp), len(source_bucket.session))
-        if count == 0:
-            return [], []
-
-        values = list(var_bucket.value)[:count]
-        timestamps = list(source_bucket.recon_timestamp)[:count]
-        return timestamps, values
+        var_bucket, source_bucket, count = storage
+        return self._series_slice(var_bucket, source_bucket, 0, count)
 
     def clear(self) -> None:
         self.sources.clear()
@@ -197,6 +265,7 @@ class DataModel:
             source_bucket.offset_src = None
             source_bucket.last_src_timestamp = None
             source_bucket.current_session = 1
+            source_bucket.reconstruction_dirty = False
 
         if clear_offsets:
             to_delete = [key for key in self.offsets if key[0] == src]
