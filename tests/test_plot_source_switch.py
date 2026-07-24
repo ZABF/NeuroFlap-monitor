@@ -1,4 +1,5 @@
 import os
+import math
 import sys
 import types
 import unittest
@@ -145,6 +146,148 @@ class PlotSourceSwitchTest(unittest.TestCase):
         self.window.close()
         self.app.processEvents()
         DataReceiver.start = self.original_start
+
+    def test_auto_x_off_skips_periodic_curve_processing(self):
+        self.window.plot_state = self.window.plot_state.RUNNING
+        self.window.auto_scroll_enabled = False
+        original = self.window._curve_plot_data
+        self.window._curve_plot_data = lambda _name: self.fail(
+            "AutoX off must not process curves from the periodic timer"
+        )
+        try:
+            self.window.update_plot()
+        finally:
+            self.window._curve_plot_data = original
+
+    def test_auto_x_on_skips_curves_without_new_source_revision(self):
+        self.window.plot_state = self.window.plot_state.RUNNING
+        self.window.auto_scroll_enabled = True
+        for name, curve in self.window.curves.items():
+            if curve.isVisible():
+                self.window._curve_render_signatures[name] = (
+                    self.window._curve_revision_signature(name)
+                )
+        original = self.window._curve_plot_data
+        self.window._curve_plot_data = lambda _name: self.fail(
+            "Unchanged curves must not be queried again"
+        )
+        try:
+            self.window.update_plot()
+        finally:
+            self.window._curve_plot_data = original
+
+    def test_auto_x_off_uses_current_view_box_range(self):
+        self.window.reception_start_time = 0.0
+        self.window.window_now = 10000.0
+        self.window.auto_scroll_enabled = False
+        self.window.plot_widget.setXRange(2000.0, 3000.0, padding=0)
+
+        start, end = self.window._clip_window_range()
+
+        self.assertAlmostEqual(start, 2000.0)
+        self.assertAlmostEqual(end, 3000.0)
+
+    def test_derived_curve_queries_only_viewport_and_context(self):
+        timestamps = [float(index * 10) for index in range(10001)]
+        values = [float(index) for index in range(10001)]
+        self.window.data_model.add_series("F_X", "test", timestamps, values)
+        ast = CurveExpressionParser("smooth([F_X], 100)").parse()
+        self.window.create_derived_curve("smooth_test", "smooth([F_X], 100)", ast)
+        self.window.reception_start_time = 0.0
+        self.window.window_now = 100000.0
+        self.window.auto_scroll_enabled = False
+        self.window.plot_widget.setXRange(90000.0, 91000.0, padding=0)
+        self.window._invalidate_curve_render_state()
+
+        calls = []
+        original = self.window.data_model.get_series_between
+
+        def recording_query(var_name, start_ms, end_ms, **kwargs):
+            calls.append((var_name, start_ms, end_ms, kwargs))
+            return original(var_name, start_ms, end_ms, **kwargs)
+
+        self.window.data_model.get_series_between = recording_query
+        try:
+            self.window._curve_plot_data("smooth_test")
+            self.window._curve_plot_data("smooth_test")
+        finally:
+            self.window.data_model.get_series_between = original
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "F_X")
+        self.assertGreaterEqual(calls[0][1], 89800.0)
+        self.assertLessEqual(calls[0][2], 91200.0)
+        full_ts, _full_vs = self.window._curve_view_data["smooth_test"]
+        self.assertTrue(full_ts)
+        self.assertGreaterEqual(full_ts[0], 90000.0)
+        self.assertLessEqual(full_ts[-1], 91000.0)
+        expected_ts, expected_vs = self.window._smooth_curve_data(
+            timestamps,
+            values,
+            100.0,
+        )
+        expected = [
+            (timestamp, value)
+            for timestamp, value in zip(expected_ts, expected_vs)
+            if 90000.0 <= timestamp <= 91000.0
+        ]
+        actual = list(zip(*self.window._curve_view_data["smooth_test"]))
+        self.assertEqual(actual, expected)
+        raw_ts, raw_vs = self.window._curve_source_data("F_X")
+        self.assertEqual(len(raw_ts), 10001)
+        self.assertEqual(len(raw_vs), 10001)
+
+    def test_windowed_derivatives_match_full_history_results(self):
+        timestamps = [float(index * 10) for index in range(2001)]
+        values = [math.sin(index * 0.02) for index in range(2001)]
+        self.window.data_model.add_series("F_X", "test", timestamps, values)
+        self.window.reception_start_time = 0.0
+        self.window.window_now = 20000.0
+        self.window.auto_scroll_enabled = False
+        self.window.plot_widget.setXRange(8000.0, 10000.0, padding=0)
+
+        cases = [
+            (
+                "d_test",
+                "d([F_X])",
+                lambda: self.window._differentiate_curve_data(timestamps, values),
+            ),
+            (
+                "sg_test",
+                "sg([F_X], 150, 3, 1)",
+                lambda: self.window._savgol_curve_data(timestamps, values, 150, 3, 1),
+            ),
+            (
+                "tau_test",
+                "joint_tau([F_X], 150, 3, 1, 0.1, 0.2, 0.01)",
+                lambda: self.window._joint_tau_curve_data(
+                    timestamps,
+                    values,
+                    150,
+                    3,
+                    1,
+                    0.1,
+                    0.2,
+                    0.01,
+                ),
+            ),
+        ]
+
+        for name, expression, full_evaluator in cases:
+            ast = CurveExpressionParser(expression).parse()
+            self.window.create_derived_curve(name, expression, ast)
+            self.window._curve_plot_data(name)
+            actual_ts, actual_vs = self.window._curve_view_data[name]
+            expected_ts, expected_vs = full_evaluator()
+            expected = [
+                (timestamp, value)
+                for timestamp, value in zip(expected_ts, expected_vs)
+                if 8000.0 <= timestamp <= 10000.0
+            ]
+            self.assertEqual(actual_ts, [item[0] for item in expected])
+            self.assertEqual(len(actual_vs), len(expected))
+            for actual, (_timestamp, expected_value) in zip(actual_vs, expected):
+                self.assertAlmostEqual(actual, expected_value, places=9)
 
     def test_replay_switch_preserves_workspace_and_auto_recovers_derived(self):
         self.window._load_imported_series("/tmp/first.csv", _series("a", [1.0, 2.0]))

@@ -83,6 +83,48 @@ class DataModelTest(unittest.TestCase):
         )
         self.assertEqual(model.get_series_tail("value", 0), ([], []))
 
+    def test_range_query_can_include_filter_context_samples(self):
+        model = DataModel([])
+        model.add_series(
+            "value",
+            "source",
+            timestamps=[0.0, 10.0, 20.0, 30.0, 40.0],
+            values=[0.0, 1.0, 2.0, 3.0, 4.0],
+        )
+
+        self.assertEqual(
+            model.get_series_between(
+                "value",
+                20.0,
+                20.0,
+                before_samples=1,
+                after_samples=1,
+            ),
+            ([10.0, 20.0, 30.0], [1.0, 2.0, 3.0]),
+        )
+
+    def test_series_revision_changes_when_samples_change(self):
+        model = DataModel([])
+        initial = model.get_series_revision("value")
+        model.add_series("value", "source", [0.0], [1.0])
+        loaded = model.get_series_revision("value")
+        model.add_data("source", 10.0, 10.0, {"value": 2.0})
+        appended = model.get_series_revision("value")
+
+        self.assertNotEqual(initial, loaded)
+        self.assertNotEqual(loaded, appended)
+
+    def test_nearest_sample_uses_complete_raw_series(self):
+        model = DataModel([])
+        model.add_series(
+            "value",
+            "source",
+            timestamps=[0.0, 10.0, 20.0],
+            values=[1.0, 2.0, 3.0],
+        )
+
+        self.assertEqual(model.get_nearest_sample("value", 14.0), (10.0, 2.0))
+
 
 if __name__ == "__main__":
     unittest.main()
