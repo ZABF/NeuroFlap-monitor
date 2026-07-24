@@ -43,6 +43,7 @@ from ui.curve_expression import (
     resolve_clip_bounds,
 )
 from ui.curve_state import ActiveDataSource, expression_refs, resolve_derived_health
+from ui.curve_data_engine import min_max_downsample
 
 '''
 CURRENT STATE  |    start           stop            clear
@@ -75,7 +76,7 @@ class PlotWindow(QWidget):
 
     def __init__(self, persist_layout=True):
         super().__init__()
-        self.setWindowTitle("Monitor v3.0.0")
+        self.setWindowTitle("Monitor v3.1.0")
         self._layout_settings = QSettings("NeuroFlap", "Monitor") if persist_layout else None
         saved_section_order = (
             self._layout_settings.value(self.SECTION_ORDER_SETTINGS_KEY, [])
@@ -137,6 +138,10 @@ class PlotWindow(QWidget):
         self.curve_transforms = {}
         self.curve_specs = {}
         self.curve_visibility = {}
+        self._curve_view_data = {}
+        self._curve_cache = {}
+        self._curve_render_signatures = {}
+        self._curve_expression_revision = 0
         self.active_data_source = ActiveDataSource.none()
         self.available_raw_variables = set()
         self.derived_health = {}
@@ -594,6 +599,12 @@ class PlotWindow(QWidget):
         self.plot_timer = QTimer()
         self.plot_timer.timeout.connect(self.update_plot)
         self.plot_timer.start(20)
+
+        self.viewport_refresh_timer = QTimer(self)
+        self.viewport_refresh_timer.setSingleShot(True)
+        self.viewport_refresh_timer.timeout.connect(
+            lambda: self.refresh_all_curves(visible_only=True)
+        )
 
         # 瀹氭椂鍣ㄧ敤浜庡埛鏂板厜鏍?
         self.axis_timer = QTimer()
@@ -1053,6 +1064,7 @@ class PlotWindow(QWidget):
         self.now_line.setValue(self.window_now)
         self.begin_line.setValue(self.reception_start_time)
         self.x_axis.set_start_time(self.reception_start_time)
+        self._invalidate_curve_render_state()
         for curve in self.curves.values():
             curve.setData([], [])
 
@@ -1080,6 +1092,7 @@ class PlotWindow(QWidget):
         self._live_activation_requested = False
         self.data_receiver.set_data_ingestion_enabled(False)
         self.data_model.clear()
+        self._invalidate_curve_render_state()
         self._hide_selected_hover_point()
         self._set_active_data_source(ActiveDataSource.replay(path))
         self._set_available_raw_variables(series.keys())
@@ -1155,6 +1168,9 @@ class PlotWindow(QWidget):
 
     def update_window_duration(self, value):
         self.fixed_window_seconds = value
+        self._invalidate_curve_render_state()
+        if self.auto_scroll_enabled:
+            self.refresh_all_curves(visible_only=True)
 
     def _set_auto_checkboxes_silent(self, auto_x, auto_y):
         self.auto_x.blockSignals(True)
@@ -1169,6 +1185,7 @@ class PlotWindow(QWidget):
         if self.auto_scroll_enabled == enabled:
             return
         self.auto_scroll_enabled = enabled
+        self._invalidate_curve_render_state()
         self.refresh_all_curves(visible_only=True)
 
     def set_auto_y_enabled(self, state):
@@ -1186,7 +1203,8 @@ class PlotWindow(QWidget):
             self.auto_scroll_enabled = False
             self.auto_x.setChecked(False)
         if auto_x_was_enabled:
-            self.refresh_all_curves(visible_only=True)
+            self._invalidate_curve_render_state()
+        self.viewport_refresh_timer.start(40)
 
     def get_default_color(self, var_name):
         """Return the default curve color for a variable."""
@@ -1275,6 +1293,7 @@ class PlotWindow(QWidget):
             self.data_receiver.first_ft_received_flag = False
             self.data_receiver.first_udp_received_flag = False
             self.data_model.clear()  # 闃叉娈嬬暀鏁版嵁
+            self._invalidate_curve_render_state()
             self.reception_start_time = now
             unix_time = time.time_ns() / 1000
             # print(f"The latest window t0 corresponds to the unix time {unix_time} us")
@@ -1339,6 +1358,104 @@ class PlotWindow(QWidget):
     def _is_derived_curve(self, var_name):
         return self.curve_specs.get(var_name, {}).get("kind") == "expr"
 
+    def _invalidate_curve_render_state(self, var_name=None):
+        if var_name is None:
+            self._curve_cache.clear()
+            self._curve_view_data.clear()
+            self._curve_render_signatures.clear()
+            return
+        self._curve_cache.pop(var_name, None)
+        self._curve_view_data.pop(var_name, None)
+        self._curve_render_signatures.pop(var_name, None)
+
+    def _curve_transform_signature(self, var_name):
+        transform = self._get_curve_transform(var_name)
+        return (
+            float(transform.get("phase_ms", 0.0)),
+            float(transform.get("scale", 1.0)),
+            float(transform.get("offset", 0.0)),
+        )
+
+    def _curve_revision_signature(self, var_name, stack=()):
+        if var_name in stack:
+            return ("cycle", var_name)
+        transform = self._curve_transform_signature(var_name)
+        spec = self.curve_specs.get(var_name)
+        if not spec or spec.get("kind") != "expr":
+            return ("raw", self.data_model.get_series_revision(var_name), transform)
+        refs = sorted(expression_refs(spec.get("ast")))
+        return (
+            "expr",
+            self._curve_expression_revision,
+            spec.get("expr", ""),
+            transform,
+            tuple(
+                (ref, self._curve_revision_signature(ref, stack + (var_name,)))
+                for ref in refs
+            ),
+        )
+
+    def _curve_context_ms(self, var_name, stack=()):
+        if var_name in stack:
+            return 0.0
+        spec = self.curve_specs.get(var_name)
+        if not spec or spec.get("kind") != "expr":
+            return 0.0
+        return self._expr_context_ms(spec.get("ast"), stack + (var_name,))
+
+    @classmethod
+    def _static_scalar_expr_value(cls, node):
+        if node is None:
+            return None
+        kind = node[0]
+        if kind == "num":
+            return float(node[1])
+        if kind == "unary":
+            value = cls._static_scalar_expr_value(node[2])
+            if value is None:
+                return None
+            return value if node[1] == "+" else -value
+        if kind == "bin":
+            left = cls._static_scalar_expr_value(node[2])
+            right = cls._static_scalar_expr_value(node[3])
+            if left is None or right is None:
+                return None
+            return cls._apply_binary_scalar(node[1], left, right)
+        return None
+
+    def _expr_context_ms(self, node, stack=()):
+        if node is None:
+            return 0.0
+        kind = node[0]
+        if kind == "ref":
+            return self._curve_context_ms(node[1], stack)
+        if kind == "unary":
+            return self._expr_context_ms(node[2], stack)
+        if kind == "bin":
+            return max(
+                self._expr_context_ms(node[2], stack),
+                self._expr_context_ms(node[3], stack),
+            )
+        if kind != "call":
+            return 0.0
+
+        name = node[1].lower()
+        if name == "soomth":
+            name = "smooth"
+        args = node[2]
+        nested = max((self._expr_context_ms(arg, stack) for arg in args), default=0.0)
+        window_arg = None
+        if name in ("smooth", "sg", "joint_tau") and len(args) > 1:
+            window_arg = args[1]
+        if window_arg is not None:
+            try:
+                window_ms = self._static_scalar_expr_value(window_arg)
+                if window_ms is not None:
+                    return nested + max(0.0, float(window_ms))
+            except (TypeError, ValueError):
+                pass
+        return nested
+
     def _refresh_derived_health(self):
         self.derived_health = resolve_derived_health(
             self.curve_specs,
@@ -1350,16 +1467,35 @@ class PlotWindow(QWidget):
                 ctrl.set_invalid_state("" if health.valid else health.message)
         self._update_selected_controls()
 
-    def _curve_source_data(self, var_name, eval_stack=None):
+    def _curve_source_data(
+        self,
+        var_name,
+        eval_stack=None,
+        range_start=None,
+        range_end=None,
+    ):
         spec = self.curve_specs.get(var_name)
         if spec and spec.get("kind") == "expr":
             health = self.derived_health.get(var_name)
             if health is not None and not health.valid:
                 return [], []
-            value = self._eval_curve_expr(spec.get("ast"), eval_stack or ())
+            value = self._eval_curve_expr(
+                spec.get("ast"),
+                eval_stack or (),
+                range_start,
+                range_end,
+            )
             if value.get("kind") == "series":
                 return value.get("ts", []), value.get("vs", [])
             return [], []
+        if range_start is not None or range_end is not None:
+            return self.data_model.get_series_between(
+                var_name,
+                range_start,
+                range_end,
+                before_samples=2,
+                after_samples=2,
+            )
         return self.data_model.get_series(var_name, None)
 
     @staticmethod
@@ -1693,7 +1829,7 @@ class PlotWindow(QWidget):
 
         return out_ts, out_vs
 
-    def _eval_curve_expr(self, node, eval_stack):
+    def _eval_curve_expr(self, node, eval_stack, range_start=None, range_end=None):
         if node is None:
             return self._series_value([], [])
         kind = node[0]
@@ -1701,19 +1837,39 @@ class PlotWindow(QWidget):
             return self._scalar_value(node[1])
         if kind == "ref":
             name = node[1]
-            ts, vs = self._curve_full_transformed_data(name, eval_stack)
+            ts, vs = self._curve_full_transformed_data(
+                name,
+                eval_stack,
+                range_start,
+                range_end,
+            )
             return self._series_value(ts, vs)
         if kind == "unary":
             op = node[1]
-            value = self._eval_curve_expr(node[2], eval_stack)
+            value = self._eval_curve_expr(
+                node[2],
+                eval_stack,
+                range_start,
+                range_end,
+            )
             if op == "+":
                 return value
             if self._is_scalar_value(value):
                 return self._scalar_value(-value["value"])
             return self._series_value(value.get("ts", []), [-float(v) for v in value.get("vs", [])])
         if kind == "bin":
-            left = self._eval_curve_expr(node[2], eval_stack)
-            right = self._eval_curve_expr(node[3], eval_stack)
+            left = self._eval_curve_expr(
+                node[2],
+                eval_stack,
+                range_start,
+                range_end,
+            )
+            right = self._eval_curve_expr(
+                node[3],
+                eval_stack,
+                range_start,
+                range_end,
+            )
             return self._apply_binary_value(node[1], left, right)
         if kind == "call":
             name = node[1].lower()
@@ -1723,7 +1879,12 @@ class PlotWindow(QWidget):
             if name == "d":
                 if len(args) != 1:
                     return self._series_value([], [])
-                value = self._eval_curve_expr(args[0], eval_stack)
+                value = self._eval_curve_expr(
+                    args[0],
+                    eval_stack,
+                    range_start,
+                    range_end,
+                )
                 if not self._is_series_value(value):
                     return self._series_value([], [])
                 ts, vs = self._differentiate_curve_data(value.get("ts", []), value.get("vs", []))
@@ -1731,8 +1892,8 @@ class PlotWindow(QWidget):
             if name == "smooth":
                 if len(args) != 2:
                     return self._series_value([], [])
-                value = self._eval_curve_expr(args[0], eval_stack)
-                window = self._eval_curve_expr(args[1], eval_stack)
+                value = self._eval_curve_expr(args[0], eval_stack, range_start, range_end)
+                window = self._eval_curve_expr(args[1], eval_stack, range_start, range_end)
                 if not self._is_series_value(value) or not self._is_scalar_value(window):
                     return self._series_value([], [])
                 ts, vs = self._smooth_curve_data(value.get("ts", []), value.get("vs", []), window["value"])
@@ -1740,10 +1901,10 @@ class PlotWindow(QWidget):
             if name == "sg":
                 if len(args) != 4:
                     return self._series_value([], [])
-                value = self._eval_curve_expr(args[0], eval_stack)
-                window = self._eval_curve_expr(args[1], eval_stack)
-                order = self._eval_curve_expr(args[2], eval_stack)
-                derivative = self._eval_curve_expr(args[3], eval_stack)
+                value = self._eval_curve_expr(args[0], eval_stack, range_start, range_end)
+                window = self._eval_curve_expr(args[1], eval_stack, range_start, range_end)
+                order = self._eval_curve_expr(args[2], eval_stack, range_start, range_end)
+                derivative = self._eval_curve_expr(args[3], eval_stack, range_start, range_end)
                 if (
                     not self._is_series_value(value) or
                     not self._is_scalar_value(window) or
@@ -1762,14 +1923,22 @@ class PlotWindow(QWidget):
             if name == "sign":
                 if len(args) != 1:
                     return self._series_value([], [])
-                value = self._eval_curve_expr(args[0], eval_stack)
+                value = self._eval_curve_expr(args[0], eval_stack, range_start, range_end)
                 return self._apply_unary_function_value(name, value)
             if name == "clip":
                 if len(args) not in (2, 3):
                     return self._series_value([], [])
-                value = self._eval_curve_expr(args[0], eval_stack)
-                lower_or_limit = self._eval_curve_expr(args[1], eval_stack)
-                upper = self._eval_curve_expr(args[2], eval_stack) if len(args) == 3 else None
+                value = self._eval_curve_expr(args[0], eval_stack, range_start, range_end)
+                lower_or_limit = self._eval_curve_expr(
+                    args[1],
+                    eval_stack,
+                    range_start,
+                    range_end,
+                )
+                upper = (
+                    self._eval_curve_expr(args[2], eval_stack, range_start, range_end)
+                    if len(args) == 3 else None
+                )
                 if not self._is_scalar_value(lower_or_limit):
                     return self._series_value([], [])
                 if upper is not None and not self._is_scalar_value(upper):
@@ -1791,8 +1960,11 @@ class PlotWindow(QWidget):
             if name == "joint_tau":
                 if len(args) != 7:
                     return self._series_value([], [])
-                q = self._eval_curve_expr(args[0], eval_stack)
-                scalars = [self._eval_curve_expr(arg, eval_stack) for arg in args[1:]]
+                q = self._eval_curve_expr(args[0], eval_stack, range_start, range_end)
+                scalars = [
+                    self._eval_curve_expr(arg, eval_stack, range_start, range_end)
+                    for arg in args[1:]
+                ]
                 if (
                     not self._is_series_value(q) or
                     any(not self._is_scalar_value(value) for value in scalars)
@@ -1820,22 +1992,41 @@ class PlotWindow(QWidget):
         vs_out = [(float(v) * scale) + offset for v in vs]
         return ts_out, vs_out
 
-    def _curve_full_transformed_data(self, var_name, eval_stack=None):
+    def _curve_full_transformed_data(
+        self,
+        var_name,
+        eval_stack=None,
+        range_start=None,
+        range_end=None,
+    ):
         if var_name not in self.curves:
             return [], []
         eval_stack = eval_stack or ()
         if var_name in eval_stack:
             return [], []
-        ts, vs = self._curve_source_data(var_name, eval_stack + (var_name,))
+        phase_ms, _scale, _offset = self._curve_transform_signature(var_name)
+        source_start = None if range_start is None else float(range_start) - phase_ms
+        source_end = None if range_end is None else float(range_end) - phase_ms
+        ts, vs = self._curve_source_data(
+            var_name,
+            eval_stack + (var_name,),
+            source_start,
+            source_end,
+        )
         if not ts:
             return [], []
         return self._transform_curve_data(var_name, ts, vs)
 
     def _clip_window_range(self):
-        clip_end = self.window_now
         if self.auto_scroll_enabled:
+            clip_end = self.window_now
             return clip_end - self.fixed_window_seconds * 1000, clip_end
-        return self.reception_start_time, clip_end
+        x_range = self.view_box.viewRange()[0]
+        if not x_range or len(x_range) < 2:
+            return self.reception_start_time, self.window_now
+        start = max(self.reception_start_time, float(x_range[0]))
+        end = min(self.window_now, float(x_range[1]))
+        return (start, max(start, end))
 
     def _clip_curve_to_time_window(self, ts, vs):
         window_start, window_end = self._clip_window_range()
@@ -1848,24 +2039,37 @@ class PlotWindow(QWidget):
         return clipped_ts, clipped_vs
 
     def _curve_plot_data(self, var_name):
-        if not self._is_derived_curve(var_name):
-            window_start, window_end = self._clip_window_range()
-            transform = self._get_curve_transform(var_name)
-            phase_ms = float(transform.get("phase_ms", 0.0))
-            ts, vs = self.data_model.get_series_between(
+        window_start, window_end = self._clip_window_range()
+        context_ms = self._curve_context_ms(var_name)
+        revision = self._curve_revision_signature(var_name)
+        cache_key = (
+            revision,
+            round(float(window_start), 3),
+            round(float(window_end), 3),
+            round(float(context_ms), 3),
+        )
+        cached = self._curve_cache.get(var_name)
+        if cached is not None and cached["key"] == cache_key:
+            full_ts, full_vs = cached["data"]
+        else:
+            ts, vs = self._curve_full_transformed_data(
                 var_name,
-                window_start - phase_ms,
-                window_end - phase_ms,
+                range_start=window_start - context_ms,
+                range_end=window_end + context_ms,
             )
-            if not ts:
-                return [], []
-            ts, vs = self._transform_curve_data(var_name, ts, vs)
-            return self._clip_curve_to_time_window(ts, vs)
+            full_ts, full_vs = self._clip_curve_to_time_window(ts, vs)
+            self._curve_cache[var_name] = {
+                "key": cache_key,
+                "data": (full_ts, full_vs),
+            }
 
-        ts, vs = self._curve_full_transformed_data(var_name)
-        if not ts:
-            return [], []
-        return self._clip_curve_to_time_window(ts, vs)
+        self._curve_view_data[var_name] = (full_ts, full_vs)
+        viewport_width = max(1, int(self.plot_widget.viewport().width()))
+        return min_max_downsample(
+            full_ts,
+            full_vs,
+            max(256, viewport_width * 2),
+        )
 
     def refresh_curve(self, var_name, update_auto_y=True):
         curve = self.curves.get(var_name)
@@ -1879,6 +2083,7 @@ class PlotWindow(QWidget):
 
         ts_plot, vs_plot = self._curve_plot_data(var_name)
         curve.setData(ts_plot, vs_plot)
+        self._curve_render_signatures[var_name] = self._curve_revision_signature(var_name)
         if var_name == self.selected_var_name:
             self._update_selected_hover_point()
         if update_auto_y:
@@ -1961,6 +2166,7 @@ class PlotWindow(QWidget):
         else:
             self.curve_transforms[var_name] = dict(transform)
 
+        self._invalidate_curve_render_state()
         self.refresh_all_curves(visible_only=True)
         self._apply_auto_y_range()
         if update_controls and var_name == self.selected_var_name:
@@ -2380,6 +2586,8 @@ class PlotWindow(QWidget):
             return
 
         self.curve_specs[name] = {"kind": "expr", "expr": expr, "ast": ast}
+        self._curve_expression_revision += 1
+        self._invalidate_curve_render_state()
         self.dynamic_signal_sections[name] = "Derived"
 
         section_info = self._get_or_create_dataflow_export_section("Derived")
@@ -2406,6 +2614,8 @@ class PlotWindow(QWidget):
             return
 
         self.curve_specs[name] = {"kind": "expr", "expr": expr, "ast": ast}
+        self._curve_expression_revision += 1
+        self._invalidate_curve_render_state()
         self._refresh_derived_health()
         self.refresh_all_curves(visible_only=True)
         self._apply_auto_y_range()
@@ -2428,6 +2638,7 @@ class PlotWindow(QWidget):
         self.curve_specs.pop(var_name, None)
         self.curve_visibility.pop(var_name, None)
         self.dynamic_signal_sections.pop(var_name, None)
+        self._invalidate_curve_render_state(var_name)
 
         if var_name in self.signal_variables:
             self.signal_variables.remove(var_name)
@@ -2641,11 +2852,30 @@ class PlotWindow(QWidget):
     def _nearest_selected_point(self, x_value):
         var_name = self.selected_var_name
         curve = self.curves.get(var_name)
-        if curve is None or curve.xData is None or curve.yData is None:
+        if curve is None:
             return None
 
-        xs = list(curve.xData)
-        ys = list(curve.yData)
+        if not self._is_derived_curve(var_name):
+            phase_ms, scale, offset = self._curve_transform_signature(var_name)
+            sample = self.data_model.get_nearest_sample(
+                var_name,
+                float(x_value) - phase_ms,
+            )
+            if sample is not None:
+                timestamp, value = sample
+                return (
+                    timestamp + phase_ms,
+                    value * scale + offset,
+                )
+
+        xs, ys = self._curve_view_data.get(var_name, (None, None))
+        if xs is None or ys is None:
+            xs = curve.xData
+            ys = curve.yData
+        if xs is None or ys is None:
+            return None
+        xs = list(xs)
+        ys = list(ys)
         count = min(len(xs), len(ys))
         if count == 0:
             return None
@@ -2767,7 +2997,9 @@ class PlotWindow(QWidget):
 
     def eventFilter(self, obj, event):
         if obj in (self.plot_widget, self.plot_widget.viewport()):
-            if event.type() == QEvent.FocusIn:
+            if event.type() == QEvent.Resize and hasattr(self, "viewport_refresh_timer"):
+                self.viewport_refresh_timer.start(40)
+            elif event.type() == QEvent.FocusIn:
                 if self.selected_var_name:
                     self._set_selected_curve_focus_active(True)
             elif event.type() == QEvent.FocusOut:
@@ -2801,16 +3033,19 @@ class PlotWindow(QWidget):
 
         # Pause freezes the time window; DataModel can still receive data.
         if self.plot_state == PlotState.STOPPING:
-            for var in self.signal_variables:
-                ts, vs = self._curve_plot_data(var)
-                self.curves[var].setData(ts, vs)
-            self._apply_auto_y_range()
+            self.refresh_all_curves(visible_only=True)
             return
 
         if self.plot_state == PlotState.RUNNING:
+            if not self.auto_scroll_enabled:
+                return
             for var in self.signal_variables:
                 if not self.curves[var].isVisible():
                     continue  # 璺宠繃闅愯棌鏇茬嚎
+
+                revision = self._curve_revision_signature(var)
+                if self._curve_render_signatures.get(var) == revision:
+                    continue
 
                 ts_plot, vs_plot = self._curve_plot_data(var)
                 if not ts_plot:
@@ -2818,19 +3053,13 @@ class PlotWindow(QWidget):
                         self.curves[var].setData([], [])  # 鏈夋暟鎹?-> 鏃犳暟鎹墠闇€瑕佹竻闄?
                     if var == self.selected_var_name:
                         self._hide_selected_hover_point()
+                    self._curve_render_signatures[var] = revision
                     continue
 
-                # 浠呭湪鏁版嵁鍙樺寲鏃舵洿鏂?
-                if (
-                        self.curves[var].xData is None or
-                        len(self.curves[var].xData) != len(ts_plot) or
-                        (ts_plot and self.curves[var].xData[-1] != ts_plot[-1]) or
-                        self.curves[var].yData is None or
-                        (vs_plot and self.curves[var].yData[-1] != vs_plot[-1])
-                ):
-                    self.curves[var].setData(ts_plot, vs_plot)
-                    if var == self.selected_var_name:
-                        self._update_selected_hover_point()
+                self.curves[var].setData(ts_plot, vs_plot)
+                self._curve_render_signatures[var] = revision
+                if var == self.selected_var_name:
+                    self._update_selected_hover_point()
 
             self._apply_auto_y_range()
 
@@ -2865,6 +3094,7 @@ class PlotWindow(QWidget):
         # CLEANING:
         self.plot_state = PlotState.CLEARING
         self.data_model.clear()
+        self._invalidate_curve_render_state()
         self.update_cursor()
         self.update_plot()
 
@@ -2900,6 +3130,7 @@ class PlotWindow(QWidget):
         color = self.colors.get(var_name, default_color)
         visible = self.curve_visibility.get(var_name, bool(checked))
         curve = self.plot_widget.plot(pen=pg.mkPen(color=color, width=2), name=var_name)
+        curve.setClipToView(True)
         curve.setVisible(visible)
         self._connect_curve_click(curve, var_name)
         self.curves[var_name] = curve

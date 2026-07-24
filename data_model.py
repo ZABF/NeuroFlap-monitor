@@ -22,6 +22,8 @@ class SourceBucket:
     last_src_timestamp: Optional[float] = None
     current_session: int = 1
     reconstruction_dirty: bool = False
+    timestamp_revision: int = 0
+    reconstruction_revision: int = 0
 
 
 @dataclass
@@ -29,6 +31,7 @@ class VarBucket:
     var: str
     src: str
     value: array = field(default_factory=_double_array)
+    value_revision: int = 0
 
 
 class DataModel:
@@ -37,9 +40,19 @@ class DataModel:
         self.sources: Dict[str, SourceBucket] = {}
         self.vars: Dict[str, VarBucket] = {}
         self.offsets: Dict[Tuple[str, int], float] = {}
+        self.revision = 0
+        self.epoch = 0
         for var_name in variable_names:
             self.vars.setdefault(var_name, None)
         self.vars = {k: v for k, v in self.vars.items() if v is not None}
+
+    def _next_revision(self) -> int:
+        self.revision += 1
+        return self.revision
+
+    def _mark_reconstruction_changed(self, source_bucket: SourceBucket) -> None:
+        source_bucket.reconstruction_dirty = True
+        source_bucket.reconstruction_revision = self._next_revision()
 
     def ensure_source(self, src: str) -> SourceBucket:
         bucket = self.sources.get(src)
@@ -62,12 +75,14 @@ class DataModel:
         bucket.src_timestamp.append(float(src_timestamp))
         bucket.recon_timestamp.append(float(recon_timestamp))
         bucket.session.append(int(session))
+        bucket.timestamp_revision = self._next_revision()
         assert len(bucket.src_timestamp) == len(bucket.recon_timestamp) == len(bucket.session)
 
     def add_value(self, var: str, src: str, value: float) -> None:
         var_bucket = self.ensure_var(var, src)
         self.ensure_source(var_bucket.src)
         var_bucket.value.append(float(value))
+        var_bucket.value_revision = self._next_revision()
 
     def update_source_timestamp(
         self,
@@ -84,7 +99,7 @@ class DataModel:
         clock_bucket = self.ensure_source(clock_src)
         if source_bucket.offset_src != clock_src:
             source_bucket.offset_src = clock_src
-            source_bucket.reconstruction_dirty = True
+            self._mark_reconstruction_changed(source_bucket)
 
         if (
             clock_bucket.last_src_timestamp is not None
@@ -102,7 +117,7 @@ class DataModel:
             self.offsets[offset_key] = current_offset
             for bucket in self.sources.values():
                 if (bucket.offset_src or bucket.src) == clock_src:
-                    bucket.reconstruction_dirty = True
+                    self._mark_reconstruction_changed(bucket)
 
         recon_timestamp = src_timestamp + self.offsets[offset_key]
         self.add_timestamp(src, src_timestamp, recon_timestamp, clock_bucket.current_session)
@@ -150,6 +165,10 @@ class DataModel:
             source_bucket.recon_timestamp.append(ts)
             source_bucket.session.append(1)
             var_bucket.value.append(float(values[i]))
+        revision = self._next_revision()
+        source_bucket.timestamp_revision = revision
+        source_bucket.reconstruction_revision = revision
+        var_bucket.value_revision = revision
 
     def _series_storage(self, var: str):
         var_bucket = self.vars.get(var)
@@ -209,7 +228,15 @@ class DataModel:
             start_idx = 0
         return self._series_slice(var_bucket, source_bucket, start_idx, count)
 
-    def get_series_between(self, var: str, start_ms=None, end_ms=None):
+    def get_series_between(
+        self,
+        var: str,
+        start_ms=None,
+        end_ms=None,
+        *,
+        before_samples: int = 0,
+        after_samples: int = 0,
+    ):
         """Return a time slice without materializing the complete history."""
         storage = self._series_storage(var)
         if storage is None:
@@ -232,7 +259,46 @@ class DataModel:
                 start_idx,
                 count,
             )
+        start_idx = max(0, start_idx - max(0, int(before_samples)))
+        end_idx = min(count, end_idx + max(0, int(after_samples)))
         return self._series_slice(var_bucket, source_bucket, start_idx, end_idx)
+
+    def get_series_revision(self, var: str):
+        """Return a stable cache key for one variable's value and time axes."""
+        var_bucket = self.vars.get(var)
+        if var_bucket is None:
+            return self.epoch, 0, 0, 0
+        source_bucket = self.sources.get(var_bucket.src)
+        if source_bucket is None:
+            return self.epoch, var_bucket.value_revision, 0, 0
+        return (
+            self.epoch,
+            var_bucket.value_revision,
+            source_bucket.timestamp_revision,
+            source_bucket.reconstruction_revision,
+        )
+
+    def get_nearest_sample(self, var: str, timestamp_ms: float):
+        storage = self._series_storage(var)
+        if storage is None:
+            return None
+        var_bucket, source_bucket, count = storage
+        idx = bisect_left(source_bucket.recon_timestamp, float(timestamp_ms), 0, count)
+        candidates = []
+        if idx < count:
+            candidates.append(idx)
+        if idx > 0:
+            candidates.append(idx - 1)
+        if not candidates:
+            return None
+        best_idx = min(
+            candidates,
+            key=lambda item: abs(source_bucket.recon_timestamp[item] - float(timestamp_ms)),
+        )
+        return (
+            float(source_bucket.recon_timestamp[best_idx]),
+            float(var_bucket.value[best_idx]),
+        )
 
     def get_series_tail(self, var: str, max_samples: int):
         """Return at most the newest max_samples without copying older history."""
@@ -255,6 +321,8 @@ class DataModel:
         self.sources.clear()
         self.vars.clear()
         self.offsets.clear()
+        self.epoch += 1
+        self._next_revision()
 
     def clear_source(self, src: str, *, clear_offsets: bool = True) -> None:
         source_bucket = self.sources.get(src)
@@ -266,6 +334,9 @@ class DataModel:
             source_bucket.last_src_timestamp = None
             source_bucket.current_session = 1
             source_bucket.reconstruction_dirty = False
+            revision = self._next_revision()
+            source_bucket.timestamp_revision = revision
+            source_bucket.reconstruction_revision = revision
 
         if clear_offsets:
             to_delete = [key for key in self.offsets if key[0] == src]
@@ -275,6 +346,7 @@ class DataModel:
         for var_bucket in self.vars.values():
             if var_bucket.src == src:
                 var_bucket.value.clear()
+                var_bucket.value_revision = self._next_revision()
 
     def clear_sources_with_prefix(self, prefix: str, *, clear_offsets: bool = True) -> None:
         for src in list(self.sources.keys()):
@@ -285,3 +357,4 @@ class DataModel:
         var_bucket = self.vars.get(var)
         if var_bucket is not None:
             var_bucket.value.clear()
+            var_bucket.value_revision = self._next_revision()
