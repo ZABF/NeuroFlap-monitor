@@ -76,7 +76,7 @@ class PlotWindow(QWidget):
 
     def __init__(self, persist_layout=True):
         super().__init__()
-        self.setWindowTitle("Monitor v3.1.0")
+        self.setWindowTitle("Monitor v3.2.0")
         self._layout_settings = QSettings("NeuroFlap", "Monitor") if persist_layout else None
         saved_section_order = (
             self._layout_settings.value(self.SECTION_ORDER_SETTINGS_KEY, [])
