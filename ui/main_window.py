@@ -7,7 +7,6 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import QEvent, QPointF, QSettings, QTimer, Qt
 from bisect import bisect_left
-import csv
 import math
 import numpy as np
 import pyqtgraph as pg
@@ -21,6 +20,7 @@ from ui.RelativeTimeAxis import RelativeTimeAxis
 from data_model import DataModel
 from data_receiver import DataReceiver
 from data_transporter_thread import DataTransporterThread
+from monitor_csv import read_monitor_csv, write_monitor_csv
 from ui.reorderable_section_container import ReorderableSectionContainer
 from ui.task_variable_group import TaskVariableGroup, task_display_order
 from ui.theme import (
@@ -143,6 +143,7 @@ class PlotWindow(QWidget):
         self._curve_render_signatures = {}
         self._curve_expression_revision = 0
         self.active_data_source = ActiveDataSource.none()
+        self.active_capture_metadata = {}
         self.available_raw_variables = set()
         self.derived_health = {}
         self._live_activation_requested = False
@@ -845,21 +846,6 @@ class PlotWindow(QWidget):
             return "MoCap"
         return "Ungrouped"
 
-    def _csv_descriptor_fields(self, var_name):
-        desc = self.dynamic_signal_descriptors.get(var_name, {})
-        return [
-            desc.get("category", ""),
-            desc.get("descriptor_kind", ""),
-            desc.get("task_id", ""),
-            desc.get("direction", ""),
-            desc.get("owner", ""),
-            desc.get("display_name", ""),
-            desc.get("task_order", ""),
-            desc.get("slot", ""),
-            desc.get("group_order", ""),
-            1 if desc.get("hidden_control", False) else 0,
-        ]
-
     def _write_monitor_csv(self, final_path):
         series = []
         for var_name in self.signal_variables:
@@ -869,35 +855,28 @@ class PlotWindow(QWidget):
             count = min(len(ts), len(vs))
             if count <= 0:
                 continue
-            series.append((var_name, list(ts)[:count], list(vs)[:count]))
+            section = self._csv_group_for_var(var_name)
+            desc = dict(self.dynamic_signal_descriptors.get(var_name, {}))
+            desc.update({
+                "name": var_name,
+                "timestamps": list(ts)[:count],
+                "values": list(vs)[:count],
+                "section": section,
+                "unit": desc.get("unit", ""),
+                "category": desc.get("category", "external"),
+                "descriptor_kind": desc.get("descriptor_kind", "external"),
+                "owner": desc.get("owner", section),
+                "display_name": desc.get("display_name", var_name),
+            })
+            series.append(desc)
 
-        headers = []
-        for var_name, _ts, _vs in series:
-            headers.extend([f"{var_name}_x", f"{var_name}_y"])
-
-        max_rows = max((len(ts) for _name, ts, _vs in series), default=0)
-        with open(final_path, "w", newline="", encoding="utf-8") as fp:
-            writer = csv.writer(fp)
-            writer.writerow(["#NFMonitorCSV", "2"])
-            for var_name, _ts, _vs in series:
-                desc = self.dynamic_signal_descriptors.get(var_name, {})
-                writer.writerow([
-                    "#var",
-                    var_name,
-                    self._csv_group_for_var(var_name),
-                    desc.get("unit", ""),
-                    *self._csv_descriptor_fields(var_name),
-                ])
-            writer.writerow(headers)
-            for row_idx in range(max_rows):
-                row = []
-                for _var_name, ts, vs in series:
-                    if row_idx < len(ts) and row_idx < len(vs):
-                        row.extend([f"{float(ts[row_idx]):.6f}", f"{float(vs[row_idx]):.10g}"])
-                    else:
-                        row.extend(["", ""])
-                writer.writerow(row)
-        return len(series)
+        metadata = dict(self.active_capture_metadata)
+        if self.active_data_source.kind == "live":
+            metadata["protocol"] = "NFv3"
+            generation = getattr(self.data_receiver, "nf_schema_generation", None)
+            if generation is not None:
+                metadata["schema_generation"] = generation
+        return write_monitor_csv(final_path, series, metadata)
 
     def import_csv(self):
         path, _selected_filter = QFileDialog.getOpenFileName(
@@ -910,7 +889,8 @@ class PlotWindow(QWidget):
             return
 
         try:
-            series = self._read_monitor_csv(path)
+            document = read_monitor_csv(path)
+            series = document.series
         except Exception as exc:
             QMessageBox.critical(self, "Import failed", str(exc))
             return
@@ -919,124 +899,8 @@ class PlotWindow(QWidget):
             QMessageBox.warning(self, "Import failed", "No plottable variable series found in CSV.")
             return
 
-        self._load_imported_series(path, series)
+        self._load_imported_series(path, series, document.metadata)
         QMessageBox.information(self, "Import successful", f"CSV imported:\n{path}\nvariables: {len(series)}")
-
-    @staticmethod
-    def _parse_csv_float(value):
-        text = str(value).strip()
-        if not text:
-            return None
-        try:
-            value = float(text)
-        except ValueError:
-            return None
-        return value if math.isfinite(value) else None
-
-    @staticmethod
-    def _csv_series_pairs(headers):
-        pairs = []
-        used = set()
-        index = {name: idx for idx, name in enumerate(headers)}
-        for idx, name in enumerate(headers):
-            if idx in used:
-                continue
-            if name.endswith("_time_ms"):
-                var_name = name[:-8]
-                value_name = f"{var_name}_value"
-            elif name.endswith("_x"):
-                var_name = name[:-2]
-                value_name = f"{var_name}_y"
-            else:
-                continue
-            value_idx = index.get(value_name)
-            if value_idx is None or not var_name or var_name.startswith("x000"):
-                continue
-            pairs.append((var_name, idx, value_idx))
-            used.add(idx)
-            used.add(value_idx)
-        return pairs
-
-    def _read_monitor_csv(self, path):
-        metadata = {}
-        with open(path, "r", newline="", encoding="utf-8-sig") as fp:
-            reader = csv.reader(fp)
-            headers = None
-            for row in reader:
-                if not row:
-                    continue
-                tag = row[0].strip()
-                if tag.startswith("#"):
-                    if tag == "#var" and len(row) >= 3:
-                        var_name = row[1].strip()
-                        section = row[2].strip()
-                        unit = row[3].strip() if len(row) >= 4 else ""
-                        if var_name:
-                            def field(index, default=""):
-                                return row[index].strip() if len(row) > index else default
-
-                            def int_field(index):
-                                try:
-                                    return int(field(index))
-                                except (TypeError, ValueError):
-                                    return None
-
-                            metadata[var_name] = {
-                                "section": section or "Ungrouped",
-                                "unit": unit,
-                                "category": field(4),
-                                "descriptor_kind": field(5),
-                                "task_id": int_field(6),
-                                "direction": int_field(7),
-                                "owner": field(8),
-                                "display_name": field(9),
-                                "task_order": int_field(10),
-                                "slot": int_field(11),
-                                "group_order": int_field(12),
-                                "hidden_control": field(13) == "1",
-                            }
-                    elif tag == "#group" and len(row) >= 3:
-                        var_name = row[1].strip()
-                        section = row[2].strip()
-                        if var_name:
-                            metadata[var_name] = {
-                                "section": section or "Ungrouped",
-                                "unit": "",
-                            }
-                    continue
-                headers = row
-                break
-            if headers is None:
-                return {}
-            headers = [h.strip() for h in headers]
-            pairs = self._csv_series_pairs(headers)
-            if not pairs:
-                return {}
-
-            series = {
-                var_name: {
-                    "timestamps": [],
-                    "values": [],
-                    **metadata.get(var_name, {"section": "Ungrouped", "unit": ""}),
-                }
-                for var_name, _ti, _vi in pairs
-            }
-            for row in reader:
-                for var_name, time_idx, value_idx in pairs:
-                    if time_idx >= len(row) or value_idx >= len(row):
-                        continue
-                    timestamp = self._parse_csv_float(row[time_idx])
-                    value = self._parse_csv_float(row[value_idx])
-                    if timestamp is None or value is None:
-                        continue
-                    series[var_name]["timestamps"].append(timestamp)
-                    series[var_name]["values"].append(value)
-
-        return {
-            var_name: data
-            for var_name, data in series.items()
-            if data["timestamps"] and len(data["timestamps"]) == len(data["values"])
-        }
 
     def _set_active_data_source(self, source):
         self.active_data_source = source
@@ -1079,13 +943,17 @@ class PlotWindow(QWidget):
             self._reset_live_time_window()
 
         self._set_active_data_source(source)
+        self.active_capture_metadata = {
+            "protocol": "NFv3",
+            "schema_generation": getattr(self.data_receiver, "nf_schema_generation", ""),
+        }
         self._set_available_raw_variables(self._live_raw_variable_names(descriptors))
         self.register_dataflow_export_descriptors(descriptors)
         self._live_activation_requested = False
         self.refresh_all_curves(visible_only=True)
         return True
 
-    def _load_imported_series(self, path, series):
+    def _load_imported_series(self, path, series, metadata=None):
         if self.plot_state == PlotState.RUNNING:
             self.toggle_reception()
 
@@ -1095,6 +963,7 @@ class PlotWindow(QWidget):
         self._invalidate_curve_render_state()
         self._hide_selected_hover_point()
         self._set_active_data_source(ActiveDataSource.replay(path))
+        self.active_capture_metadata = dict(metadata or {})
         self._set_available_raw_variables(series.keys())
 
         descriptors = []
@@ -3181,6 +3050,7 @@ class PlotWindow(QWidget):
             set_section_kind(info["box"], category)
             return info
 
+        category = category or ("derived" if section == "Derived" else "dataflow")
         box = QGroupBox(section)
         set_section_kind(box, category)
         grid = QGridLayout()

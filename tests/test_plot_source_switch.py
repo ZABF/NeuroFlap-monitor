@@ -1,6 +1,7 @@
 import os
 import math
 import sys
+import tempfile
 import types
 import unittest
 
@@ -64,6 +65,7 @@ sys.modules.setdefault("data_transporter", _data_transporter_mod)
 from PyQt5.QtWidgets import QApplication, QLabel, QAbstractSpinBox
 
 from data_receiver import DataReceiver
+from monitor_csv import read_monitor_csv
 from ui.curve_expression import CurveExpressionParser
 from ui.main_window import PlotWindow
 
@@ -501,6 +503,34 @@ class PlotSourceSwitchTest(unittest.TestCase):
         capture = self.window.waveform_capture_window
         self.assertEqual(capture.signal_names, self.window.signal_variables)
         capture.close()
+
+    def test_v3_export_round_trip_restores_task_port_and_latency_metadata(self):
+        self.window.register_dataflow_export_descriptors(_task_descriptors())
+        for index, desc in enumerate(_task_descriptors()):
+            name = desc["var_name"]
+            self.window.data_model.add_series(
+                name,
+                f"test:{index}",
+                [1000.0 + index, 1010.0 + index],
+                [10.0 + index, 20.0 + index],
+            )
+
+        handle = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+        handle.close()
+        try:
+            self.assertEqual(self.window._write_monitor_csv(handle.name), 4)
+            document = read_monitor_csv(handle.name)
+        finally:
+            os.unlink(handle.name)
+
+        input_desc = document.series["MadgwickTask.input.roll"]
+        self.assertEqual(input_desc["descriptor_kind"], "task_port")
+        self.assertEqual(input_desc["direction"], 0)
+        self.assertEqual(input_desc["slot"], 0)
+        latency_desc = document.series["MadgwickTask.latency_us"]
+        self.assertEqual(latency_desc["descriptor_kind"], "task_latency")
+        self.assertTrue(latency_desc["hidden_control"])
+        self.assertEqual(latency_desc["unit"], "us")
 
     def test_schema_change_removes_stale_task_group_and_latency_curve(self):
         self.window.register_dataflow_export_descriptors(_task_descriptors())

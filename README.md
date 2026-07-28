@@ -55,6 +55,10 @@ Dataflow export protocol reference:
 
 - [`docs/NFv3_Dataflow_Export_Protocol.md`](docs/NFv3_Dataflow_Export_Protocol.md)
 
+Monitor capture format:
+
+- [`docs/NFMonitorCSV_v3.md`](docs/NFMonitorCSV_v3.md)
+
 ## Troubleshooting
 
 - No TaskIO/DataNode variable list or data:
