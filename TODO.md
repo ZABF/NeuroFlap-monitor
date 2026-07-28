@@ -6,9 +6,9 @@
   - It resets the selected plot's phase, scale, and offset.
 
 - Added CSV import support.
-  - New exports use `<var>_x,<var>_y` column pairs.
-  - New exports include `#var,<var>,<section>,<unit>` metadata rows so import can restore signal groups and later units.
-  - Import also accepts older pyqtgraph-style `<var>_x,<var>_y` column pairs.
+  - New exports use NFMonitorCSV v3 metadata followed by independent `<var>_time_us,<var>_value` column pairs.
+  - Variable names directly identify data columns; `#var` records restore TaskIO/Dataflow groups, units, types, and hidden latency curves.
+  - Import also accepts v2 `<var>_x,<var>_y`, `<var>_time_ms,<var>_value`, and metadata-free legacy files.
   - Variables without metadata are placed in the `Ungrouped` section.
   - Imported variables are loaded into `DataModel` and reuse the normal plot controls.
   - Imported variables are unchecked by default.
