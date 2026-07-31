@@ -1,5 +1,6 @@
 import struct
 import unittest
+from types import SimpleNamespace
 
 from nfv3_parser import NFv3Parser
 
@@ -182,7 +183,7 @@ class NFv3ParserTest(unittest.TestCase):
             self.parser.MAGIC,
             self.parser.VERSION,
             self.parser.TYPE_SCHEMA_RESP,
-            3,
+            0xFF,
             0,
             1,
             1,
@@ -191,6 +192,180 @@ class NFv3ParserTest(unittest.TestCase):
         packet = self.parser.parse_packet(header + raw)
         self.assertTrue(self.parser.install_schema(3, packet["entries"]))
         self.assertEqual(self.parser.schema_tasks[9]["inputs"], [])
+
+    def test_parse_network_diagnostic_probe(self):
+        packet_size = 1200
+        header = struct.pack(
+            self.parser.DIAG_PROBE_HEADER_FMT,
+            self.parser.MAGIC,
+            self.parser.VERSION,
+            self.parser.TYPE_DIAG_PROBE,
+            42,
+            2,
+            self.parser.DIAG_PROBE_STAGE_END,
+            packet_size,
+            99,
+            123456,
+            500,
+            0,
+        )
+
+        packet = self.parser.parse_packet(header + bytes(packet_size - len(header)))
+
+        self.assertEqual(packet["type"], "diag_probe")
+        self.assertEqual(packet["test_id"], 42)
+        self.assertEqual(packet["stage"], 2)
+        self.assertEqual(packet["probe_seq"], 99)
+        self.assertEqual(packet["target_pps"], 500)
+
+    def test_build_network_diagnostic_feedback(self):
+        packet = self.parser.build_diag_feedback(
+            test_id=7,
+            stage=1,
+            flags=self.parser.DIAG_FEEDBACK_STAGE_COMPLETE,
+            normal_packets_rx=100,
+            normal_packet_gaps=2,
+            probe_packets_rx=200,
+            probe_packet_gaps=3,
+            last_probe_seq=88,
+            max_probe_gap=4,
+            receiver_errors=5,
+        )
+
+        self.assertEqual(len(packet), self.parser.DIAG_FEEDBACK_SIZE)
+        values = struct.unpack(self.parser.DIAG_FEEDBACK_FMT, packet)
+        self.assertEqual(values[2], self.parser.TYPE_DIAG_FEEDBACK)
+        self.assertEqual(values[3], 7)
+        self.assertEqual(values[7:12], (100, 2, 200, 3, 88))
+        self.assertEqual(values[12:14], (4, 5))
+        parsed = self.parser.parse_packet(packet)
+        self.assertEqual(parsed["max_probe_gap"], 4)
+        self.assertEqual(parsed["receiver_errors"], 5)
+
+    def test_network_diagnostic_capability_echo_and_control_layouts(self):
+        capabilities = self.parser.build_diag_capabilities(
+            self.parser.DIAG_CAPABILITY_ALL,
+            1200,
+            256,
+            0x12345678,
+        )
+        self.assertEqual(len(capabilities), 16)
+        parsed_capabilities = self.parser.parse_packet(capabilities)
+        self.assertEqual(parsed_capabilities["features"], self.parser.DIAG_CAPABILITY_ALL)
+        self.assertEqual(parsed_capabilities["max_udp_payload"], 1200)
+
+        echo_request = struct.pack(
+            self.parser.DIAG_ECHO_FMT,
+            self.parser.MAGIC,
+            self.parser.VERSION,
+            self.parser.TYPE_DIAG_ECHO_REQUEST,
+            9,
+            17,
+            123456789,
+            123456800,
+            123456810,
+            0xFF,
+        )
+        self.assertEqual(len(echo_request), 40)
+        parsed_echo = self.parser.parse_packet(echo_request)
+        self.assertEqual(parsed_echo["type"], "diag_echo_request")
+        self.assertEqual(parsed_echo["flags"], 0xFF)
+        echo_response = self.parser.build_diag_echo_response(
+            parsed_echo["test_id"],
+            parsed_echo["sequence"],
+            parsed_echo["t1_us"],
+            parsed_echo["t2_us"],
+            parsed_echo["t3_us"],
+            parsed_echo["flags"],
+        )
+        parsed_response = self.parser.parse_packet(echo_response)
+        self.assertEqual(parsed_response["type"], "diag_echo_response")
+        self.assertEqual(parsed_response["flags"], 0xFF)
+
+        control = struct.pack(
+            self.parser.DIAG_CONTROL_FMT,
+            self.parser.MAGIC,
+            self.parser.VERSION,
+            self.parser.TYPE_DIAG_CONTROL,
+            9,
+            self.parser.DIAG_CONTROL_UDP_UPLOAD_START,
+            self.parser.DIAG_MODE_UDP_CAPACITY,
+            4,
+            0,
+            500,
+            1200,
+            3000,
+            28081,
+            0,
+        )
+        self.assertEqual(len(control), 24)
+        parsed_control = self.parser.parse_packet(control)
+        self.assertEqual(parsed_control["target_pps"], 500)
+        self.assertEqual(parsed_control["tcp_port"], 28081)
+
+    def test_network_diagnostic_tcp_frame_layout(self):
+        frame = self.parser.build_diag_tcp_frame(
+            11,
+            self.parser.DIAG_TCP_PING,
+            3,
+            99,
+            987654321,
+            987654400,
+            987654500,
+        )
+        self.assertEqual(len(frame), 1200)
+        parsed = self.parser.parse_diag_tcp_frame(frame)
+        self.assertEqual(
+            parsed,
+            {
+                "test_id": 11,
+                "kind": self.parser.DIAG_TCP_PING,
+                "stage": 3,
+                "sequence": 99,
+                "t1_us": 987654321,
+                "t2_us": 987654400,
+                "t3_us": 987654500,
+            },
+        )
+
+    def test_network_diagnostic_clock_sample_and_model_layouts(self):
+        sample = struct.pack(
+            self.parser.DIAG_CLOCK_SAMPLE_FMT,
+            self.parser.MAGIC,
+            self.parser.VERSION,
+            self.parser.TYPE_DIAG_CLOCK_SAMPLE,
+            0,
+            19,
+            1_000_000,
+            2_001_100,
+            2_001_140,
+            1_002_100,
+            0xFF,
+        )
+        parsed = self.parser.parse_packet(sample)
+        self.assertEqual(parsed["type"], "diag_clock_sample")
+        self.assertEqual(parsed["sequence"], 19)
+        self.assertEqual(parsed["t4_us"], 1_002_100)
+
+        transform = SimpleNamespace(
+            revision=7,
+            source_anchor_us=1_000_000,
+            target_anchor_us=2_000_000,
+            drift_ppb=80_000,
+            uncertainty_us=450,
+            locked=True,
+        )
+        stats = {
+            "upload": {"samples": 10, "latest": 800, "min": 700, "p50": 810, "p95": 950},
+            "download": {"samples": 10, "latest": 900, "min": 750, "p50": 920, "p95": 1100},
+            "rtt": {"samples": 10, "latest": 1700, "min": 1500, "p50": 1730, "p95": 2000},
+        }
+        model = self.parser.build_diag_clock_model(transform, stats)
+        self.assertEqual(len(model), self.parser.DIAG_CLOCK_MODEL_SIZE)
+        fields = struct.unpack(self.parser.DIAG_CLOCK_MODEL_FMT, model)
+        self.assertEqual(fields[2], self.parser.TYPE_DIAG_CLOCK_MODEL)
+        self.assertEqual(fields[3:9], (7, 1_000_000, 2_000_000, 80_000, 450, 1))
+        self.assertEqual(fields[9:14], (10, 800, 700, 810, 950))
 
 
 if __name__ == "__main__":

@@ -3,6 +3,8 @@ from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
+from network_clock import ClockTransform
+
 
 def _double_array():
     return array("d")
@@ -40,6 +42,7 @@ class DataModel:
         self.sources: Dict[str, SourceBucket] = {}
         self.vars: Dict[str, VarBucket] = {}
         self.offsets: Dict[Tuple[str, int], float] = {}
+        self.clock_transforms: Dict[str, ClockTransform] = {}
         self.revision = 0
         self.epoch = 0
         for var_name in variable_names:
@@ -111,16 +114,33 @@ class DataModel:
             source_bucket.last_src_timestamp = src_timestamp
 
         offset_key = (clock_src, clock_bucket.current_session)
-        current_offset = unix_timestamp - clock_timestamp
-        last_offset = self.offsets.get(offset_key)
-        if last_offset is None or current_offset < last_offset:
-            self.offsets[offset_key] = current_offset
-            for bucket in self.sources.values():
-                if (bucket.offset_src or bucket.src) == clock_src:
-                    self._mark_reconstruction_changed(bucket)
-
-        recon_timestamp = src_timestamp + self.offsets[offset_key]
+        transform = self.clock_transforms.get(clock_src)
+        if transform is not None and (transform.usable or transform.locked):
+            recon_timestamp = transform.map_ms(src_timestamp)
+        else:
+            current_offset = unix_timestamp - clock_timestamp
+            last_offset = self.offsets.get(offset_key)
+            if last_offset is None or current_offset < last_offset:
+                self.offsets[offset_key] = current_offset
+                for bucket in self.sources.values():
+                    if (bucket.offset_src or bucket.src) == clock_src:
+                        self._mark_reconstruction_changed(bucket)
+            recon_timestamp = src_timestamp + self.offsets[offset_key]
         self.add_timestamp(src, src_timestamp, recon_timestamp, clock_bucket.current_session)
+
+    def set_clock_transform(
+        self, src: str, transform: Optional[ClockTransform]
+    ) -> None:
+        previous = self.clock_transforms.get(src)
+        if transform is None:
+            self.clock_transforms.pop(src, None)
+        else:
+            self.clock_transforms[src] = transform
+        if previous == transform:
+            return
+        for bucket in self.sources.values():
+            if (bucket.offset_src or bucket.src) == src:
+                self._mark_reconstruction_changed(bucket)
 
     def add_data(
         self,
@@ -198,14 +218,24 @@ class DataModel:
             return
 
         offset_src = source_bucket.offset_src or source_bucket.src
-        source_bucket.recon_timestamp = array(
-            "d",
-            (
-                source_bucket.src_timestamp[index]
-                + self.offsets.get((offset_src, source_bucket.session[index]), 0.0)
-                for index in range(count)
-            ),
-        )
+        transform = self.clock_transforms.get(offset_src)
+        if transform is not None and (transform.usable or transform.locked):
+            source_bucket.recon_timestamp = array(
+                "d",
+                (
+                    transform.map_ms(source_bucket.src_timestamp[index])
+                    for index in range(count)
+                ),
+            )
+        else:
+            source_bucket.recon_timestamp = array(
+                "d",
+                (
+                    source_bucket.src_timestamp[index]
+                    + self.offsets.get((offset_src, source_bucket.session[index]), 0.0)
+                    for index in range(count)
+                ),
+            )
         source_bucket.reconstruction_dirty = False
 
     @staticmethod
@@ -321,6 +351,7 @@ class DataModel:
         self.sources.clear()
         self.vars.clear()
         self.offsets.clear()
+        self.clock_transforms.clear()
         self.epoch += 1
         self._next_revision()
 

@@ -82,9 +82,16 @@ class _DummyMainWindow:
 class _DummyDataModel:
     def __init__(self):
         self.records = []
+        self.clock_transforms = {}
 
     def add_data(self, src, unix_timestamp, src_timestamp, data, **kwargs):
         self.records.append((src, unix_timestamp, src_timestamp, dict(data), dict(kwargs)))
+
+    def set_clock_transform(self, src, transform):
+        if transform is None:
+            self.clock_transforms.pop(src, None)
+        else:
+            self.clock_transforms[src] = transform
 
 
 class DataReceiverNFv3DecodeTest(unittest.TestCase):
@@ -317,6 +324,121 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
 
         self.assertEqual(self.model.records, [])
         self.assertTrue(self.receiver.nf_schema_retry_active)
+
+    def test_diagnostic_sequence_counter_counts_missing_packets(self):
+        last, missing = self.receiver._advance_sequence_counter(10, None)
+        self.assertEqual((last, missing), (10, 0))
+        last, missing = self.receiver._advance_sequence_counter(13, last)
+        self.assertEqual((last, missing), (13, 2))
+        last, missing = self.receiver._advance_sequence_counter(13, last)
+        self.assertEqual((last, missing), (13, 0))
+
+    def test_probe_is_counted_and_feedback_does_not_enter_data_model(self):
+        sent = []
+        self.receiver._send_diag_udp_packet_ = (
+            lambda packet, target=None: sent.append((packet, target)) or True
+        )
+        packet_size = 1200
+        header = struct.pack(
+            self.parser.DIAG_PROBE_HEADER_FMT,
+            self.parser.MAGIC,
+            self.parser.VERSION,
+            self.parser.TYPE_DIAG_PROBE,
+            11,
+            0,
+            self.parser.DIAG_PROBE_STAGE_START
+            | self.parser.DIAG_PROBE_STAGE_END,
+            packet_size,
+            5,
+            123456,
+            100,
+            0,
+        )
+
+        handled = self.receiver._handle_nfv3_diag_datagram_(
+            header + bytes(packet_size - len(header)),
+            ("127.0.0.1", 19002),
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(self.receiver.nf_diag_probe_packets_rx, 1)
+        self.assertEqual(self.receiver.nf_diag_probe_last_seq, 5)
+        self.assertEqual(self.model.records, [])
+        self.assertEqual(len(sent), 1)
+        feedback = struct.unpack(self.parser.DIAG_FEEDBACK_FMT, sent[0][0])
+        self.assertEqual(feedback[2], self.parser.TYPE_DIAG_FEEDBACK)
+        self.assertEqual(feedback[3], 11)
+        self.assertEqual(
+            feedback[5] & self.parser.DIAG_FEEDBACK_STAGE_COMPLETE,
+            self.parser.DIAG_FEEDBACK_STAGE_COMPLETE,
+        )
+        self.assertEqual(feedback[9], 1)
+
+    def test_echo_request_is_answered_in_receive_fast_path(self):
+        sent = []
+        self.receiver._send_diag_udp_packet_ = (
+            lambda packet, target=None: sent.append((packet, target)) or True
+        )
+        request = struct.pack(
+            self.parser.DIAG_ECHO_FMT,
+            self.parser.MAGIC,
+            self.parser.VERSION,
+            self.parser.TYPE_DIAG_ECHO_REQUEST,
+            5,
+            23,
+            123456,
+            0,
+            0,
+            0xFF,
+        )
+
+        handled = self.receiver._handle_nfv3_diag_datagram_(
+            request,
+            ("127.0.0.1", 19002),
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][1], ("127.0.0.1", 19002))
+        response = self.parser.parse_packet(sent[0][0])
+        self.assertEqual(response["type"], "diag_echo_response")
+        self.assertEqual(response["sequence"], 23)
+        self.assertEqual(response["t1_us"], 123456)
+        self.assertGreater(response["t2_us"], 0)
+        self.assertGreaterEqual(response["t3_us"], response["t2_us"])
+        self.assertEqual(response["flags"], 0xFF)
+        self.assertEqual(len(self.receiver.pending_queue), 0)
+
+    def test_control_actions_route_to_workers_without_gui_queue(self):
+        actions = []
+        self.receiver._start_nfv3_udp_upload_ = (
+            lambda packet, remote: actions.append(("udp", packet["stage"], remote))
+        )
+        control = struct.pack(
+            self.parser.DIAG_CONTROL_FMT,
+            self.parser.MAGIC,
+            self.parser.VERSION,
+            self.parser.TYPE_DIAG_CONTROL,
+            44,
+            self.parser.DIAG_CONTROL_UDP_UPLOAD_START,
+            self.parser.DIAG_MODE_UDP_CAPACITY,
+            2,
+            0,
+            250,
+            1200,
+            3000,
+            28081,
+            0,
+        )
+
+        handled = self.receiver._handle_nfv3_diag_datagram_(
+            control,
+            ("127.0.0.1", 19002),
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(actions, [("udp", 2, ("127.0.0.1", 19002))])
+        self.assertEqual(len(self.receiver.pending_queue), 0)
 
 
 if __name__ == "__main__":

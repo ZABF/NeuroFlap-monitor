@@ -38,21 +38,23 @@ python run.py
 1. Flash and start the NeuroFlap firmware on ESP32-S3.
 2. Ensure `SysDataflowExportTask` is running on firmware.
 3. Connect PC and ESP32 to the same network (or ESP32 SoftAP).
-4. Start Monitor, open the **NeuroFlap** tab, set ESP32 IP/port (default IP `192.168.4.1`, NFv3 UDP port `28080`).
+4. Start Monitor, open the **NeuroFlap** tab, set ESP32 IP/port (default IP `192.168.4.1`, UDP port `28080`).
 5. Click **Connect** (connection retry: 200ms, timeout: 5s).
-6. After `CONNECT_ACK`, monitor auto-requests schema and starts decoding data.
-7. Keepalive runs automatically (`PING` every 2s, retry every 1s if waiting `PONG`, link timeout 6s).
-8. Click **Disconnect** to release firmware session.
+6. Monitor negotiates NFv4 first and falls back to released NFv3 when needed.
+7. After session acceptance, Monitor requests schema and starts decoding data.
+8. NFv4 clock sync also maintains liveness; NFv3 fallback uses `PING/PONG`.
+9. Click **Disconnect** to release firmware session.
 
 Notes:
 
-- Plot `Start/Pause/Clear` is decoupled from NFv3 connection lifecycle.
+- Plot `Start/Pause/Clear` is decoupled from the firmware connection lifecycle.
 - Firmware is single-session: if occupied, monitor shows busy owner IP/port.
 
 ## Protocol
 
 Dataflow export protocol reference:
 
+- [`docs/NFv4_Dataflow_Export_Protocol.md`](docs/NFv4_Dataflow_Export_Protocol.md)
 - [`docs/NFv3_Dataflow_Export_Protocol.md`](docs/NFv3_Dataflow_Export_Protocol.md)
 
 Monitor capture format:

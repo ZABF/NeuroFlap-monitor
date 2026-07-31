@@ -14,6 +14,54 @@ class NFv3Parser:
     TYPE_LINK_PING = 0x23
     TYPE_LINK_PONG = 0x24
     TYPE_DISCONNECT_REQ = 0x25
+    TYPE_DIAG_FEEDBACK = 0x30
+    TYPE_DIAG_PROBE = 0x31
+    TYPE_DIAG_CAPABILITIES = 0x32
+    TYPE_DIAG_ECHO_REQUEST = 0x33
+    TYPE_DIAG_ECHO_RESPONSE = 0x34
+    TYPE_DIAG_CONTROL = 0x35
+    TYPE_DIAG_CLOCK_SAMPLE = 0x36
+    TYPE_DIAG_CLOCK_MODEL = 0x37
+
+    DIAG_FEEDBACK_FINAL = 1 << 0
+    DIAG_FEEDBACK_STAGE_COMPLETE = 1 << 1
+    DIAG_PROBE_STAGE_START = 1 << 0
+    DIAG_PROBE_STAGE_END = 1 << 1
+    DIAG_PROBE_TEST_END = 1 << 2
+    DIAG_PROBE_MONITOR_TO_FIRMWARE = 1 << 3
+
+    DIAG_CAPABILITY_FEEDBACK = 1 << 0
+    DIAG_CAPABILITY_ECHO = 1 << 1
+    DIAG_CAPABILITY_UDP_REVERSE = 1 << 2
+    DIAG_CAPABILITY_TCP = 1 << 3
+    DIAG_CAPABILITY_FOUR_TIMESTAMPS = 1 << 4
+    DIAG_CAPABILITY_ALL = (
+        DIAG_CAPABILITY_FEEDBACK
+        | DIAG_CAPABILITY_ECHO
+        | DIAG_CAPABILITY_UDP_REVERSE
+        | DIAG_CAPABILITY_TCP
+        | DIAG_CAPABILITY_FOUR_TIMESTAMPS
+    )
+
+    DIAG_CONTROL_TEST_BEGIN = 1
+    DIAG_CONTROL_UDP_UPLOAD_START = 2
+    DIAG_CONTROL_TCP_CONNECT = 3
+    DIAG_CONTROL_TCP_DOWNLOAD_START = 4
+    DIAG_CONTROL_TCP_UPLOAD_START = 5
+    DIAG_CONTROL_TEST_END = 6
+    DIAG_CONTROL_CANCEL = 7
+
+    DIAG_MODE_NONE = 0
+    DIAG_MODE_LATENCY = 1
+    DIAG_MODE_UDP_CAPACITY = 2
+    DIAG_MODE_TCP_CAPACITY = 3
+    DIAG_MODE_FULL = 4
+
+    DIAG_TCP_MAGIC = 0x5444464E
+    DIAG_TCP_PING = 1
+    DIAG_TCP_PONG = 2
+    DIAG_TCP_DOWNLOAD_DATA = 3
+    DIAG_TCP_UPLOAD_DATA = 4
 
     SCHEMA_KIND_TASK = 1
     SCHEMA_KIND_TASK_PORT = 2
@@ -37,6 +85,14 @@ class NFv3Parser:
     SCHEMA_ENTRY_HEADER_FMT = "<BH"
     CTRL_HEADER_FMT = "<HBB"
     BUSY_ACK_FMT = "<4sH"
+    DIAG_FEEDBACK_FMT = "<HBBIBBHIIIIIII"
+    DIAG_PROBE_HEADER_FMT = "<HBBIBBHIQHH"
+    DIAG_CAPABILITIES_FMT = "<HBBIHHI"
+    DIAG_ECHO_FMT = "<HBBIIQQQB3x"
+    DIAG_CONTROL_FMT = "<HBBIBBBBHHIHH"
+    DIAG_CLOCK_SAMPLE_FMT = "<HBBIIQQQQB3x"
+    DIAG_CLOCK_MODEL_FMT = "<HBBIQQiIB3x15I"
+    DIAG_TCP_HEADER_FMT = "<IIBBHIQQQ"
 
     DATA_HEADER_SIZE = struct.calcsize(DATA_HEADER_FMT)
     TASK_FRAME_HEADER_SIZE = struct.calcsize(TASK_FRAME_HEADER_FMT)
@@ -46,6 +102,15 @@ class NFv3Parser:
     SCHEMA_ENTRY_HEADER_SIZE = struct.calcsize(SCHEMA_ENTRY_HEADER_FMT)
     CTRL_HEADER_SIZE = struct.calcsize(CTRL_HEADER_FMT)
     BUSY_ACK_SIZE = struct.calcsize(BUSY_ACK_FMT)
+    DIAG_FEEDBACK_SIZE = struct.calcsize(DIAG_FEEDBACK_FMT)
+    DIAG_PROBE_HEADER_SIZE = struct.calcsize(DIAG_PROBE_HEADER_FMT)
+    DIAG_CAPABILITIES_SIZE = struct.calcsize(DIAG_CAPABILITIES_FMT)
+    DIAG_ECHO_SIZE = struct.calcsize(DIAG_ECHO_FMT)
+    DIAG_CONTROL_SIZE = struct.calcsize(DIAG_CONTROL_FMT)
+    DIAG_CLOCK_SAMPLE_SIZE = struct.calcsize(DIAG_CLOCK_SAMPLE_FMT)
+    DIAG_CLOCK_MODEL_SIZE = struct.calcsize(DIAG_CLOCK_MODEL_FMT)
+    DIAG_TCP_HEADER_SIZE = struct.calcsize(DIAG_TCP_HEADER_FMT)
+    DIAG_TCP_FRAME_SIZE = 1200
 
     TYPE_UNKNOWN = 0
     TYPE_BOOL = 1
@@ -143,11 +208,174 @@ class NFv3Parser:
     def build_disconnect_request(self) -> bytes:
         return struct.pack(self.CTRL_HEADER_FMT, self.MAGIC, self.VERSION, self.TYPE_DISCONNECT_REQ)
 
-    def parse_packet(self, data: bytes):
-        if not data or len(data) < 4:
+    def build_diag_feedback(
+        self,
+        test_id: int,
+        stage: int,
+        flags: int,
+        normal_packets_rx: int,
+        normal_packet_gaps: int,
+        probe_packets_rx: int,
+        probe_packet_gaps: int,
+        last_probe_seq: int,
+        max_probe_gap: int,
+        receiver_errors: int,
+    ) -> bytes:
+        return struct.pack(
+            self.DIAG_FEEDBACK_FMT,
+            self.MAGIC,
+            self.VERSION,
+            self.TYPE_DIAG_FEEDBACK,
+            test_id & 0xFFFFFFFF,
+            stage & 0xFF,
+            flags & 0xFF,
+            0,
+            normal_packets_rx & 0xFFFFFFFF,
+            normal_packet_gaps & 0xFFFFFFFF,
+            probe_packets_rx & 0xFFFFFFFF,
+            probe_packet_gaps & 0xFFFFFFFF,
+            last_probe_seq & 0xFFFFFFFF,
+            max_probe_gap & 0xFFFFFFFF,
+            receiver_errors & 0xFFFFFFFF,
+        )
+
+    def build_diag_capabilities(
+        self,
+        features: int,
+        max_udp_payload: int,
+        preferred_tcp_frame: int,
+        monitor_nonce: int,
+    ) -> bytes:
+        return struct.pack(
+            self.DIAG_CAPABILITIES_FMT,
+            self.MAGIC,
+            self.VERSION,
+            self.TYPE_DIAG_CAPABILITIES,
+            features & 0xFFFFFFFF,
+            max_udp_payload & 0xFFFF,
+            preferred_tcp_frame & 0xFFFF,
+            monitor_nonce & 0xFFFFFFFF,
+        )
+
+    def build_diag_echo_response(
+        self,
+        test_id: int,
+        sequence: int,
+        t1_us: int,
+        t2_us: int,
+        t3_us: int,
+        flags: int = 0,
+    ) -> bytes:
+        return struct.pack(
+            self.DIAG_ECHO_FMT,
+            self.MAGIC,
+            self.VERSION,
+            self.TYPE_DIAG_ECHO_RESPONSE,
+            test_id & 0xFFFFFFFF,
+            sequence & 0xFFFFFFFF,
+            t1_us & 0xFFFFFFFFFFFFFFFF,
+            t2_us & 0xFFFFFFFFFFFFFFFF,
+            t3_us & 0xFFFFFFFFFFFFFFFF,
+            flags & 0xFF,
+        )
+
+    def build_diag_clock_model(self, transform, path_stats) -> bytes:
+        def values(name):
+            stats = path_stats.get(name, {})
+            return (
+                int(stats.get("samples", 0)),
+                int(stats.get("latest", 0)),
+                int(stats.get("min", 0)),
+                int(stats.get("p50", 0)),
+                int(stats.get("p95", 0)),
+            )
+
+        return struct.pack(
+            self.DIAG_CLOCK_MODEL_FMT,
+            self.MAGIC,
+            self.VERSION,
+            self.TYPE_DIAG_CLOCK_MODEL,
+            int(transform.revision) & 0xFFFFFFFF,
+            int(transform.source_anchor_us) & 0xFFFFFFFFFFFFFFFF,
+            int(transform.target_anchor_us) & 0xFFFFFFFFFFFFFFFF,
+            int(transform.drift_ppb),
+            min(0xFFFFFFFF, max(0, int(transform.uncertainty_us))),
+            1 if transform.locked else 0,
+            *values("upload"),
+            *values("download"),
+            *values("rtt"),
+        )
+
+    def build_diag_probe(
+        self,
+        test_id: int,
+        stage: int,
+        flags: int,
+        packet_size: int,
+        probe_seq: int,
+        send_us: int,
+        target_pps: int,
+    ) -> bytes:
+        if packet_size < self.DIAG_PROBE_HEADER_SIZE or packet_size > 0xFFFF:
+            raise ValueError("invalid diagnostic probe size")
+        packet = bytearray(packet_size)
+        struct.pack_into(
+            self.DIAG_PROBE_HEADER_FMT,
+            packet,
+            0,
+            self.MAGIC,
+            self.VERSION,
+            self.TYPE_DIAG_PROBE,
+            test_id & 0xFFFFFFFF,
+            stage & 0xFF,
+            flags & 0xFF,
+            packet_size,
+            probe_seq & 0xFFFFFFFF,
+            send_us & 0xFFFFFFFFFFFFFFFF,
+            target_pps & 0xFFFF,
+            0,
+        )
+        return bytes(packet)
+
+    def build_diag_tcp_frame(
+        self,
+        test_id: int,
+        kind: int,
+        stage: int,
+        sequence: int,
+        t1_us: int,
+        t2_us: int = 0,
+        t3_us: int = 0,
+    ) -> bytes:
+        frame = bytearray(self.DIAG_TCP_FRAME_SIZE)
+        struct.pack_into(
+            self.DIAG_TCP_HEADER_FMT,
+            frame,
+            0,
+            self.DIAG_TCP_MAGIC,
+            test_id & 0xFFFFFFFF,
+            kind & 0xFF,
+            stage & 0xFF,
+            self.DIAG_TCP_FRAME_SIZE - self.DIAG_TCP_HEADER_SIZE,
+            sequence & 0xFFFFFFFF,
+            t1_us & 0xFFFFFFFFFFFFFFFF,
+            t2_us & 0xFFFFFFFFFFFFFFFF,
+            t3_us & 0xFFFFFFFFFFFFFFFF,
+        )
+        return bytes(frame)
+
+    @classmethod
+    def peek_packet_type(cls, data: bytes):
+        if not data or len(data) < cls.CTRL_HEADER_SIZE:
             return None
-        magic, version, packet_type = struct.unpack_from("<HBB", data, 0)
-        if magic != self.MAGIC or version != self.VERSION:
+        magic, version, packet_type = struct.unpack_from(cls.CTRL_HEADER_FMT, data, 0)
+        if magic != cls.MAGIC or version != cls.VERSION:
+            return None
+        return int(packet_type)
+
+    def parse_packet(self, data: bytes):
+        packet_type = self.peek_packet_type(data)
+        if packet_type is None:
             return None
         if packet_type == self.TYPE_DATA:
             return self._parse_data_packet(data)
@@ -159,7 +387,187 @@ class NFv3Parser:
             return self._parse_busy_ack(data)
         if packet_type == self.TYPE_LINK_PONG:
             return self._parse_control(data, "link_pong")
+        if packet_type == self.TYPE_DIAG_PROBE:
+            return self._parse_diag_probe(data)
+        if packet_type == self.TYPE_DIAG_CAPABILITIES:
+            return self._parse_diag_capabilities(data)
+        if packet_type == self.TYPE_DIAG_ECHO_REQUEST:
+            return self._parse_diag_echo(data, "diag_echo_request")
+        if packet_type == self.TYPE_DIAG_ECHO_RESPONSE:
+            return self._parse_diag_echo(data, "diag_echo_response")
+        if packet_type == self.TYPE_DIAG_CONTROL:
+            return self._parse_diag_control(data)
+        if packet_type == self.TYPE_DIAG_FEEDBACK:
+            return self._parse_diag_feedback(data)
+        if packet_type == self.TYPE_DIAG_CLOCK_SAMPLE:
+            return self._parse_diag_clock_sample(data)
         return None
+
+    def _parse_diag_clock_sample(self, data: bytes):
+        if len(data) != self.DIAG_CLOCK_SAMPLE_SIZE:
+            return None
+        values = struct.unpack(self.DIAG_CLOCK_SAMPLE_FMT, data)
+        return {
+            "type": "diag_clock_sample",
+            "test_id": int(values[3]),
+            "sequence": int(values[4]),
+            "t1_us": int(values[5]),
+            "t2_us": int(values[6]),
+            "t3_us": int(values[7]),
+            "t4_us": int(values[8]),
+            "flags": int(values[9]),
+        }
+
+    def _parse_diag_feedback(self, data: bytes):
+        if len(data) != self.DIAG_FEEDBACK_SIZE:
+            return None
+        values = struct.unpack(self.DIAG_FEEDBACK_FMT, data)
+        return {
+            "type": "diag_feedback",
+            "test_id": int(values[3]),
+            "stage": int(values[4]),
+            "flags": int(values[5]),
+            "normal_packets_rx": int(values[7]),
+            "normal_packet_gaps": int(values[8]),
+            "probe_packets_rx": int(values[9]),
+            "probe_packet_gaps": int(values[10]),
+            "last_probe_seq": int(values[11]),
+            "max_probe_gap": int(values[12]),
+            "receiver_errors": int(values[13]),
+        }
+
+    def _parse_diag_probe(self, data: bytes):
+        if len(data) < self.DIAG_PROBE_HEADER_SIZE:
+            return None
+        (
+            _magic,
+            _version,
+            _packet_type,
+            test_id,
+            stage,
+            flags,
+            packet_size,
+            probe_seq,
+            send_us,
+            target_pps,
+            _reserved,
+        ) = struct.unpack_from(self.DIAG_PROBE_HEADER_FMT, data, 0)
+        if packet_size != len(data):
+            return None
+        return {
+            "type": "diag_probe",
+            "test_id": test_id,
+            "stage": stage,
+            "flags": flags,
+            "packet_size": packet_size,
+            "probe_seq": probe_seq,
+            "send_us": send_us,
+            "target_pps": target_pps,
+        }
+
+    def _parse_diag_capabilities(self, data: bytes):
+        if len(data) != self.DIAG_CAPABILITIES_SIZE:
+            return None
+        (
+            _magic,
+            _version,
+            _packet_type,
+            features,
+            max_udp_payload,
+            preferred_tcp_frame,
+            monitor_nonce,
+        ) = struct.unpack(self.DIAG_CAPABILITIES_FMT, data)
+        return {
+            "type": "diag_capabilities",
+            "features": int(features),
+            "max_udp_payload": int(max_udp_payload),
+            "preferred_tcp_frame": int(preferred_tcp_frame),
+            "monitor_nonce": int(monitor_nonce),
+        }
+
+    def _parse_diag_echo(self, data: bytes, name: str):
+        if len(data) != self.DIAG_ECHO_SIZE:
+            return None
+        (
+            _magic,
+            _version,
+            _packet_type,
+            test_id,
+            sequence,
+            t1_us,
+            t2_us,
+            t3_us,
+            flags,
+        ) = struct.unpack(self.DIAG_ECHO_FMT, data)
+        return {
+            "type": name,
+            "test_id": int(test_id),
+            "sequence": int(sequence),
+            "t1_us": int(t1_us),
+            "t2_us": int(t2_us),
+            "t3_us": int(t3_us),
+            "flags": int(flags),
+        }
+
+    def _parse_diag_control(self, data: bytes):
+        if len(data) != self.DIAG_CONTROL_SIZE:
+            return None
+        (
+            _magic,
+            _version,
+            _packet_type,
+            test_id,
+            action,
+            mode,
+            stage,
+            flags,
+            target_pps,
+            payload_bytes,
+            duration_ms,
+            tcp_port,
+            _reserved,
+        ) = struct.unpack(self.DIAG_CONTROL_FMT, data)
+        return {
+            "type": "diag_control",
+            "test_id": int(test_id),
+            "action": int(action),
+            "mode": int(mode),
+            "stage": int(stage),
+            "flags": int(flags),
+            "target_pps": int(target_pps),
+            "payload_bytes": int(payload_bytes),
+            "duration_ms": int(duration_ms),
+            "tcp_port": int(tcp_port),
+        }
+
+    def parse_diag_tcp_frame(self, data: bytes):
+        if len(data) != self.DIAG_TCP_FRAME_SIZE:
+            return None
+        (
+            magic,
+            test_id,
+            kind,
+            stage,
+            payload_size,
+            sequence,
+            t1_us,
+            t2_us,
+            t3_us,
+        ) = struct.unpack_from(self.DIAG_TCP_HEADER_FMT, data, 0)
+        if (
+            magic != self.DIAG_TCP_MAGIC
+            or payload_size != self.DIAG_TCP_FRAME_SIZE - self.DIAG_TCP_HEADER_SIZE
+        ):
+            return None
+        return {
+            "test_id": int(test_id),
+            "kind": int(kind),
+            "stage": int(stage),
+            "sequence": int(sequence),
+            "t1_us": int(t1_us),
+            "t2_us": int(t2_us),
+            "t3_us": int(t3_us),
+        }
 
     def raw_to_value(self, scalar_type: int, raw: int):
         if scalar_type == self.TYPE_BOOL:
