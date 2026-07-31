@@ -76,7 +76,7 @@ class PlotWindow(QWidget):
 
     def __init__(self, persist_layout=True):
         super().__init__()
-        self.setWindowTitle("Monitor v3.2.0")
+        self.setWindowTitle("Monitor v3.3.0")
         self._layout_settings = QSettings("NeuroFlap", "Monitor") if persist_layout else None
         saved_section_order = (
             self._layout_settings.value(self.SECTION_ORDER_SETTINGS_KEY, [])
@@ -239,6 +239,8 @@ class PlotWindow(QWidget):
         self.nf_busy_label.setVisible(False)
         self.active_source_label = QLabel(self.active_data_source.label)
         self.active_source_label.setToolTip(self.active_data_source.detail)
+        self.nf_clock_label = QLabel("Sync: --")
+        set_semantic_state(self.nf_clock_label, "muted")
 
         # ===== 鍙橀噺鍕鹃€夊尯鍩?=====
         self.var_controls = {}
@@ -416,6 +418,7 @@ class PlotWindow(QWidget):
         nfv3_ctrl_layout.addWidget(self.nf_disconnect_btn)
         nfv3_ctrl_layout.addWidget(self.nf_status_label)
         nfv3_ctrl_layout.addWidget(self.active_source_label)
+        nfv3_ctrl_layout.addWidget(self.nf_clock_label)
         nfv3_ctrl_layout.addStretch()
         self.reset_section_layout_btn = QPushButton("Reset layout")
         self.reset_section_layout_btn.clicked.connect(self.reset_section_layout)
@@ -757,6 +760,131 @@ class PlotWindow(QWidget):
         self.nf_connect_btn.setEnabled(state != "connected")
         self.nf_disconnect_btn.setEnabled(state in ("connected", "connecting"))
 
+        clock = status.get("clock", {})
+        clock_state = str(clock.get("state", "Acquiring"))
+        uncertainty_us = float(clock.get("uncertainty_us", math.inf))
+        drift_ppb = float(clock.get("drift_ppb", 0.0))
+        representatives = int(clock.get("representative_count", 0))
+        required_representatives = int(
+            clock.get("lock_required_representatives", 8)
+        )
+        representative_span_s = float(clock.get("representative_span_us", 0.0)) / 1.0e6
+        rejected = int(clock.get("rejected_count", 0))
+        sample_count = int(clock.get("sample_count", 0))
+        blocker = str(clock.get("blocker", "") or "")
+        transport = clock.get("transport", {}) or {}
+        requests_sent = int(transport.get("requests_sent", 0))
+        responses_matched = int(transport.get("responses_matched", 0))
+        if state != "connected":
+            clock_text = "Sync: --"
+            clock_semantic = "muted"
+        elif clock_state == "Locked":
+            clock_text = (
+                f"Sync: Locked +/-{uncertainty_us / 1000.0:.2f} ms"
+                f" | {drift_ppb / 1000.0:+.1f} ppm"
+            )
+            clock_semantic = "success"
+        elif clock_state == "Degraded":
+            clock_text = (
+                f"Sync: Degraded +/-{uncertainty_us / 1000.0:.2f} ms"
+                f" | rejected {rejected}"
+            )
+            clock_semantic = "warning"
+        elif clock_state == "Stale":
+            clock_text = "Sync: Stale"
+            clock_semantic = "error"
+        elif clock_state == "Provisional":
+            clock_text = (
+                f"Sync: Provisional {representatives}/"
+                f"{required_representatives}"
+                f" | {representative_span_s:.0f} s"
+            )
+            clock_semantic = "warning"
+        elif sample_count == 0:
+            clock_text = (
+                f"Sync: Acquiring | TX {requests_sent}"
+                f" RX {responses_matched}"
+            )
+            clock_semantic = "warning" if requests_sent else "muted"
+        else:
+            clock_text = (
+                f"Sync: Acquiring {representatives}/"
+                f"{required_representatives}"
+                f" | {representative_span_s:.0f} s"
+            )
+            clock_semantic = "muted"
+        self.nf_clock_label.setText(clock_text)
+        set_semantic_state(self.nf_clock_label, clock_semantic)
+
+        def age_text(value):
+            return "--" if value is None else f"{float(value):.0f} ms"
+
+        target_ip = str(transport.get("target_ip", "") or "--")
+        target_port = int(transport.get("target_port", 0))
+        local_ip = str(transport.get("local_ip", "") or "--")
+        local_port = int(transport.get("local_port", 0))
+        self.nf_clock_label.setToolTip(
+            "\n".join(
+                (
+                    f"state: {clock_state}",
+                    f"blocked by: {blocker or '--'}",
+                    "",
+                    "transport",
+                    f"service thread: {'running' if transport.get('service_thread_alive') else 'stopped'}",
+                    f"UDP socket: {'ready' if transport.get('socket_ready') else 'unavailable'}",
+                    f"local: {local_ip}:{local_port}",
+                    f"target: {target_ip}:{target_port}",
+                    "requests: "
+                    f"due {int(transport.get('requests_due', 0))}, "
+                    f"sent {requests_sent}, "
+                    f"failed {int(transport.get('request_send_failures', 0))}",
+                    "responses: "
+                    f"seen {int(transport.get('responses_seen', 0))}, "
+                    f"matched {responses_matched}, "
+                    f"pending {int(transport.get('outstanding', 0))}",
+                    "aux datagrams: "
+                    f"received {int(transport.get('aux_datagrams_rx', 0))}, "
+                    f"invalid {int(transport.get('aux_invalid_packets', 0))}, "
+                    f"wrong peer {int(transport.get('aux_wrong_peer', 0))}, "
+                    f"wrong session {int(transport.get('aux_wrong_session', 0))}",
+                    "response errors: "
+                    f"parse {int(transport.get('response_parse_failures', 0))}, "
+                    f"session {int(transport.get('response_session_mismatches', 0))}, "
+                    f"sequence {int(transport.get('response_unknown_sequences', 0))}, "
+                    f"context {int(transport.get('response_context_mismatches', 0))}",
+                    "baseline samples: "
+                    f"accepted {int(transport.get('samples_accepted', 0))}, "
+                    f"rejected {int(transport.get('samples_rejected', 0))}",
+                    f"loaded-test responses: {int(transport.get('loaded_responses', 0))}",
+                    f"last TX age: {age_text(transport.get('last_send_age_ms'))}",
+                    f"last RX age: {age_text(transport.get('last_response_age_ms'))}",
+                    f"last transport failure: {transport.get('last_failure', '') or '--'}",
+                    "",
+                    "estimator",
+                    f"samples: {sample_count}",
+                    f"representatives: {representatives}",
+                    f"window span: {float(clock.get('sample_span_us', 0.0)) / 1.0e6:.1f} s",
+                    "strict intersection: "
+                    f"{'yes' if clock.get('strict_intersection') else 'no'}",
+                    "compatible intervals: "
+                    f"{int(clock.get('compatible_count', 0))}/"
+                    f"{int(clock.get('consensus_required_count', 0))} required",
+                    f"drift fit: {'valid' if clock.get('drift_fit_valid') else 'invalid'}",
+                    "lock confirmation: "
+                    f"{int(clock.get('healthy_fit_streak', 0))}/"
+                    f"{int(clock.get('lock_confirm_updates', 0))}",
+                    f"drift: {drift_ppb / 1000.0:+.3f} ppm",
+                    "drift uncertainty: "
+                    f"{float(clock.get('drift_uncertainty_ppb', math.inf)) / 1000.0:.3f} ppm",
+                    f"offset uncertainty: {uncertainty_us:.1f} us",
+                    f"minimum RTT: {float(clock.get('minimum_rtt_us', math.inf)):.1f} us",
+                    f"rejected samples: {rejected}",
+                    f"resets: {int(clock.get('reset_count', 0))}",
+                    f"last reset: {clock.get('last_reset_reason', '') or '--'}",
+                )
+            )
+        )
+
     def update_misc_tasks(self):
         self.update_bota_status_label()
         self.update_nfv3_status()
@@ -872,10 +1000,14 @@ class PlotWindow(QWidget):
 
         metadata = dict(self.active_capture_metadata)
         if self.active_data_source.kind == "live":
-            metadata["protocol"] = "NFv3"
+            protocol_version = int(getattr(self.data_receiver, "nf_protocol", 0) or 0)
+            metadata["protocol"] = (
+                f"NFv{protocol_version}" if protocol_version else "NeuroFlap"
+            )
             generation = getattr(self.data_receiver, "nf_schema_generation", None)
             if generation is not None:
                 metadata["schema_generation"] = generation
+            metadata.update(self.data_receiver.get_nfv3_clock_metadata())
         return write_monitor_csv(final_path, series, metadata)
 
     def import_csv(self):
@@ -943,8 +1075,11 @@ class PlotWindow(QWidget):
             self._reset_live_time_window()
 
         self._set_active_data_source(source)
+        protocol_version = int(getattr(self.data_receiver, "nf_protocol", 0) or 0)
         self.active_capture_metadata = {
-            "protocol": "NFv3",
+            "protocol": (
+                f"NFv{protocol_version}" if protocol_version else "NeuroFlap"
+            ),
             "schema_generation": getattr(self.data_receiver, "nf_schema_generation", ""),
         }
         self._set_available_raw_variables(self._live_raw_variable_names(descriptors))

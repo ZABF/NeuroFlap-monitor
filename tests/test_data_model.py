@@ -2,6 +2,7 @@ import unittest
 from array import array
 
 from data_model import DataModel
+from network_clock import ClockTransform
 
 
 class DataModelTest(unittest.TestCase):
@@ -53,6 +54,42 @@ class DataModelTest(unittest.TestCase):
             model.get_series("value"),
             ([1090.0, 1190.0], [1.0, 2.0]),
         )
+
+    def test_locked_affine_clock_reconstructs_existing_history_lazily(self):
+        model = DataModel([])
+        model.add_data(
+            "source",
+            2100.0,
+            1000.0,
+            {"value": 1.0},
+            offset_src="clock",
+            offset_timestamp=1000.0,
+        )
+        model.add_data(
+            "source",
+            3100.0,
+            2000.0,
+            {"value": 2.0},
+            offset_src="clock",
+            offset_timestamp=2000.0,
+        )
+
+        model.set_clock_transform(
+            "clock",
+            ClockTransform(
+                source_anchor_us=1_000_000,
+                target_anchor_us=2_000_000,
+                drift_ppb=100_000,
+                uncertainty_us=500,
+                locked=True,
+                revision=1,
+            ),
+        )
+
+        timestamps, values = model.get_series("value")
+        self.assertAlmostEqual(timestamps[0], 2000.0, places=6)
+        self.assertAlmostEqual(timestamps[1], 3000.1, places=6)
+        self.assertEqual(values, [1.0, 2.0])
 
     def test_recent_series_keeps_existing_window_semantics(self):
         model = DataModel([])

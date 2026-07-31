@@ -359,11 +359,83 @@ class PlotSourceSwitchTest(unittest.TestCase):
             for index in range(self.window.nfv3_ctrl_layout.count())
         ]
         self.assertIn(self.window.active_source_label, row_widgets)
+        self.assertIn(self.window.nf_clock_label, row_widgets)
         self.assertIs(row_widgets[-1], self.window.reset_section_layout_btn)
         self.assertNotIn(
             "ESP32 Dataflow Export (Dynamic):",
             [label.text() for label in self.window.findChildren(QLabel)],
         )
+
+    def test_clock_alignment_status_is_compact_and_has_detailed_tooltip(self):
+        self.window.data_receiver.get_nfv3_status = lambda: {
+            "state": "connected",
+            "local_ip": "192.168.4.2",
+            "clock": {
+                "state": "Locked",
+                "uncertainty_us": 180.0,
+                "drift_ppb": 72_400.0,
+                "drift_uncertainty_ppb": 350.0,
+                "sample_count": 400,
+                "representative_count": 10,
+                "sample_span_us": 20_000_000.0,
+                "representative_span_us": 18_000_000.0,
+                "rejected_count": 0,
+                "minimum_rtt_us": 900.0,
+            },
+        }
+
+        self.window.update_nfv3_status()
+
+        self.assertEqual(
+            self.window.nf_clock_label.text(),
+            "Sync: Locked +/-0.18 ms | +72.4 ppm",
+        )
+        self.assertIn("minimum RTT: 900.0 us", self.window.nf_clock_label.toolTip())
+
+    def test_clock_acquiring_status_exposes_transport_progress(self):
+        self.window.data_receiver.get_nfv3_status = lambda: {
+            "state": "connected",
+            "clock": {
+                "state": "Acquiring",
+                "sample_count": 0,
+                "representative_count": 0,
+                "lock_required_representatives": 8,
+                "blocker": "no clock response from 192.168.0.119:28081",
+                "transport": {
+                    "active": True,
+                    "service_thread_alive": True,
+                    "socket_ready": True,
+                    "local_ip": "192.168.0.2",
+                    "local_port": 41234,
+                    "target_ip": "192.168.0.119",
+                    "target_port": 28081,
+                    "requests_due": 42,
+                    "requests_sent": 42,
+                    "request_send_failures": 0,
+                    "responses_seen": 0,
+                    "responses_matched": 0,
+                    "outstanding": 42,
+                    "samples_accepted": 0,
+                    "samples_rejected": 0,
+                    "last_send_age_ms": 25.0,
+                    "last_response_age_ms": None,
+                },
+            },
+        }
+
+        self.window.update_nfv3_status()
+
+        self.assertEqual(
+            self.window.nf_clock_label.text(),
+            "Sync: Acquiring | TX 42 RX 0",
+        )
+        tooltip = self.window.nf_clock_label.toolTip()
+        self.assertIn(
+            "blocked by: no clock response from 192.168.0.119:28081",
+            tooltip,
+        )
+        self.assertIn("requests: due 42, sent 42, failed 0", tooltip)
+        self.assertIn("target: 192.168.0.119:28081", tooltip)
 
     def test_dynamic_layout_orders_categories_and_groups_task_ports(self):
         ast = CurveExpressionParser("1").parse()
@@ -531,6 +603,42 @@ class PlotSourceSwitchTest(unittest.TestCase):
         self.assertEqual(latency_desc["descriptor_kind"], "task_latency")
         self.assertTrue(latency_desc["hidden_control"])
         self.assertEqual(latency_desc["unit"], "us")
+
+    def test_live_v3_export_includes_final_clock_snapshot_metadata(self):
+        self.window._live_activation_requested = True
+        self.assertTrue(
+            self.window.activate_live_dataflow_export_descriptors(
+                [{"var_name": "DataNode1", "section": "Dataflow/Default"}],
+                "192.168.4.1",
+                28080,
+            )
+        )
+        self.window.data_model.add_series(
+            "DataNode1",
+            "test:clock",
+            [1000.0],
+            [1.0],
+        )
+        self.window.data_receiver.get_nfv3_clock_metadata = lambda: {
+            "clock_model": "rolling_affine_interval_v2",
+            "clock_state": "Locked",
+            "clock_uncertainty_us": 180.0,
+        }
+
+        handle = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+        handle.close()
+        try:
+            self.assertEqual(self.window._write_monitor_csv(handle.name), 1)
+            document = read_monitor_csv(handle.name)
+        finally:
+            os.unlink(handle.name)
+
+        self.assertEqual(
+            document.metadata["clock_model"],
+            "rolling_affine_interval_v2",
+        )
+        self.assertEqual(document.metadata["clock_state"], "Locked")
+        self.assertEqual(document.metadata["clock_uncertainty_us"], "180.0")
 
     def test_schema_change_removes_stale_task_group_and_latency_curve(self):
         self.window.register_dataflow_export_descriptors(_task_descriptors())
