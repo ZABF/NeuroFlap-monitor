@@ -3,9 +3,9 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QCheckBox, QLabel, QSpinBox, QGridLayout, QMessageBox, QLineEdit, QComboBox, QFrame, QTabWidget, QGroupBox,
     QScrollArea, QColorDialog, QDoubleSpinBox, QFileDialog, QDialog, QDialogButtonBox, QFormLayout,
-    QAbstractSpinBox
+    QAbstractItemView, QAbstractSpinBox, QHeaderView, QTableWidget, QTableWidgetItem
 )
-from PyQt5.QtCore import QEvent, QPointF, QSettings, QTimer, Qt
+from PyQt5.QtCore import QEvent, QPointF, QSettings, QTimer, Qt, pyqtSignal
 from bisect import bisect_left
 import math
 import numpy as np
@@ -27,6 +27,7 @@ from ui.theme import (
     CURVE_OUTLINE,
     ERROR_HEX,
     PLOT_BG_HEX,
+    curve_label_style,
     curve_needs_outline,
     set_section_kind,
     set_semantic_state,
@@ -69,6 +70,15 @@ class PlotState(Enum):
     STOPPING = 2  # 姝ｅ湪鏆傚仠
     STOPPED = 3  # 鎺ユ敹鏆傚仠
     CLEARING = 4  # 姝ｅ湪娓呴櫎鏁版嵁
+
+
+class _ClickableLabel(QLabel):
+    clicked = pyqtSignal()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
 
 
 class PlotWindow(QWidget):
@@ -241,6 +251,15 @@ class PlotWindow(QWidget):
         self.active_source_label.setToolTip(self.active_data_source.detail)
         self.nf_clock_label = QLabel("Sync: --")
         set_semantic_state(self.nf_clock_label, "muted")
+        self.nf_snapshot_contention_label = _ClickableLabel("Snapshot contention: 0")
+        self.nf_snapshot_contention_label.setCursor(Qt.PointingHandCursor)
+        self.nf_snapshot_contention_label.clicked.connect(
+            self._show_snapshot_contention_details
+        )
+        set_semantic_state(self.nf_snapshot_contention_label, "muted")
+        self._snapshot_contention_status = {"total": 0, "tasks": []}
+        self.snapshot_contention_dialog = None
+        self.snapshot_contention_table = None
 
         # ===== 鍙橀噺鍕鹃€夊尯鍩?=====
         self.var_controls = {}
@@ -419,6 +438,7 @@ class PlotWindow(QWidget):
         nfv3_ctrl_layout.addWidget(self.nf_status_label)
         nfv3_ctrl_layout.addWidget(self.active_source_label)
         nfv3_ctrl_layout.addWidget(self.nf_clock_label)
+        nfv3_ctrl_layout.addWidget(self.nf_snapshot_contention_label)
         nfv3_ctrl_layout.addStretch()
         self.reset_section_layout_btn = QPushButton("Reset layout")
         self.reset_section_layout_btn.clicked.connect(self.reset_section_layout)
@@ -444,8 +464,8 @@ class PlotWindow(QWidget):
         mocap_page_layout.addStretch()
 
         tab_widget = QTabWidget()
-        tab_widget.setDocumentMode(True)
-        tab_widget.tabBar().setDrawBase(False)
+        tab_widget.setDocumentMode(False)
+        tab_widget.tabBar().setDrawBase(True)
         tab_widget.tabBar().setExpanding(False)
         tab_widget.addTab(neuroflap_page, "NeuroFlap")
         tab_widget.addTab(bota_page, "Bota FT")
@@ -473,8 +493,22 @@ class PlotWindow(QWidget):
         selected_plot_layout = QHBoxLayout()
         selected_plot_layout.setContentsMargins(0, 0, 0, 0)
         selected_plot_layout.setSpacing(6)
+        self.selected_plot_label = QLabel("Selected plot:")
+        selected_plot_font = self.selected_plot_label.font()
+        selected_plot_font.setBold(True)
+        self.selected_plot_label.setFont(selected_plot_font)
         self.selected_plot_value = QLabel("-")
         self.selected_plot_value.setMinimumWidth(180)
+        self.selected_plot_error = QLabel("!")
+        selected_error_font = self.selected_plot_error.font()
+        selected_error_font.setBold(True)
+        self.selected_plot_error.setFont(selected_error_font)
+        self.selected_plot_error.setStyleSheet(f"color: {ERROR_HEX};")
+        self.selected_plot_error.setFixedWidth(8)
+        error_size_policy = self.selected_plot_error.sizePolicy()
+        error_size_policy.setRetainSizeWhenHidden(True)
+        self.selected_plot_error.setSizePolicy(error_size_policy)
+        self.selected_plot_error.setVisible(False)
         self.selected_coord_value = QLabel("")
         self.selected_coord_value.setMinimumWidth(150)
 
@@ -528,8 +562,9 @@ class PlotWindow(QWidget):
         self.selected_reset_btn.setFocusPolicy(Qt.NoFocus)
         self.selected_reset_btn.clicked.connect(self.reset_selected_transform)
 
-        selected_plot_layout.addWidget(QLabel("Selected plot:"))
+        selected_plot_layout.addWidget(self.selected_plot_label)
         selected_plot_layout.addWidget(self.selected_plot_value)
+        selected_plot_layout.addWidget(self.selected_plot_error)
         selected_plot_layout.addWidget(self.selected_visible_check)
         selected_plot_layout.addWidget(self.selected_derived_btn)
         selected_plot_layout.addWidget(self.selected_derived_edit_btn)
@@ -727,8 +762,124 @@ class PlotWindow(QWidget):
         self.data_receiver.disconnect_nfv3()
         self.update_nfv3_status()
 
+    @staticmethod
+    def _snapshot_contention_tooltip(diagnostics):
+        tasks = list(diagnostics.get("tasks", ()))
+        if not tasks:
+            return "No snapshot contention observed in this connection."
+        lines = [f"Observed total: {int(diagnostics.get('total', 0))}"]
+        for item in tasks[:5]:
+            lines.append(
+                f"{item.get('task_name', 'Unknown')}: "
+                f"total {int(item.get('total', 0))}, "
+                f"recent {int(item.get('recent_2s', 0))}"
+            )
+        return "\n".join(lines)
+
+    def _update_snapshot_contention_ui(self, diagnostics):
+        diagnostics = diagnostics or {"total": 0, "tasks": []}
+        self._snapshot_contention_status = diagnostics
+        total = int(diagnostics.get("total", 0))
+        self.nf_snapshot_contention_label.setText(
+            f"Snapshot contention: {total}"
+        )
+        self.nf_snapshot_contention_label.setToolTip(
+            self._snapshot_contention_tooltip(diagnostics)
+        )
+        set_semantic_state(
+            self.nf_snapshot_contention_label,
+            "error" if total > 0 else "muted",
+        )
+        if (
+            self.snapshot_contention_dialog is not None
+            and self.snapshot_contention_dialog.isVisible()
+        ):
+            self._refresh_snapshot_contention_table()
+
+    def _ensure_snapshot_contention_dialog(self):
+        if self.snapshot_contention_dialog is not None:
+            return
+        dialog = QDialog(self, Qt.Tool)
+        dialog.setWindowTitle("Snapshot Contention")
+        dialog.setWindowOpacity(0.94)
+        dialog.resize(650, 280)
+
+        table = QTableWidget(0, 5, dialog)
+        table.setHorizontalHeaderLabels(
+            ["Task", "Total", "Recent 2s", "Last", "Status"]
+        )
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for column in range(1, 5):
+            table.horizontalHeader().setSectionResizeMode(
+                column, QHeaderView.ResizeToContents
+            )
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(table)
+        self.snapshot_contention_dialog = dialog
+        self.snapshot_contention_table = table
+
+    def _refresh_snapshot_contention_table(self):
+        if self.snapshot_contention_table is None:
+            return
+        tasks = list(self._snapshot_contention_status.get("tasks", ()))
+        self.snapshot_contention_table.setRowCount(len(tasks))
+        for row, item in enumerate(tasks):
+            recent = int(item.get("recent_2s", 0))
+            last_seconds = item.get("last_seconds_ago")
+            if item.get("likely_phase_lock") and recent > 0:
+                state = "Likely phase lock"
+            elif recent > 0:
+                state = "Contended"
+            else:
+                state = "Historical"
+            values = (
+                str(item.get("task_name", "Unknown")),
+                str(int(item.get("total", 0))),
+                str(recent),
+                "--" if last_seconds is None else f"{float(last_seconds):.1f} s",
+                state,
+            )
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(value)
+                if column in (1, 2, 3):
+                    cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.snapshot_contention_table.setItem(row, column, cell)
+
+    def _show_snapshot_contention_details(self):
+        self._ensure_snapshot_contention_dialog()
+        self._refresh_snapshot_contention_table()
+        anchor = self.nf_snapshot_contention_label.mapToGlobal(
+            self.nf_snapshot_contention_label.rect().bottomLeft()
+        )
+        available = self.screen().availableGeometry()
+        anchor.setX(
+            max(
+                available.left(),
+                min(anchor.x(), available.right() - self.snapshot_contention_dialog.width()),
+            )
+        )
+        anchor.setY(
+            max(
+                available.top(),
+                min(anchor.y(), available.bottom() - self.snapshot_contention_dialog.height()),
+            )
+        )
+        self.snapshot_contention_dialog.move(anchor)
+        self.snapshot_contention_dialog.show()
+        self.snapshot_contention_dialog.raise_()
+        self.snapshot_contention_dialog.activateWindow()
+
     def update_nfv3_status(self):
         status = self.data_receiver.get_nfv3_status()
+        self._update_snapshot_contention_ui(
+            status.get("snapshot_contention", {})
+        )
         state = status.get("state", "disconnected")
         local_ip = status.get("local_ip", "0.0.0.0")
         self.nf_local_ip_label.setText(f"{local_ip}")
@@ -2136,9 +2287,13 @@ class PlotWindow(QWidget):
         self._updating_selected_controls = True
         health = self.derived_health.get(var_name) if is_derived else None
         invalid_message = health.message if health is not None and not health.valid else ""
-        self.selected_plot_value.setText(f"{var_name} !" if invalid_message else (var_name if has_selection else "-"))
+        self.selected_plot_value.setText(var_name if has_selection else "-")
         self.selected_plot_value.setToolTip(invalid_message)
-        self.selected_plot_value.setStyleSheet(f"color: {ERROR_HEX};" if invalid_message else "")
+        self.selected_plot_value.setStyleSheet(
+            curve_label_style(color) if has_selection else ""
+        )
+        self.selected_plot_error.setToolTip(invalid_message)
+        self.selected_plot_error.setVisible(bool(invalid_message))
         self._update_selected_color_button(color)
         self.selected_color_btn.setEnabled(has_selection)
         self.selected_visible_check.setEnabled(has_selection)

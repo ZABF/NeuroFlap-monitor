@@ -72,6 +72,9 @@ class NFv3Parser:
     TASK_FLAG_BUSINESS_ENABLED = 1 << 0
     TASK_FLAG_INPUTS_VALID = 1 << 1
     TASK_FLAG_OUTPUTS_VALID = 1 << 2
+    TASK_FLAG_STATE_MASK = 0x07
+    TASK_CONTENTION_SHIFT = 3
+    TASK_CONTENTION_MASK = 0x1F
     DEFAULT_TIMESTAMP_GROUP = 0xFF
     INVALID_AGE_US = 0xFFFFFFFF
 
@@ -653,6 +656,9 @@ class NFv3Parser:
                 {
                     "task_id": int(task_id),
                     "flags": int(flags),
+                    "snapshot_contention_count": (
+                        int(flags) >> self.TASK_CONTENTION_SHIFT
+                    ) & self.TASK_CONTENTION_MASK,
                     "input_age_us": int(input_age_us),
                     "output_age_us": int(output_age_us),
                     "inputs": inputs,

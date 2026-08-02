@@ -155,6 +155,41 @@ class NFv3ParserTest(unittest.TestCase):
         self.assertEqual(self.parser.raw_to_value(frame["outputs"][0]["scalar_type"], frame["outputs"][0]["raw"]), 2.0)
         self.assertEqual(packet["node_frames"][0]["publish_age_us"], 25)
 
+    def test_task_frame_flags_include_snapshot_contention(self):
+        schema = self._schema_packet()
+        self.assertTrue(self.parser.install_schema(7, schema["entries"]))
+        state_flags = self.parser.TASK_FLAG_BUSINESS_ENABLED
+        flags = state_flags | (7 << self.parser.TASK_CONTENTION_SHIFT)
+        header = struct.pack(
+            self.parser.DATA_HEADER_FMT,
+            self.parser.MAGIC,
+            self.parser.VERSION,
+            self.parser.TYPE_DATA,
+            7,
+            1,
+            1000,
+            1,
+            0,
+        )
+        task_frame = struct.pack(
+            self.parser.TASK_FRAME_HEADER_FMT,
+            5,
+            flags,
+            10,
+            5,
+        )
+        task_frame += struct.pack("<III", 0, 0, 0)
+        task_frame += struct.pack("<II", 0, 0)
+
+        parsed = self.parser.parse_packet(header + task_frame)
+
+        frame = parsed["task_frames"][0]
+        self.assertEqual(frame["snapshot_contention_count"], 7)
+        self.assertEqual(
+            frame["flags"] & self.parser.TASK_FLAG_STATE_MASK,
+            state_flags,
+        )
+
     def test_unknown_generation_returns_header_for_schema_resync(self):
         schema = self._schema_packet()
         self.assertTrue(self.parser.install_schema(7, schema["entries"]))
