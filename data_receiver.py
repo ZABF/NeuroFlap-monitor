@@ -112,6 +112,9 @@ class DataReceiver:
         self.nf_last_schema_sync_ok_ms = 0.0
         self.nf_last_packet_seq = None
         self.nf_packet_gap_count = 0
+        self._nf_snapshot_contention_lock = threading.Lock()
+        self.nf_snapshot_contention_total = 0
+        self.nf_snapshot_contention_by_task = {}
         self.nf_diag_normal_packets_rx = 0
         self.nf_diag_normal_packet_gaps = 0
         self.nf_diag_normal_last_seq = None
@@ -254,6 +257,7 @@ class DataReceiver:
             self.start()
 
         self._clear_nfv3_schema_()
+        self._reset_snapshot_contention_()
         self.nf_schema_retry_active = False
         self.nf_next_schema_retry_ms = 0.0
 
@@ -362,7 +366,78 @@ class DataReceiver:
             "busy_owner_port": int(self.nf_busy_owner_port or 0),
             "last_error": self.nf_last_error,
             "clock": self.get_nfv3_clock_status(),
+            "snapshot_contention": self._snapshot_contention_status_(),
         }
+
+    def _reset_snapshot_contention_(self):
+        with self._nf_snapshot_contention_lock:
+            self.nf_snapshot_contention_total = 0
+            self.nf_snapshot_contention_by_task = {}
+
+    def _record_snapshot_contention_(self, task_frames):
+        now = time.monotonic()
+        with self._nf_snapshot_contention_lock:
+            for frame in task_frames:
+                task_id = int(frame.get("task_id", 0))
+                count = max(0, int(frame.get("snapshot_contention_count", 0)))
+                task_schema = self.nf_parser.schema_tasks.get(task_id, {})
+                task_name = str(task_schema.get("name", f"Task{task_id}"))
+                if count <= 0:
+                    entry = self.nf_snapshot_contention_by_task.get(task_id)
+                    if entry is not None:
+                        entry["consecutive_reports"] = 0
+                        entry["likely_phase_lock"] = False
+                    continue
+                entry = self.nf_snapshot_contention_by_task.setdefault(
+                    task_id,
+                    {
+                        "total": 0,
+                        "task_name": task_name,
+                        "recent": deque(),
+                        "last_monotonic": 0.0,
+                        "consecutive_reports": 0,
+                        "likely_phase_lock": False,
+                    },
+                )
+                recent = entry["recent"]
+                while recent and now - recent[0][0] > 2.0:
+                    recent.popleft()
+                self.nf_snapshot_contention_total += count
+                entry["total"] += count
+                entry["last_monotonic"] = now
+                entry["consecutive_reports"] += 1
+                entry["likely_phase_lock"] = bool(
+                    count >= self.nf_parser.TASK_CONTENTION_MASK
+                    or entry["consecutive_reports"] >= 3
+                )
+                recent.append((now, count))
+
+    def _snapshot_contention_status_(self):
+        now = time.monotonic()
+        tasks = []
+        with self._nf_snapshot_contention_lock:
+            total = int(self.nf_snapshot_contention_total)
+            for task_id, entry in self.nf_snapshot_contention_by_task.items():
+                recent = entry["recent"]
+                while recent and now - recent[0][0] > 2.0:
+                    recent.popleft()
+                last_monotonic = float(entry["last_monotonic"])
+                tasks.append(
+                    {
+                        "task_id": int(task_id),
+                        "task_name": str(entry["task_name"]),
+                        "total": int(entry["total"]),
+                        "recent_2s": int(sum(item[1] for item in recent)),
+                        "last_seconds_ago": (
+                            max(0.0, now - last_monotonic)
+                            if last_monotonic > 0.0
+                            else None
+                        ),
+                        "likely_phase_lock": bool(entry["likely_phase_lock"]),
+                    }
+                )
+        tasks.sort(key=lambda item: (-item["total"], item["task_id"]))
+        return {"total": total, "tasks": tasks}
 
     def get_nfv3_clock_status(self):
         snapshot = self.nf_clock_estimator.snapshot(
@@ -1940,6 +2015,8 @@ class DataReceiver:
                 self.nf_schema_chunk_entry_total = 0
                 self._request_nfv3_schema(force=True)
             return
+
+        self._record_snapshot_contention_(packet.get("task_frames", ()))
 
         if not self.data_ingestion_enabled:
             return

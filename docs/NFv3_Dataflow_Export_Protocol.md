@@ -43,7 +43,22 @@ Header `<HBII>` (11 bytes):
 task_id, flags, input_age_us, output_age_us
 ```
 
-Flags: bit 0 business enabled, bit 1 inputs valid, bit 2 outputs valid.
+Flags:
+
+- bit 0: business enabled
+- bit 1: inputs valid
+- bit 2: outputs valid
+- bits 3..7: snapshot contention count, saturated at 31
+
+The contention count is the number of exporter reads that met an in-progress TaskFrame
+publication since the previous emitted frame. The exporter retries contended tasks once
+after one scheduler tick. A non-zero count is diagnostic only; it does not make the
+TaskFrame invalid and does not change the frame size.
+
+Input values, output values, task start/end times, and the frame generation come from one
+atomic task publication. If the retry still cannot acquire that publication, the exporter
+omits that task from the packet, so the Monitor retains its last received sample. The
+firmware never combines fields from different task executions into one frame.
 
 The remaining layout is determined by the Task and TaskPort schema:
 

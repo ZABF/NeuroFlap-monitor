@@ -182,7 +182,9 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
             }
         )
 
-    def _build_data_packet(self, packet_seq=10, generation=1):
+    def _build_data_packet(
+        self, packet_seq=10, generation=1, snapshot_contention_count=0
+    ):
         packet_time_us = 1_000_000
         header = struct.pack(
             self.parser.DATA_HEADER_FMT,
@@ -200,7 +202,11 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
             5,
             self.parser.TASK_FLAG_BUSINESS_ENABLED
             | self.parser.TASK_FLAG_INPUTS_VALID
-            | self.parser.TASK_FLAG_OUTPUTS_VALID,
+            | self.parser.TASK_FLAG_OUTPUTS_VALID
+            | (
+                (snapshot_contention_count & self.parser.TASK_CONTENTION_MASK)
+                << self.parser.TASK_CONTENTION_SHIFT
+            ),
             100,
             50,
         )
@@ -309,6 +315,35 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
 
         self.assertEqual(self.model.records, [])
         self.assertEqual(self.receiver.nf_schema_generation, 1)
+
+    def test_snapshot_contention_is_counted_while_ingestion_is_paused(self):
+        self._install_schema()
+        self.receiver.set_data_ingestion_enabled(False)
+
+        packet = self._build_data_packet(snapshot_contention_count=3)
+        self.receiver._process_nfv3_data(packet, unix_ts=1000.0)
+
+        diagnostics = self.receiver.get_nfv3_status()["snapshot_contention"]
+        self.assertEqual(diagnostics["total"], 3)
+        self.assertEqual(diagnostics["tasks"][0]["task_name"], "MadgwickTask")
+        self.assertEqual(diagnostics["tasks"][0]["recent_2s"], 3)
+        self.assertEqual(self.model.records, [])
+
+    def test_snapshot_contention_resets_for_a_new_connection(self):
+        self._install_schema()
+        packet = self._build_data_packet(snapshot_contention_count=2)
+        self.receiver._process_nfv3_data(packet, unix_ts=1000.0)
+        self.assertEqual(
+            self.receiver.get_nfv3_status()["snapshot_contention"]["total"],
+            2,
+        )
+
+        self.receiver.running = True
+        self.receiver._start_connect_attempt_ = lambda _now_ms: None
+        self.receiver.connect_nfv3()
+
+        diagnostics = self.receiver.get_nfv3_status()["snapshot_contention"]
+        self.assertEqual(diagnostics, {"total": 0, "tasks": []})
 
     def test_schema_activation_reenables_live_ingestion(self):
         self.receiver.set_data_ingestion_enabled(False)

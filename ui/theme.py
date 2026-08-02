@@ -169,23 +169,25 @@ QLabel[semanticState="warning"] {{ color: {_hex(WARNING)}; }}
 QLabel[semanticState="error"] {{ color: {_hex(ERROR)}; }}
 QLabel[semanticState="muted"] {{ color: {TEXT_MUTED_HEX}; }}
 QTabWidget::pane {{
-    border: 0;
-    border-top: 1px solid {BORDER_HEX};
+    border: 1px solid {BORDER_HEX};
     background-color: {PANEL_BG_HEX};
 }}
 QTabBar::tab {{
-    background-color: transparent;
+    background-color: {INPUT_BG_HEX};
     color: {TEXT_MUTED_HEX};
-    border: 0;
-    border-bottom: 2px solid transparent;
+    border: 1px solid {BORDER_HEX};
+    border-bottom: 1px solid {BORDER_HEX};
+    border-top-left-radius: 3px;
+    border-top-right-radius: 3px;
     padding: 7px 14px;
     margin-right: 2px;
 }}
-QTabBar::tab:hover {{ background-color: {_hex((38, 43, 51))}; color: {TEXT_HEX}; }}
+QTabBar::tab:hover {{ background-color: {_hex((52, 58, 67))}; color: {TEXT_HEX}; }}
 QTabBar::tab:selected {{
-    background-color: transparent;
+    background-color: {PANEL_BG_HEX};
     color: {TEXT_HEX};
-    border-bottom: 2px solid {_hex(ACCENT)};
+    border-top: 2px solid {_hex(ACCENT)};
+    border-bottom: 1px solid {PANEL_BG_HEX};
 }}
 QScrollArea, QScrollArea > QWidget > QWidget {{ background-color: {PANEL_BG_HEX}; }}
 QHeaderView::section {{ background-color: {INPUT_BG_HEX}; color: {TEXT_HEX}; border: 1px solid {BORDER_HEX}; }}

@@ -66,6 +66,11 @@ class ThemeTest(unittest.TestCase):
             self.assertIn(rule, DARK_STYLESHEET)
         self.assertNotIn("border-top: 3px solid", DARK_STYLESHEET)
 
+    def test_tabs_have_visible_boundaries(self):
+        self.assertIn("QTabWidget::pane", DARK_STYLESHEET)
+        self.assertIn("QTabBar::tab:selected", DARK_STYLESHEET)
+        self.assertIn("border-top: 2px solid", DARK_STYLESHEET)
+
 
 if __name__ == "__main__":
     unittest.main()
