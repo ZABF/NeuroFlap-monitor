@@ -91,6 +91,76 @@ class DataModelTest(unittest.TestCase):
         self.assertAlmostEqual(timestamps[1], 3000.1, places=6)
         self.assertEqual(values, [1.0, 2.0])
 
+    def test_forward_data_gap_does_not_create_a_new_clock_epoch(self):
+        model = DataModel([])
+        model.begin_clock_epoch("clock", 3)
+        model.add_data(
+            "source",
+            2100.0,
+            1000.0,
+            {"value": 1.0},
+            offset_src="clock",
+            offset_timestamp=1000.0,
+        )
+        model.add_data(
+            "source",
+            5100.0,
+            4000.0,
+            {"value": 2.0},
+            offset_src="clock",
+            offset_timestamp=4000.0,
+        )
+
+        self.assertEqual(model.sources["clock"].current_session, 3)
+        self.assertEqual(model.sources["source"].session.tolist(), [3, 3])
+
+    def test_new_clock_epoch_does_not_remap_previous_epoch(self):
+        model = DataModel([])
+        model.begin_clock_epoch("clock", 1)
+        model.add_data(
+            "source",
+            2100.0,
+            1000.0,
+            {"value": 1.0},
+            offset_src="clock",
+            offset_timestamp=1000.0,
+        )
+        model.set_clock_transform(
+            "clock",
+            ClockTransform(
+                source_anchor_us=1_000_000,
+                target_anchor_us=2_000_000,
+                uncertainty_us=100,
+                usable=True,
+                epoch=1,
+                revision=1,
+            ),
+        )
+        model.begin_clock_epoch("clock", 2)
+        model.add_data(
+            "source",
+            5300.0,
+            300.0,
+            {"value": 2.0},
+            offset_src="clock",
+            offset_timestamp=300.0,
+        )
+        model.set_clock_transform(
+            "clock",
+            ClockTransform(
+                source_anchor_us=300_000,
+                target_anchor_us=5_000_000,
+                uncertainty_us=100,
+                usable=True,
+                epoch=2,
+                revision=2,
+            ),
+        )
+
+        timestamps, values = model.get_series("value")
+        self.assertEqual(timestamps, [2000.0, 5000.0])
+        self.assertEqual(values, [1.0, 2.0])
+
     def test_recent_series_keeps_existing_window_semantics(self):
         model = DataModel([])
         model.add_series(

@@ -81,12 +81,18 @@ class _ClickableLabel(QLabel):
         super().mousePressEvent(event)
 
 
+class _CompactDoubleSpinBox(QDoubleSpinBox):
+    def textFromValue(self, value):
+        text = f"{value:.{self.decimals()}f}".rstrip("0").rstrip(".")
+        return "0" if text in ("", "-0") else text
+
+
 class PlotWindow(QWidget):
     SECTION_ORDER_SETTINGS_KEY = "dataflow/section_order_v1"
 
     def __init__(self, persist_layout=True):
         super().__init__()
-        self.setWindowTitle("Monitor v3.3.0")
+        self.setWindowTitle("Monitor v3.3.1")
         self._layout_settings = QSettings("NeuroFlap", "Monitor") if persist_layout else None
         saved_section_order = (
             self._layout_settings.value(self.SECTION_ORDER_SETTINGS_KEY, [])
@@ -543,14 +549,14 @@ class PlotWindow(QWidget):
         self.selected_phase_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self.selected_phase_spin.valueChanged.connect(self._selected_transform_changed)
 
-        self.selected_offset_spin = QDoubleSpinBox()
-        self.selected_offset_spin.setRange(-1000000000.0, 1000000000.0)
+        self.selected_offset_spin = _CompactDoubleSpinBox()
+        self.selected_offset_spin.setRange(-1000000000000000.0, 1000000000000000.0)
         self.selected_offset_spin.setDecimals(6)
         self.selected_offset_spin.setSingleStep(1.0)
         self.selected_offset_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self.selected_offset_spin.valueChanged.connect(self._selected_transform_changed)
 
-        self.selected_scale_spin = QDoubleSpinBox()
+        self.selected_scale_spin = _CompactDoubleSpinBox()
         self.selected_scale_spin.setRange(-1000000000.0, 1000000000.0)
         self.selected_scale_spin.setDecimals(6)
         self.selected_scale_spin.setSingleStep(0.1)
@@ -922,6 +928,7 @@ class PlotWindow(QWidget):
         representative_span_s = float(clock.get("representative_span_us", 0.0)) / 1.0e6
         rejected = int(clock.get("rejected_count", 0))
         sample_count = int(clock.get("sample_count", 0))
+        candidate_count = int(clock.get("candidate_count", 0))
         blocker = str(clock.get("blocker", "") or "")
         transport = clock.get("transport", {}) or {}
         requests_sent = int(transport.get("requests_sent", 0))
@@ -993,6 +1000,7 @@ class PlotWindow(QWidget):
                     f"seen {int(transport.get('responses_seen', 0))}, "
                     f"matched {responses_matched}, "
                     f"pending {int(transport.get('outstanding', 0))}",
+                    f"expired requests: {int(transport.get('requests_expired', 0))}",
                     "aux datagrams: "
                     f"received {int(transport.get('aux_datagrams_rx', 0))}, "
                     f"invalid {int(transport.get('aux_invalid_packets', 0))}, "
@@ -1013,6 +1021,7 @@ class PlotWindow(QWidget):
                     "",
                     "estimator",
                     f"samples: {sample_count}",
+                    f"clock candidates: {candidate_count}",
                     f"representatives: {representatives}",
                     f"window span: {float(clock.get('sample_span_us', 0.0)) / 1.0e6:.1f} s",
                     "strict intersection: "
@@ -1028,7 +1037,14 @@ class PlotWindow(QWidget):
                     "drift uncertainty: "
                     f"{float(clock.get('drift_uncertainty_ppb', math.inf)) / 1000.0:.3f} ppm",
                     f"offset uncertainty: {uncertainty_us:.1f} us",
+                    f"RTT latest: {float(clock.get('latest_rtt_us', math.inf)):.1f} us",
+                    f"RTT P50/P95: {float(clock.get('rtt_p50_us', math.inf)):.1f} / "
+                    f"{float(clock.get('rtt_p95_us', math.inf)):.1f} us",
                     f"minimum RTT: {float(clock.get('minimum_rtt_us', math.inf)):.1f} us",
+                    f"delay floor: {float(clock.get('delay_floor_us', math.inf)):.1f} us",
+                    f"model age: {float(clock.get('model_age_s', math.inf)):.1f} s",
+                    f"holdover age: {float(clock.get('holdover_age_s', 0.0)):.1f} s",
+                    f"clock epoch: {int(clock.get('epoch', 1))}",
                     f"rejected samples: {rejected}",
                     f"resets: {int(clock.get('reset_count', 0))}",
                     f"last reset: {clock.get('last_reset_reason', '') or '--'}",
@@ -3196,8 +3212,9 @@ class PlotWindow(QWidget):
             return
 
         if self.plot_state == PlotState.RUNNING:
-            if not self.auto_scroll_enabled:
-                return
+            # AutoX controls the viewport, not whether live curves are redrawn.
+            # Keep processing changed revisions so samples that enter a fixed
+            # viewport appear without requiring a manual pan or resize.
             for var in self.signal_variables:
                 if not self.curves[var].isVisible():
                     continue  # 璺宠繃闅愯棌鏇茬嚎

@@ -81,7 +81,7 @@ Monitor records `T4` on receipt.
 
 ```text
 RTT = (T4 - T1) - (T3 - T2)
-midpoint offset = ((T2 - T1) + (T3 - T4)) / 2
+monitor-minus-ESP midpoint offset = ((T1 - T2) + (T4 - T3)) / 2
 ```
 
 The estimator publishes an affine transform:
@@ -91,14 +91,23 @@ monitor_us = target_anchor_us
            + (esp_us - source_anchor_us) * (1 + drift_ppb / 1e9)
 ```
 
-Monitor sends requests at 20 Hz while Acquiring, Degraded, or Stale and at 1 Hz while
-Locked. Any valid matching response refreshes liveness. Six seconds without one causes
-reconnection.
+Monitor sends baseline `context=0` requests at a fixed 10 Hz in every alignment state.
+Loaded diagnostic requests use a separate 20 Hz scheduler and never replace baseline
+requests. Requests expire after six seconds; late responses cannot update the clock
+model or refresh baseline liveness.
 
 At least four valid samples provide a provisional zero-drift transform. Full lock
 requires at least eight representatives, 15 seconds of span, and three consecutive
-healthy fits. Drift changes rebuild bounds from the rolling raw-sample window.
-Loaded diagnostic samples never move the baseline model.
+healthy fits. The estimator keeps a 120-second RTT window, derives a recent delay
+floor, rejects high-delay samples from clock fitting, and robustly fits an affine
+model from 2-second low-delay representatives. A rejected fit enters holdover without
+publishing zero drift or moving the last good transform. Loaded diagnostic samples
+never move the baseline model.
+
+RTT remains available before clock lock. One-way `device_to_monitor` (upload) and
+`monitor_to_device` (download) estimates are reported only while a usable model has
+bounded uncertainty; the Monitor does not synthesize pre-lock values by splitting RTT
+in half.
 
 ## Diagnostics
 
@@ -110,7 +119,7 @@ Diagnostics are optional and session-scoped:
   (48 bytes), and Path (104 bytes).
 
 Capabilities are sent once after session acceptance. Idle feedback is 1 Hz and active
-feedback is 4 Hz. Path/model publication is revision-limited to at most 5 Hz.
+feedback is 4 Hz. Path/model publication is revision-limited to at most 1 Hz.
 
 ## Compatibility
 
