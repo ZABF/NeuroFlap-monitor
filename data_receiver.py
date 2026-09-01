@@ -481,6 +481,7 @@ class DataReceiver:
             "drift_ppb": snapshot.drift_ppb,
             "drift_uncertainty_ppb": snapshot.drift_uncertainty_ppb,
             "sample_count": snapshot.sample_count,
+            "candidate_count": snapshot.candidate_count,
             "representative_count": snapshot.representative_count,
             "lock_required_representatives": (
                 self.nf_clock_estimator.MIN_LOCK_REPRESENTATIVES
@@ -489,6 +490,10 @@ class DataReceiver:
             "representative_span_us": snapshot.representative_span_us,
             "rejected_count": snapshot.rejected_count,
             "minimum_rtt_us": snapshot.minimum_rtt_us,
+            "latest_rtt_us": snapshot.latest_rtt_us,
+            "rtt_p50_us": snapshot.rtt_p50_us,
+            "rtt_p95_us": snapshot.rtt_p95_us,
+            "delay_floor_us": snapshot.delay_floor_us,
             "strict_intersection": snapshot.strict_intersection,
             "consensus_accepted": snapshot.consensus_accepted,
             "compatible_count": snapshot.compatible_count,
@@ -496,6 +501,9 @@ class DataReceiver:
             "drift_fit_valid": snapshot.drift_fit_valid,
             "healthy_fit_streak": snapshot.healthy_fit_streak,
             "lock_confirm_updates": snapshot.lock_confirm_updates,
+            "model_age_s": snapshot.model_age_s,
+            "holdover_age_s": snapshot.holdover_age_s,
+            "epoch": snapshot.epoch,
             "reset_count": snapshot.reset_count,
             "last_reset_reason": snapshot.last_reset_reason,
             "blocker": blocker,
@@ -533,15 +541,14 @@ class DataReceiver:
             if transport["samples_rejected"] > 0:
                 return "clock responses arrived, but every baseline sample was rejected"
             return "clock responses arrived without a baseline synchronization sample"
+        if snapshot.state.value == "Stale":
+            return "no reliable baseline clock sample for 5 seconds"
+        if snapshot.state.value == "Degraded":
+            return "candidate model rejected; holding the last good transform"
         if not snapshot.consensus_accepted:
             return (
                 "compatible interval consensus is insufficient "
                 f"({snapshot.compatible_count}/{snapshot.consensus_required_count})"
-            )
-        if not snapshot.strict_intersection:
-            return (
-                "sample intervals do not share a strict intersection "
-                f"({snapshot.compatible_count}/{snapshot.sample_count} compatible)"
             )
         if snapshot.representative_count < self.nf_clock_estimator.MIN_LOCK_REPRESENTATIVES:
             return (
@@ -895,9 +902,14 @@ class DataReceiver:
                     stage = self._nf_v4_diag_stage
                 self.nf_v4_clock.tick(
                     self._send_v4_sync_packet_,
-                    context=context,
-                    stage=stage,
+                    context=0,
                 )
+                if context != 0:
+                    self.nf_v4_clock.tick(
+                        self._send_v4_sync_packet_,
+                        context=context,
+                        stage=stage,
+                    )
                 self._publish_nfv4_clock_transform_()
                 self._tick_nfv4_diag_feedback_()
             else:
@@ -946,9 +958,13 @@ class DataReceiver:
             return last_sequence, 0
         return sequence, forward - 1
 
-    def _reset_nfv3_diagnostics_(self):
-        self.nf_clock_estimator.reset()
-        self.data_model.set_clock_transform(self.NF_CLOCK_SOURCE, None)
+    def _reset_nfv3_diagnostics_(self, *, reset_clock=True):
+        if reset_clock:
+            self.nf_clock_estimator.reset()
+            self.data_model.begin_clock_epoch(
+                self.NF_CLOCK_SOURCE,
+                self.nf_clock_estimator.epoch,
+            )
         with self._nf_diag_lock:
             self.nf_diag_normal_packets_rx = 0
             self.nf_diag_normal_packet_gaps = 0
@@ -1051,7 +1067,10 @@ class DataReceiver:
         if age_s < self.NF_CLOCK_MODEL_UNLOCK_S:
             return
         self.nf_clock_estimator.reset()
-        self.data_model.set_clock_transform(self.NF_CLOCK_SOURCE, None)
+        self.data_model.begin_clock_epoch(
+            self.NF_CLOCK_SOURCE,
+            self.nf_clock_estimator.epoch,
+        )
 
     def _observe_nfv3_data_packet_(self, packet):
         if not self.nf_connected:
@@ -1287,6 +1306,7 @@ class DataReceiver:
             uncertainty_us=transform.uncertainty_us,
             usable=transform.usable,
             locked=transform.locked,
+            epoch=transform.epoch,
             revision=transform.revision,
             updated_monotonic=transform.updated_monotonic,
         )
@@ -1301,7 +1321,7 @@ class DataReceiver:
             )
             self._send_diag_udp_packet_(packet)
         self._clock_last_published_revision = transform.revision
-        self._clock_next_publish_us = now_us + 200_000
+        self._clock_next_publish_us = now_us + 1_000_000
 
     @staticmethod
     def _single_path_stats_(value):
@@ -1319,6 +1339,8 @@ class DataReceiver:
             return False
         transform = self.nf_clock_estimator.transform
         if not (transform.usable or transform.locked):
+            return False
+        if not measurement.get("one_way_valid"):
             return False
         stats = {
             "upload": self._single_path_stats_(
@@ -1433,6 +1455,7 @@ class DataReceiver:
             uncertainty_us=transform.uncertainty_us,
             usable=transform.usable,
             locked=transform.locked,
+            epoch=transform.epoch,
             revision=transform.revision,
             updated_monotonic=transform.updated_monotonic,
         )
@@ -2140,8 +2163,12 @@ class DataReceiver:
                 self.NF_RECONNECT_MIN_MS
             )
             self.nf_disconnect_burst_left = 0
-            self._reset_nfv3_diagnostics_()
+            self._reset_nfv3_diagnostics_(reset_clock=False)
             self.nf_v4_clock.start_session(self.nf_session_id)
+            self.data_model.begin_clock_epoch(
+                self.NF_CLOCK_SOURCE,
+                self.nf_clock_estimator.epoch,
+            )
             if (
                 self.nf_accepted_features
                 & self.nf_v4_codec.FEATURE_DIAGNOSTICS

@@ -43,6 +43,9 @@ class DataModel:
         self.vars: Dict[str, VarBucket] = {}
         self.offsets: Dict[Tuple[str, int], float] = {}
         self.clock_transforms: Dict[str, ClockTransform] = {}
+        self.clock_transform_history: Dict[
+            Tuple[str, int], ClockTransform
+        ] = {}
         self.revision = 0
         self.epoch = 0
         for var_name in variable_names:
@@ -106,7 +109,8 @@ class DataModel:
 
         if (
             clock_bucket.last_src_timestamp is not None
-            and abs(clock_timestamp - clock_bucket.last_src_timestamp) > self.JUMP_THRESHOLD_MS
+            and clock_timestamp
+            < clock_bucket.last_src_timestamp - self.JUMP_THRESHOLD_MS
         ):
             clock_bucket.current_session += 1
         clock_bucket.last_src_timestamp = clock_timestamp
@@ -115,7 +119,11 @@ class DataModel:
 
         offset_key = (clock_src, clock_bucket.current_session)
         transform = self.clock_transforms.get(clock_src)
-        if transform is not None and (transform.usable or transform.locked):
+        if (
+            transform is not None
+            and transform.epoch == clock_bucket.current_session
+            and (transform.usable or transform.locked)
+        ):
             recon_timestamp = transform.map_ms(src_timestamp)
         else:
             current_offset = unix_timestamp - clock_timestamp
@@ -136,7 +144,21 @@ class DataModel:
             self.clock_transforms.pop(src, None)
         else:
             self.clock_transforms[src] = transform
+            self.clock_transform_history[(src, transform.epoch)] = transform
         if previous == transform:
+            return
+        for bucket in self.sources.values():
+            if (bucket.offset_src or bucket.src) == src:
+                self._mark_reconstruction_changed(bucket)
+
+    def begin_clock_epoch(self, src: str, epoch: int) -> None:
+        epoch = max(1, int(epoch))
+        clock_bucket = self.ensure_source(src)
+        previous_epoch = clock_bucket.current_session
+        clock_bucket.current_session = epoch
+        clock_bucket.last_src_timestamp = None
+        self.clock_transforms.pop(src, None)
+        if previous_epoch == epoch:
             return
         for bucket in self.sources.values():
             if (bucket.offset_src or bucket.src) == src:
@@ -218,24 +240,20 @@ class DataModel:
             return
 
         offset_src = source_bucket.offset_src or source_bucket.src
-        transform = self.clock_transforms.get(offset_src)
-        if transform is not None and (transform.usable or transform.locked):
-            source_bucket.recon_timestamp = array(
-                "d",
-                (
+        reconstructed = array("d")
+        for index in range(count):
+            session = int(source_bucket.session[index])
+            transform = self.clock_transform_history.get((offset_src, session))
+            if transform is not None and (transform.usable or transform.locked):
+                reconstructed.append(
                     transform.map_ms(source_bucket.src_timestamp[index])
-                    for index in range(count)
-                ),
-            )
-        else:
-            source_bucket.recon_timestamp = array(
-                "d",
-                (
+                )
+            else:
+                reconstructed.append(
                     source_bucket.src_timestamp[index]
-                    + self.offsets.get((offset_src, source_bucket.session[index]), 0.0)
-                    for index in range(count)
-                ),
-            )
+                    + self.offsets.get((offset_src, session), 0.0)
+                )
+        source_bucket.recon_timestamp = reconstructed
         source_bucket.reconstruction_dirty = False
 
     @staticmethod
@@ -352,6 +370,7 @@ class DataModel:
         self.vars.clear()
         self.offsets.clear()
         self.clock_transforms.clear()
+        self.clock_transform_history.clear()
         self.epoch += 1
         self._next_revision()
 
@@ -373,6 +392,12 @@ class DataModel:
             to_delete = [key for key in self.offsets if key[0] == src]
             for key in to_delete:
                 del self.offsets[key]
+            transform_keys = [
+                key for key in self.clock_transform_history if key[0] == src
+            ]
+            for key in transform_keys:
+                del self.clock_transform_history[key]
+            self.clock_transforms.pop(src, None)
 
         for var_bucket in self.vars.values():
             if var_bucket.src == src:

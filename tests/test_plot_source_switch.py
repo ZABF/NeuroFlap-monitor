@@ -149,17 +149,26 @@ class PlotSourceSwitchTest(unittest.TestCase):
         self.app.processEvents()
         DataReceiver.start = self.original_start
 
-    def test_auto_x_off_skips_periodic_curve_processing(self):
+    def test_auto_x_off_refreshes_new_source_revisions(self):
         self.window.plot_state = self.window.plot_state.RUNNING
         self.window.auto_scroll_enabled = False
+        visible_name = next(iter(self.window.curves))
+        for name, curve in self.window.curves.items():
+            curve.setVisible(name == visible_name)
+        self.window._curve_render_signatures[visible_name] = ("old",)
+
+        calls = []
         original = self.window._curve_plot_data
-        self.window._curve_plot_data = lambda _name: self.fail(
-            "AutoX off must not process curves from the periodic timer"
+        self.window._curve_plot_data = lambda name: (
+            calls.append(name) or ([1000.0, 1020.0], [1.0, 2.0])
         )
         try:
             self.window.update_plot()
         finally:
             self.window._curve_plot_data = original
+
+        self.assertEqual(calls, [visible_name])
+        self.assertEqual(self.window.curves[visible_name].xData.tolist(), [1000.0, 1020.0])
 
     def test_auto_x_on_skips_curves_without_new_source_revision(self):
         self.window.plot_state = self.window.plot_state.RUNNING
@@ -569,6 +578,21 @@ class PlotSourceSwitchTest(unittest.TestCase):
             self.window.selected_scale_spin.buttonSymbols(),
             QAbstractSpinBox.NoButtons,
         )
+
+    def test_transform_inputs_trim_zeroes_and_accept_large_offsets(self):
+        self.window.selected_offset_spin.setValue(0.0)
+        self.window.selected_scale_spin.setValue(1.0)
+        self.assertEqual(self.window.selected_offset_spin.text(), "0")
+        self.assertEqual(self.window.selected_scale_spin.text(), "1")
+
+        self.window.selected_offset_spin.setValue(-4294967295.0)
+        self.window.selected_scale_spin.setValue(1.25)
+        self.assertEqual(
+            self.window.selected_offset_spin.value(),
+            -4294967295.0,
+        )
+        self.assertEqual(self.window.selected_offset_spin.text(), "-4294967295")
+        self.assertEqual(self.window.selected_scale_spin.text(), "1.25")
 
     def test_waveform_capture_uses_current_signal_registry(self):
         self.window.open_waveform_capture()

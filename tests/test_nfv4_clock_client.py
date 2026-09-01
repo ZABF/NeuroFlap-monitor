@@ -93,6 +93,74 @@ class NFv4ClockClientTest(unittest.TestCase):
         self.assertEqual(self.client.estimator.snapshot().sample_count, 0)
         self.assertEqual(self.client.last_response_us, 2_001_600)
 
+    def test_loaded_scheduler_does_not_delay_baseline_scheduler(self):
+        loaded = []
+        baseline = []
+        self.assertTrue(
+            self.client.tick(
+                lambda packet: loaded.append(packet) or 2_000_000,
+                now_us=2_000_000,
+                context=12,
+                stage=3,
+            )
+        )
+        self.assertTrue(
+            self.client.tick(
+                lambda packet: baseline.append(packet) or 2_000_001,
+                now_us=2_000_001,
+                context=0,
+            )
+        )
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(len(baseline), 1)
+
+    def test_baseline_interval_is_fixed_at_ten_hz(self):
+        sent = []
+        self.assertTrue(
+            self.client.tick(
+                lambda packet: sent.append(packet) or 2_000_000,
+                now_us=2_000_000,
+            )
+        )
+        self.assertFalse(
+            self.client.tick(
+                lambda packet: sent.append(packet) or 2_050_000,
+                now_us=2_050_000,
+            )
+        )
+        self.assertTrue(
+            self.client.tick(
+                lambda packet: sent.append(packet) or 2_100_000,
+                now_us=2_100_000,
+            )
+        )
+        self.assertEqual(len(sent), 2)
+
+    def test_expired_request_rejects_late_response_without_liveness(self):
+        sent = []
+        self.client.tick(
+            lambda packet: sent.append(packet) or 2_000_000,
+            now_us=2_000_000,
+        )
+        response = self.response(
+            sent[0],
+            t2_us=1_500_700,
+            t3_us=1_500_740,
+        )
+
+        self.assertFalse(
+            self.client.handle_response(
+                response,
+                t4_us=2_000_000 + self.client.RESPONSE_TIMEOUT_US + 1,
+            )
+        )
+        diagnostics = self.client.diagnostics(
+            now_us=2_000_000 + self.client.RESPONSE_TIMEOUT_US + 1
+        )
+        self.assertEqual(diagnostics["requests_expired"], 1)
+        self.assertEqual(diagnostics["responses_matched"], 0)
+        self.assertIsNone(diagnostics["last_response_age_ms"])
+
     def test_rejects_response_for_unknown_sequence(self):
         request = self.codec.build_sync_request(
             0x11223344,
