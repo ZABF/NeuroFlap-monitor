@@ -150,6 +150,9 @@ class PlotSourceSwitchTest(unittest.TestCase):
         self.app.processEvents()
         DataReceiver.start = self.original_start
 
+    def test_window_title_tracks_monitor_release(self):
+        self.assertEqual(self.window.windowTitle(), "Monitor v3.4.0")
+
     def test_auto_x_off_refreshes_new_source_revisions(self):
         self.window.plot_state = self.window.plot_state.RUNNING
         self.window.auto_scroll_enabled = False

@@ -97,7 +97,7 @@ class PlotWindow(QWidget):
 
     def __init__(self, persist_layout=True):
         super().__init__()
-        self.setWindowTitle("Monitor v3.3.1")
+        self.setWindowTitle("Monitor v3.4.0")
         self._layout_settings = QSettings("NeuroFlap", "Monitor") if persist_layout else None
         self.timeline = TimelineController(parent=self)
         self._timeline_data_revision = -1
