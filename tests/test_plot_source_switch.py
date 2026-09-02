@@ -368,6 +368,7 @@ class PlotSourceSwitchTest(unittest.TestCase):
             for index in range(self.window.nfv3_ctrl_layout.count())
         ]
         self.assertIn(self.window.active_source_label, row_widgets)
+        self.assertIn(self.window.nf_clock_strategy_combo, row_widgets)
         self.assertIn(self.window.nf_clock_label, row_widgets)
         self.assertIs(row_widgets[-1], self.window.reset_section_layout_btn)
         self.assertNotIn(
@@ -400,6 +401,47 @@ class PlotSourceSwitchTest(unittest.TestCase):
             "Sync: Locked +/-0.18 ms | +72.4 ppm",
         )
         self.assertIn("minimum RTT: 900.0 us", self.window.nf_clock_label.toolTip())
+
+    def test_clock_candidate_status_shows_diagnostic_not_applied_drift(self):
+        self.window.data_receiver.get_nfv3_status = lambda: {
+            "state": "connected",
+            "clock": {
+                "state": "Provisional",
+                "offset_state": "Usable",
+                "drift_state": "Candidate",
+                "uncertainty_us": 300.0,
+                "drift_ppb": 0.0,
+                "candidate_drift_ppb": 81_500.0,
+                "sample_count": 70,
+                "representative_count": 35,
+                "representative_span_us": 69_000_000.0,
+            },
+        }
+
+        self.window.update_nfv3_status()
+
+        self.assertEqual(
+            self.window.nf_clock_label.text(),
+            "Sync: Offset Usable | Drift Candidate +81.5 ppm 69 s",
+        )
+        tooltip = self.window.nf_clock_label.toolTip()
+        self.assertIn("applied drift: +0.000 ppm", tooltip)
+        self.assertIn("selected candidate: +81.500 ppm", tooltip)
+
+    def test_clock_strategy_combo_switches_estimator_online(self):
+        self.window.data_receiver.nf_connected = True
+        epoch = self.window.data_receiver.nf_clock_estimator.epoch
+
+        self.window.nf_clock_strategy_combo.setCurrentIndex(
+            self.window.nf_clock_strategy_combo.findData("v3")
+        )
+
+        estimator = self.window.data_receiver.nf_clock_estimator
+        self.assertEqual(estimator.strategy.value, "v3")
+        self.assertEqual(estimator.epoch, epoch)
+        self.assertTrue(
+            self.window.data_receiver._clock_strategy_switch_pending
+        )
 
     def test_clock_acquiring_status_exposes_transport_progress(self):
         self.window.data_receiver.get_nfv3_status = lambda: {

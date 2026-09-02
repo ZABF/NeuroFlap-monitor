@@ -53,6 +53,7 @@ _crc_mod.Configuration = _DummyConfiguration
 sys.modules["crc"] = _crc_mod
 
 from data_receiver import DataReceiver
+from network_clock import ClockEstimatorStrategy, ClockTransform
 
 
 class _DummyTransporter:
@@ -148,6 +149,22 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
                 "unit": "",
             },
         ]
+
+    def test_clock_strategy_switch_keeps_epoch_and_existing_holdover(self):
+        epoch = self.receiver.nf_clock_estimator.epoch
+        self.model.clock_transforms[self.receiver.NF_CLOCK_SOURCE] = ClockTransform(
+            usable=True, epoch=epoch
+        )
+
+        changed = self.receiver.set_clock_estimator_strategy(
+            ClockEstimatorStrategy.V3
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(self.receiver.nf_clock_estimator.epoch, epoch)
+        self.assertIn(self.receiver.NF_CLOCK_SOURCE, self.model.clock_transforms)
+        self.assertTrue(self.receiver._clock_strategy_switch_pending)
+        self.assertTrue(self.receiver._clock_strategy_holdover)
 
     def _install_schema(self, generation=1, chunks=1):
         entries = self._entries()

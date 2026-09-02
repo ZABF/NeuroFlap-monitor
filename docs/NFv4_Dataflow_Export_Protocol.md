@@ -81,8 +81,13 @@ Monitor records `T4` on receipt.
 
 ```text
 RTT = (T4 - T1) - (T3 - T2)
-monitor-minus-ESP midpoint offset = ((T1 - T2) + (T4 - T3)) / 2
+lower offset bound = T1 - T2
+upper offset bound = T4 - T3
 ```
+
+The midpoint of these bounds is only the symmetric-path approximation. The Monitor
+does not use it as a clock observation: each exchange contributes an inequality
+interval that allows unknown, asymmetric, non-negative uplink and downlink delay.
 
 The estimator publishes an affine transform:
 
@@ -96,13 +101,42 @@ Loaded diagnostic requests use a separate 20 Hz scheduler and never replace base
 requests. Requests expire after six seconds; late responses cannot update the clock
 model or refresh baseline liveness.
 
-At least four valid samples provide a provisional zero-drift transform. Full lock
-requires at least eight representatives, 15 seconds of span, and three consecutive
-healthy fits. The estimator keeps a 120-second RTT window, derives a recent delay
-floor, rejects high-delay samples from clock fitting, and robustly fits an affine
-model from 2-second low-delay representatives. A rejected fit enters holdover without
-publishing zero drift or moving the last good transform. Loaded diagnostic samples
-never move the baseline model.
+The Monitor can select V3, V4, or V4+V3 without changing this wire protocol. V3 is the
+released 120-second robust shared-slope regression and can lock after 15 seconds of
+evidence. V4 derives the set of affine clock lines compatible with the four-timestamp
+inequalities over a 300-second window. The hybrid keeps V4 as the physical confidence
+and lifecycle authority, then constrains the V3 statistical optimum to the V4 feasible
+ppm interval.
+
+At least four compatible samples make the V4/hybrid offset usable. Two-second buckets
+retain up to three low-delay representatives, drift is reconsidered every ten seconds,
+and full lock requires at least 180 seconds of evidence, bounded drift uncertainty,
+and three consecutive healthy fits. The snapshot reports offset and drift states
+separately because a usable offset does not imply that long-term ppm is locked.
+Unknown and Candidate ppm values are diagnostic only: V4 and hybrid publish zero drift
+until the physical estimate reaches Stable. Stable ppm is applied provisionally;
+Locked ppm is applied as the fully qualified model. Once admitted, the last stable ppm
+is retained during temporary confidence loss and holdover.
+
+Four timestamps alone cannot distinguish changing path asymmetry from clock drift
+without an additional delay model. The estimator therefore reports a compatible ppm
+interval. If Wi-Fi asymmetry leaves that interval wide, drift remains Candidate or
+Stable instead of reporting a falsely precise Locked value.
+
+RTT/path statistics use a separate 120-second window. A recent delay floor excludes
+high-delay exchanges from clock fitting without removing them from RTT diagnostics.
+Loaded diagnostic samples never move the baseline model.
+
+The bounded long-window ppm search runs on a dedicated worker. The UDP receive path
+only records observations, consumes completed epoch-tagged fits, and replaces the
+worker's single queued request with the newest snapshot. A fit from a previous clock
+epoch is discarded.
+
+Changing the Monitor estimator strategy restarts fitting but does not create a device
+clock epoch. The previous transform remains as holdover until the new strategy publishes
+a usable transform; the Monitor then reprojects all retained raw timestamps in the
+current physical epoch. Device timestamp rollback or an accepted clock-jump reset does
+create a new epoch, and earlier epochs retain their historical transforms.
 
 RTT remains available before clock lock. One-way `device_to_monitor` (upload) and
 `monitor_to_device` (download) estimates are reported only while a usable model has

@@ -47,7 +47,11 @@ class NFv4ClockClient:
 
     def start_session(self, session_id):
         with self._lock:
-            self.estimator.reset("NFv4 session started")
+            restart = getattr(self.estimator, "restart_estimation", None)
+            if restart is None:
+                self.estimator.reset("NFv4 session started")
+            else:
+                restart("NFv4 session started")
             self._session_id = int(session_id) & 0xFFFFFFFF
             self._sequence = 0
             self._next_baseline_send_us = 0
@@ -60,7 +64,9 @@ class NFv4ClockClient:
 
     def stop_session(self):
         with self._lock:
-            self.estimator.reset("NFv4 session stopped")
+            restart = getattr(self.estimator, "restart_estimation", None)
+            if restart is None:
+                self.estimator.reset("NFv4 session stopped")
             self._session_id = 0
             self._next_baseline_send_us = 0
             self._next_loaded_send_us = 0
@@ -69,6 +75,14 @@ class NFv4ClockClient:
             self._outstanding.clear()
             self._last_measurement = None
             self._reset_diagnostics_locked()
+
+    def restart_estimation_sampling(self):
+        """Drop in-flight probes without changing the active NFv4 session."""
+        with self._lock:
+            self._next_baseline_send_us = 0
+            self._last_baseline_response_us = 0
+            self._outstanding.clear()
+            self._last_measurement = None
 
     @property
     def active(self):

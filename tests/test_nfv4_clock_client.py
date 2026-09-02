@@ -1,7 +1,11 @@
 import struct
 import unittest
 
-from network_clock import ClockAlignmentState
+from network_clock import (
+    ClockAlignmentState,
+    ClockEstimatorStrategy,
+    SelectableClockEstimator,
+)
 from nfv4_clock_client import NFv4ClockClient
 from nfv4_codec import NFv4Codec
 
@@ -228,6 +232,18 @@ class NFv4ClockClientTest(unittest.TestCase):
         self.assertEqual(diagnostics["responses_matched"], 0)
         self.assertEqual(diagnostics["outstanding"], 1)
         self.assertEqual(diagnostics["last_send_age_ms"], 25.0)
+
+    def test_selectable_estimator_reconnect_keeps_physical_epoch(self):
+        estimator = SelectableClockEstimator(
+            ClockEstimatorStrategy.V4_V3, background_drift=False
+        )
+        client = NFv4ClockClient(estimator=estimator, codec=self.codec)
+        epoch = estimator.epoch
+
+        client.start_session(7)
+        client.stop_session()
+
+        self.assertEqual(estimator.epoch, epoch)
 
 
 if __name__ == "__main__":
