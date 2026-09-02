@@ -153,6 +153,9 @@ class PlotSourceSwitchTest(unittest.TestCase):
     def test_window_title_tracks_monitor_release(self):
         self.assertEqual(self.window.windowTitle(), "Monitor v3.4.0")
 
+    def test_window_minimum_width_fits_common_desktop_viewport(self):
+        self.assertLessEqual(self.window.minimumSizeHint().width(), 1280)
+
     def test_auto_x_off_refreshes_new_source_revisions(self):
         self.window.plot_state = self.window.plot_state.RUNNING
         self.window.auto_scroll_enabled = False
@@ -440,19 +443,42 @@ class PlotSourceSwitchTest(unittest.TestCase):
         )
         self.assertEqual(self.window.active_data_source.kind, "none")
 
-    def test_source_and_reset_layout_share_connection_row(self):
-        row_widgets = [
+    def test_connection_and_status_controls_use_separate_rows(self):
+        connection_widgets = [
             self.window.nfv3_ctrl_layout.itemAt(index).widget()
             for index in range(self.window.nfv3_ctrl_layout.count())
         ]
-        self.assertIn(self.window.active_source_label, row_widgets)
-        self.assertIn(self.window.nf_clock_strategy_combo, row_widgets)
-        self.assertIn(self.window.nf_clock_label, row_widgets)
-        self.assertIs(row_widgets[-1], self.window.reset_section_layout_btn)
+        status_widgets = [
+            self.window.nfv3_status_layout.itemAt(index).widget()
+            for index in range(self.window.nfv3_status_layout.count())
+        ]
+
+        self.assertIn(self.window.nf_status_label, connection_widgets)
+        self.assertIs(connection_widgets[-1], self.window.reset_section_layout_btn)
+        self.assertNotIn(self.window.active_source_label, connection_widgets)
+        self.assertNotIn(self.window.nf_clock_strategy_combo, connection_widgets)
+
+        self.assertIn(self.window.active_source_label, status_widgets)
+        self.assertIn(self.window.nf_clock_label, status_widgets)
+        self.assertIn(self.window.nf_snapshot_contention_label, status_widgets)
+        self.assertIn(self.window.nf_clock_settings_btn, status_widgets)
+        self.assertNotIn(self.window.nf_clock_strategy_combo, status_widgets)
         self.assertNotIn(
             "ESP32 Dataflow Export (Dynamic):",
             [label.text() for label in self.window.findChildren(QLabel)],
         )
+
+    def test_clock_estimator_selection_lives_in_time_alignment_dialog(self):
+        self.window._show_clock_settings()
+
+        self.assertEqual(
+            self.window.clock_settings_dialog.windowTitle(), "Time Alignment"
+        )
+        self.assertIs(
+            self.window.nf_clock_strategy_combo.window(),
+            self.window.clock_settings_dialog,
+        )
+        self.assertTrue(self.window.clock_settings_dialog.isVisible())
 
     def test_clock_alignment_status_is_compact_and_has_detailed_tooltip(self):
         self.window.data_receiver.get_nfv3_status = lambda: {

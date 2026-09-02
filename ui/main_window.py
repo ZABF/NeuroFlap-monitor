@@ -3,7 +3,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QCheckBox, QLabel, QSpinBox, QGridLayout, QMessageBox, QLineEdit, QComboBox, QFrame, QTabWidget, QGroupBox,
     QScrollArea, QColorDialog, QDoubleSpinBox, QFileDialog, QDialog, QDialogButtonBox, QFormLayout,
-    QAbstractItemView, QAbstractSpinBox, QHeaderView, QTableWidget, QTableWidgetItem
+    QAbstractItemView, QAbstractSpinBox, QHeaderView, QSizePolicy, QTableWidget, QTableWidgetItem
 )
 from PyQt5.QtCore import QEvent, QPointF, QSettings, QTimer, Qt, pyqtSignal
 from bisect import bisect_left
@@ -284,10 +284,16 @@ class PlotWindow(QWidget):
         self.nf_busy_label.setVisible(False)
         self.active_source_label = QLabel(self.active_data_source.label)
         self.active_source_label.setToolTip(self.active_data_source.detail)
+        self.active_source_label.setMinimumWidth(0)
+        self.active_source_label.setSizePolicy(
+            QSizePolicy.Ignored, QSizePolicy.Preferred
+        )
         self.nf_clock_label = QLabel("Sync: --")
         set_semantic_state(self.nf_clock_label, "muted")
+        self.nf_clock_settings_btn = QPushButton("Clock...")
+        self.nf_clock_settings_btn.clicked.connect(self._show_clock_settings)
         self.nf_clock_strategy_combo = QComboBox()
-        self.nf_clock_strategy_combo.setFixedWidth(86)
+        self.nf_clock_strategy_combo.setMinimumWidth(120)
         for strategy in ClockEstimatorStrategy:
             self.nf_clock_strategy_combo.addItem(
                 strategy.display_name, strategy.value
@@ -304,6 +310,7 @@ class PlotWindow(QWidget):
         self.nf_clock_strategy_combo.currentIndexChanged.connect(
             self.set_clock_estimator_strategy
         )
+        self.clock_settings_dialog = None
         self.nf_snapshot_contention_label = _ClickableLabel("Snapshot contention: 0")
         self.nf_snapshot_contention_label.setCursor(Qt.PointingHandCursor)
         self.nf_snapshot_contention_label.clicked.connect(
@@ -489,17 +496,23 @@ class PlotWindow(QWidget):
         nfv3_ctrl_layout.addWidget(self.nf_connect_btn)
         nfv3_ctrl_layout.addWidget(self.nf_disconnect_btn)
         nfv3_ctrl_layout.addWidget(self.nf_status_label)
-        nfv3_ctrl_layout.addWidget(self.active_source_label)
-        nfv3_ctrl_layout.addWidget(QLabel("Clock:"))
-        nfv3_ctrl_layout.addWidget(self.nf_clock_strategy_combo)
-        nfv3_ctrl_layout.addWidget(self.nf_clock_label)
-        nfv3_ctrl_layout.addWidget(self.nf_snapshot_contention_label)
         nfv3_ctrl_layout.addStretch()
         self.reset_section_layout_btn = QPushButton("Reset layout")
         self.reset_section_layout_btn.clicked.connect(self.reset_section_layout)
         nfv3_ctrl_layout.addWidget(self.reset_section_layout_btn)
         self.nfv3_ctrl_layout = nfv3_ctrl_layout
+
+        nfv3_status_layout = QHBoxLayout()
+        nfv3_status_layout.setContentsMargins(0, 0, 0, 0)
+        nfv3_status_layout.setSpacing(10)
+        nfv3_status_layout.addWidget(self.active_source_label, 1)
+        nfv3_status_layout.addWidget(self.nf_clock_label)
+        nfv3_status_layout.addWidget(self.nf_snapshot_contention_label)
+        nfv3_status_layout.addWidget(self.nf_clock_settings_btn)
+        self.nfv3_status_layout = nfv3_status_layout
+
         neuroflap_page_layout.addLayout(nfv3_ctrl_layout)
+        neuroflap_page_layout.addLayout(nfv3_status_layout)
         neuroflap_page_layout.addWidget(self.nf_busy_label)
         neuroflap_page_layout.addWidget(dataflow_export_scroll, 1)
 
@@ -546,9 +559,15 @@ class PlotWindow(QWidget):
         control_layout.addWidget(self.open_flight_visualization_btn)
         control_layout.addWidget(self.open_capture_btn)
 
-        selected_plot_layout = QHBoxLayout()
+        selected_plot_layout = QVBoxLayout()
         selected_plot_layout.setContentsMargins(0, 0, 0, 0)
-        selected_plot_layout.setSpacing(6)
+        selected_plot_layout.setSpacing(3)
+        selected_plot_identity_layout = QHBoxLayout()
+        selected_plot_identity_layout.setContentsMargins(0, 0, 0, 0)
+        selected_plot_identity_layout.setSpacing(6)
+        selected_plot_transform_layout = QHBoxLayout()
+        selected_plot_transform_layout.setContentsMargins(0, 0, 0, 0)
+        selected_plot_transform_layout.setSpacing(6)
         self.selected_plot_label = QLabel("Selected plot:")
         selected_plot_font = self.selected_plot_label.font()
         selected_plot_font.setBold(True)
@@ -618,24 +637,29 @@ class PlotWindow(QWidget):
         self.selected_reset_btn.setFocusPolicy(Qt.NoFocus)
         self.selected_reset_btn.clicked.connect(self.reset_selected_transform)
 
-        selected_plot_layout.addWidget(self.selected_plot_label)
-        selected_plot_layout.addWidget(self.selected_plot_value)
-        selected_plot_layout.addWidget(self.selected_plot_error)
-        selected_plot_layout.addWidget(self.selected_visible_check)
-        selected_plot_layout.addWidget(self.selected_derived_btn)
-        selected_plot_layout.addWidget(self.selected_derived_edit_btn)
-        selected_plot_layout.addWidget(self.selected_derived_delete_btn)
-        selected_plot_layout.addWidget(self.selected_coord_value)
-        selected_plot_layout.addWidget(QLabel("color:"))
-        selected_plot_layout.addWidget(self.selected_color_btn)
-        selected_plot_layout.addWidget(QLabel("phase:"))
-        selected_plot_layout.addWidget(self.selected_phase_spin)
-        selected_plot_layout.addWidget(QLabel("offset:"))
-        selected_plot_layout.addWidget(self.selected_offset_spin)
-        selected_plot_layout.addWidget(QLabel("scale:"))
-        selected_plot_layout.addWidget(self.selected_scale_spin)
-        selected_plot_layout.addWidget(self.selected_reset_btn)
-        selected_plot_layout.addStretch()
+        selected_plot_identity_layout.addWidget(self.selected_plot_label)
+        selected_plot_identity_layout.addWidget(self.selected_plot_value)
+        selected_plot_identity_layout.addWidget(self.selected_plot_error)
+        selected_plot_identity_layout.addWidget(self.selected_visible_check)
+        selected_plot_identity_layout.addWidget(self.selected_derived_btn)
+        selected_plot_identity_layout.addWidget(self.selected_derived_edit_btn)
+        selected_plot_identity_layout.addWidget(self.selected_derived_delete_btn)
+        selected_plot_identity_layout.addWidget(self.selected_coord_value)
+        selected_plot_identity_layout.addStretch()
+
+        selected_plot_transform_layout.addWidget(QLabel("color:"))
+        selected_plot_transform_layout.addWidget(self.selected_color_btn)
+        selected_plot_transform_layout.addWidget(QLabel("phase:"))
+        selected_plot_transform_layout.addWidget(self.selected_phase_spin)
+        selected_plot_transform_layout.addWidget(QLabel("offset:"))
+        selected_plot_transform_layout.addWidget(self.selected_offset_spin)
+        selected_plot_transform_layout.addWidget(QLabel("scale:"))
+        selected_plot_transform_layout.addWidget(self.selected_scale_spin)
+        selected_plot_transform_layout.addWidget(self.selected_reset_btn)
+        selected_plot_transform_layout.addStretch()
+
+        selected_plot_layout.addLayout(selected_plot_identity_layout)
+        selected_plot_layout.addLayout(selected_plot_transform_layout)
         self._update_selected_controls()
 
         hline_1 = QFrame()
@@ -826,6 +850,32 @@ class PlotWindow(QWidget):
         self._live_activation_requested = False
         self.data_receiver.disconnect_nfv3()
         self.update_nfv3_status()
+
+    def _ensure_clock_settings_dialog(self):
+        if self.clock_settings_dialog is not None:
+            return
+
+        dialog = QDialog(self, Qt.Tool)
+        dialog.setWindowTitle("Time Alignment")
+
+        form = QFormLayout()
+        form.addRow("Estimator:", self.nf_clock_strategy_combo)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dialog.hide)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+        self.clock_settings_dialog = dialog
+
+    def _show_clock_settings(self):
+        self._ensure_clock_settings_dialog()
+        self.clock_settings_dialog.show()
+        self.clock_settings_dialog.raise_()
+        self.clock_settings_dialog.activateWindow()
 
     def set_clock_estimator_strategy(self):
         strategy = ClockEstimatorStrategy.parse(
