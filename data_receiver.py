@@ -10,7 +10,11 @@ from data_parser import DataParser
 from nfv3_parser import NFv3Parser
 from nfv4_clock_client import NFv4ClockClient
 from nfv4_codec import NFv4Codec
-from network_clock import AffineClockEstimator, ClockTransform
+from network_clock import (
+    ClockEstimatorStrategy,
+    ClockTransform,
+    SelectableClockEstimator,
+)
 import MoCap.LuMo.LuMoSDKClient as LuMoSDKClient
 
 
@@ -47,6 +51,7 @@ class DataReceiver:
         rigid_id="Rigid_WingLite_R_MainRod",
         udp_target_ip=None,
         udp_target_port=None,
+        clock_strategy=ClockEstimatorStrategy.V4_V3,
     ):
         self.data_model = data_model
         self.main_window = main_window
@@ -85,7 +90,7 @@ class DataReceiver:
         self.parser = DataParser()
         self.nf_parser = NFv3Parser()
         self.nf_v4_codec = NFv4Codec(self.nf_parser)
-        self.nf_clock_estimator = AffineClockEstimator()
+        self.nf_clock_estimator = SelectableClockEstimator(clock_strategy)
         self.nf_v4_clock = NFv4ClockClient(
             estimator=self.nf_clock_estimator,
             codec=self.nf_v4_codec,
@@ -94,6 +99,8 @@ class DataReceiver:
         self._clock_monotonic_anchor_us = time.monotonic_ns() // 1000
         self._clock_last_published_revision = -1
         self._clock_next_publish_us = 0
+        self._clock_strategy_switch_pending = False
+        self._clock_strategy_holdover = False
         self.first_ft_received_flag = False
         self.first_udp_received_flag = False
         self.data_ingestion_enabled = True
@@ -182,6 +189,19 @@ class DataReceiver:
     def set_data_ingestion_enabled(self, enabled):
         self.data_ingestion_enabled = bool(enabled)
 
+    def set_clock_estimator_strategy(self, strategy):
+        strategy = ClockEstimatorStrategy.parse(strategy)
+        if not self.nf_clock_estimator.switch_strategy(strategy):
+            return False
+        self.nf_v4_clock.restart_estimation_sampling()
+        self._clock_last_published_revision = -1
+        self._clock_next_publish_us = 0
+        self._clock_strategy_switch_pending = bool(self.nf_connected)
+        self._clock_strategy_holdover = bool(
+            self.data_model.clock_transforms.get(self.NF_CLOCK_SOURCE)
+        )
+        return True
+
     def start(self):
         if self.running:
             return
@@ -194,6 +214,7 @@ class DataReceiver:
     def stop(self):
         self.running = False
         self.nf_v4_clock.stop_session()
+        self.nf_clock_estimator.close()
         self.bota_running = False
         self.mocap_running = False
         self._stop_nfv3_diag_workers_()
@@ -475,10 +496,29 @@ class DataReceiver:
             )
         blocker = self._clock_alignment_blocker_(snapshot, transport)
         return {
+            "strategy": snapshot.strategy.value,
+            "strategy_display": snapshot.strategy.display_name,
+            "model_name": snapshot.model_name,
+            "strategy_switch_pending": self._clock_strategy_switch_pending,
+            "strategy_holdover": self._clock_strategy_holdover,
             "state": snapshot.state.value,
+            "offset_state": snapshot.offset_state.value,
+            "drift_state": snapshot.drift_state.value,
             "usable": snapshot.usable,
             "uncertainty_us": snapshot.uncertainty_us,
             "drift_ppb": snapshot.drift_ppb,
+            "candidate_drift_ppb": snapshot.candidate_drift_ppb,
+            "physical_candidate_drift_ppb": (
+                snapshot.physical_candidate_drift_ppb
+            ),
+            "statistical_candidate_drift_ppb": (
+                snapshot.statistical_candidate_drift_ppb
+            ),
+            "statistical_drift_uncertainty_ppb": (
+                snapshot.statistical_drift_uncertainty_ppb
+            ),
+            "drift_lower_ppb": snapshot.drift_lower_ppb,
+            "drift_upper_ppb": snapshot.drift_upper_ppb,
             "drift_uncertainty_ppb": snapshot.drift_uncertainty_ppb,
             "sample_count": snapshot.sample_count,
             "candidate_count": snapshot.candidate_count,
@@ -499,6 +539,9 @@ class DataReceiver:
             "compatible_count": snapshot.compatible_count,
             "consensus_required_count": snapshot.consensus_required_count,
             "drift_fit_valid": snapshot.drift_fit_valid,
+            "drift_fit_pending": snapshot.drift_fit_pending,
+            "drift_fit_runtime_ms": snapshot.drift_fit_runtime_ms,
+            "drift_fit_error": snapshot.drift_fit_error,
             "healthy_fit_streak": snapshot.healthy_fit_streak,
             "lock_confirm_updates": snapshot.lock_confirm_updates,
             "model_age_s": snapshot.model_age_s,
@@ -550,6 +593,8 @@ class DataReceiver:
                 "compatible interval consensus is insufficient "
                 f"({snapshot.compatible_count}/{snapshot.consensus_required_count})"
             )
+        if snapshot.offset_state.value == "Acquiring":
+            return "collecting a compatible offset interval"
         if snapshot.representative_count < self.nf_clock_estimator.MIN_LOCK_REPRESENTATIVES:
             return (
                 "collecting representative samples "
@@ -558,12 +603,12 @@ class DataReceiver:
             )
         if snapshot.representative_span_us < self.nf_clock_estimator.MIN_LOCK_SPAN_US:
             return (
-                "collecting clock-drift span "
+                "collecting long-term clock-drift evidence "
                 f"({snapshot.representative_span_us / 1.0e6:.1f}/"
                 f"{self.nf_clock_estimator.MIN_LOCK_SPAN_US / 1.0e6:.1f} s)"
             )
         if not snapshot.drift_fit_valid:
-            return "clock-drift fit is not valid"
+            return "clock-drift interval is not valid"
         if snapshot.healthy_fit_streak < self.nf_clock_estimator.LOCK_CONFIRM_UPDATES:
             return (
                 "confirming the clock model "
@@ -960,10 +1005,8 @@ class DataReceiver:
 
     def _reset_nfv3_diagnostics_(self, *, reset_clock=True):
         if reset_clock:
-            self.nf_clock_estimator.reset()
-            self.data_model.begin_clock_epoch(
-                self.NF_CLOCK_SOURCE,
-                self.nf_clock_estimator.epoch,
+            self.nf_clock_estimator.restart_estimation(
+                "NFv3 diagnostics restarted"
             )
         with self._nf_diag_lock:
             self.nf_diag_normal_packets_rx = 0
@@ -1066,10 +1109,8 @@ class DataReceiver:
         age_s = time.monotonic() - transform.updated_monotonic
         if age_s < self.NF_CLOCK_MODEL_UNLOCK_S:
             return
-        self.nf_clock_estimator.reset()
-        self.data_model.begin_clock_epoch(
-            self.NF_CLOCK_SOURCE,
-            self.nf_clock_estimator.epoch,
+        self.nf_clock_estimator.restart_estimation(
+            "clock model became stale"
         )
 
     def _observe_nfv3_data_packet_(self, packet):
@@ -1264,6 +1305,7 @@ class DataReceiver:
         if packet["type"] == "sync_response":
             matched = self.nf_v4_clock.handle_response(data, received_us)
             if matched:
+                self._sync_nfv4_clock_epoch_()
                 self.nf_last_pong_ms = time.time() * 1000.0
                 measurement = self.nf_v4_clock.take_measurement()
                 if measurement and int(measurement["context"]) != 0:
@@ -1283,6 +1325,15 @@ class DataReceiver:
             self._process_nfv4_diag_control_(packet, remote_addr)
             return True
         return True
+
+    def _sync_nfv4_clock_epoch_(self):
+        clock_bucket = self.data_model.ensure_source(self.NF_CLOCK_SOURCE)
+        if clock_bucket.current_session == self.nf_clock_estimator.epoch:
+            return
+        self.data_model.begin_clock_epoch(
+            self.NF_CLOCK_SOURCE,
+            self.nf_clock_estimator.epoch,
+        )
 
     def _publish_nfv4_clock_transform_(self, force=False):
         now_us = time.monotonic_ns() // 1000
@@ -1313,6 +1364,8 @@ class DataReceiver:
         self.data_model.set_clock_transform(
             self.NF_CLOCK_SOURCE, wall_transform
         )
+        self._clock_strategy_switch_pending = False
+        self._clock_strategy_holdover = False
         if self._nfv4_diagnostics_enabled_():
             packet = self.nf_v4_codec.build_diag_path_report(
                 self.nf_session_id,

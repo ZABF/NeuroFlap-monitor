@@ -9,11 +9,20 @@ NFMonitorCSV v3 is a single self-describing CSV file. Comment records at the top
 #meta,value_space,source
 #meta,protocol,NFv3
 #meta,schema_generation,12
-#meta,clock_model,rolling_affine_interval_v2
+#meta,clock_model,constrained_affine_hybrid_v4_v3
+#meta,clock_estimator_strategy,v4+v3
 #meta,clock_state,Locked
+#meta,clock_offset_state,Usable
+#meta,clock_drift_state,Locked
 #meta,clock_uncertainty_us,180.5
 #meta,clock_drift_ppb,72400
+#meta,clock_candidate_drift_ppb,73100
+#meta,clock_physical_candidate_drift_ppb,72400
+#meta,clock_statistical_candidate_drift_ppb,73100
+#meta,clock_statistical_drift_uncertainty_ppb,2400
 #meta,clock_drift_uncertainty_ppb,350
+#meta,clock_drift_fit_pending,0
+#meta,clock_drift_fit_runtime_ms,96.4
 #var_fields,name,category,section,unit,kind,owner,display_name,task_id,direction,slot,scalar_type,hidden,task_order,group_order
 #var,MadgwickTask.input.pitch,task,Task/5,deg,task_port,MadgwickTask,pitch,5,input,0,F32,0,5,
 #var,MadgwickTask.latency_us,task,Task/5,us,task_latency,MadgwickTask,latency_us,5,,,U32,1,5,
@@ -31,9 +40,11 @@ MadgwickTask.input.pitch_time_us,MadgwickTask.input.pitch_value,MadgwickTask.lat
 - Empty cells pad shorter series.
 - Values are decoded source values. Derived curves and phase/scale/offset view transforms are not exported.
 - `hidden=1` restores internal curves such as task latency without adding a regular variable checkbox.
-- Live NFv3 exports include the final rolling clock-model snapshot. It records anchors, offset
-  bounds, drift, uncertainty, window counts, rejected samples, and the final synchronization
-  state; it does not record the full estimator history.
+- Live NFv3/NFv4 exports include the final clock-model snapshot. It records anchors, offset
+  bounds, applied and candidate drift, confidence states, uncertainty, window counts, rejected
+  samples, and the final fitting status; it does not record the full estimator history.
+- `clock_estimator_strategy` is `v3`, `v4`, or `v4+v3`. Hybrid exports distinguish
+  the V4 physical candidate from the V3 statistical candidate and the final constrained value.
 - Unknown metadata fields are ignored so the format can grow without invalidating older readers.
 
 Python can read the rectangular data table with:

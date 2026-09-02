@@ -21,6 +21,7 @@ from data_model import DataModel
 from data_receiver import DataReceiver
 from data_transporter_thread import DataTransporterThread
 from monitor_csv import read_monitor_csv, write_monitor_csv
+from network_clock import ClockEstimatorStrategy
 from ui.reorderable_section_container import ReorderableSectionContainer
 from ui.task_variable_group import TaskVariableGroup, task_display_order
 from ui.theme import (
@@ -89,6 +90,7 @@ class _CompactDoubleSpinBox(QDoubleSpinBox):
 
 class PlotWindow(QWidget):
     SECTION_ORDER_SETTINGS_KEY = "dataflow/section_order_v1"
+    CLOCK_STRATEGY_SETTINGS_KEY = "network/clock_estimator_strategy"
 
     def __init__(self, persist_layout=True):
         super().__init__()
@@ -102,6 +104,17 @@ class PlotWindow(QWidget):
         if isinstance(saved_section_order, str):
             saved_section_order = [saved_section_order]
         self._custom_section_order = [str(section) for section in saved_section_order]
+        saved_clock_strategy = (
+            self._layout_settings.value(
+                self.CLOCK_STRATEGY_SETTINGS_KEY,
+                ClockEstimatorStrategy.V4_V3.value,
+            )
+            if self._layout_settings is not None
+            else ClockEstimatorStrategy.V4_V3.value
+        )
+        self.clock_estimator_strategy = ClockEstimatorStrategy.parse(
+            saved_clock_strategy
+        )
 
         self.tf_variables = ["F_X", "F_Y", "F_Z", "T_X", "T_Y", "T_Z"]
         self.mocap_variable_templates = [
@@ -192,7 +205,11 @@ class PlotWindow(QWidget):
         self.data_model = DataModel(static_variables)
         # self.data_transporter = None
         self.data_transporter = DataTransporter(self.esp32_ip, self.esp32_port)
-        self.data_receiver = DataReceiver(self.data_model, self)
+        self.data_receiver = DataReceiver(
+            self.data_model,
+            self,
+            clock_strategy=self.clock_estimator_strategy,
+        )
         self.data_receiver.start()
         # 瀛愮獥鍙?
         self.waveform_capture_window = None
@@ -257,6 +274,24 @@ class PlotWindow(QWidget):
         self.active_source_label.setToolTip(self.active_data_source.detail)
         self.nf_clock_label = QLabel("Sync: --")
         set_semantic_state(self.nf_clock_label, "muted")
+        self.nf_clock_strategy_combo = QComboBox()
+        self.nf_clock_strategy_combo.setFixedWidth(86)
+        for strategy in ClockEstimatorStrategy:
+            self.nf_clock_strategy_combo.addItem(
+                strategy.display_name, strategy.value
+            )
+        strategy_index = self.nf_clock_strategy_combo.findData(
+            self.clock_estimator_strategy.value
+        )
+        self.nf_clock_strategy_combo.setCurrentIndex(max(0, strategy_index))
+        self.nf_clock_strategy_combo.setToolTip(
+            "V3: fast robust regression\n"
+            "V4: physical feasible interval\n"
+            "V4+V3: V4 bounds with a constrained V3 point estimate"
+        )
+        self.nf_clock_strategy_combo.currentIndexChanged.connect(
+            self.set_clock_estimator_strategy
+        )
         self.nf_snapshot_contention_label = _ClickableLabel("Snapshot contention: 0")
         self.nf_snapshot_contention_label.setCursor(Qt.PointingHandCursor)
         self.nf_snapshot_contention_label.clicked.connect(
@@ -443,6 +478,8 @@ class PlotWindow(QWidget):
         nfv3_ctrl_layout.addWidget(self.nf_disconnect_btn)
         nfv3_ctrl_layout.addWidget(self.nf_status_label)
         nfv3_ctrl_layout.addWidget(self.active_source_label)
+        nfv3_ctrl_layout.addWidget(QLabel("Clock:"))
+        nfv3_ctrl_layout.addWidget(self.nf_clock_strategy_combo)
         nfv3_ctrl_layout.addWidget(self.nf_clock_label)
         nfv3_ctrl_layout.addWidget(self.nf_snapshot_contention_label)
         nfv3_ctrl_layout.addStretch()
@@ -768,6 +805,18 @@ class PlotWindow(QWidget):
         self.data_receiver.disconnect_nfv3()
         self.update_nfv3_status()
 
+    def set_clock_estimator_strategy(self):
+        strategy = ClockEstimatorStrategy.parse(
+            self.nf_clock_strategy_combo.currentData()
+        )
+        self.clock_estimator_strategy = strategy
+        if self._layout_settings is not None:
+            self._layout_settings.setValue(
+                self.CLOCK_STRATEGY_SETTINGS_KEY, strategy.value
+            )
+        self.data_receiver.set_clock_estimator_strategy(strategy)
+        self.update_nfv3_status()
+
     @staticmethod
     def _snapshot_contention_tooltip(diagnostics):
         tasks = list(diagnostics.get("tasks", ()))
@@ -918,9 +967,37 @@ class PlotWindow(QWidget):
         self.nf_disconnect_btn.setEnabled(state in ("connected", "connecting"))
 
         clock = status.get("clock", {})
+        strategy = ClockEstimatorStrategy.parse(clock.get("strategy"))
+        strategy_index = self.nf_clock_strategy_combo.findData(strategy.value)
+        if (
+            strategy_index >= 0
+            and strategy_index != self.nf_clock_strategy_combo.currentIndex()
+        ):
+            self.nf_clock_strategy_combo.blockSignals(True)
+            self.nf_clock_strategy_combo.setCurrentIndex(strategy_index)
+            self.nf_clock_strategy_combo.blockSignals(False)
+        strategy_display = str(
+            clock.get("strategy_display", strategy.display_name)
+        )
+        strategy_switch_pending = bool(
+            clock.get("strategy_switch_pending", False)
+        )
+        strategy_holdover = bool(clock.get("strategy_holdover", False))
         clock_state = str(clock.get("state", "Acquiring"))
+        offset_state = str(clock.get("offset_state", "Acquiring"))
+        drift_state = str(clock.get("drift_state", "Unknown"))
         uncertainty_us = float(clock.get("uncertainty_us", math.inf))
         drift_ppb = float(clock.get("drift_ppb", 0.0))
+        candidate_drift_ppb = float(clock.get("candidate_drift_ppb", 0.0))
+        physical_candidate_drift_ppb = float(
+            clock.get("physical_candidate_drift_ppb", math.nan)
+        )
+        statistical_candidate_drift_ppb = float(
+            clock.get("statistical_candidate_drift_ppb", math.nan)
+        )
+        statistical_drift_uncertainty_ppb = float(
+            clock.get("statistical_drift_uncertainty_ppb", math.inf)
+        )
         representatives = int(clock.get("representative_count", 0))
         required_representatives = int(
             clock.get("lock_required_representatives", 8)
@@ -936,6 +1013,12 @@ class PlotWindow(QWidget):
         if state != "connected":
             clock_text = "Sync: --"
             clock_semantic = "muted"
+        elif strategy_switch_pending:
+            clock_text = (
+                f"Sync: Switching to {strategy_display}"
+                f" | {'Holdover' if strategy_holdover else 'Acquiring'}"
+            )
+            clock_semantic = "warning"
         elif clock_state == "Locked":
             clock_text = (
                 f"Sync: Locked +/-{uncertainty_us / 1000.0:.2f} ms"
@@ -952,10 +1035,15 @@ class PlotWindow(QWidget):
             clock_text = "Sync: Stale"
             clock_semantic = "error"
         elif clock_state == "Provisional":
+            drift_value = (
+                candidate_drift_ppb
+                if drift_state in ("Unknown", "Candidate")
+                else drift_ppb
+            )
             clock_text = (
-                f"Sync: Provisional {representatives}/"
-                f"{required_representatives}"
-                f" | {representative_span_s:.0f} s"
+                f"Sync: Offset {offset_state}"
+                f" | Drift {drift_state} {drift_value / 1000.0:+.1f} ppm"
+                f" {representative_span_s:.0f} s"
             )
             clock_semantic = "warning"
         elif sample_count == 0:
@@ -977,6 +1065,13 @@ class PlotWindow(QWidget):
         def age_text(value):
             return "--" if value is None else f"{float(value):.0f} ms"
 
+        def ppm_text(value):
+            return (
+                "--"
+                if not math.isfinite(value)
+                else f"{value / 1000.0:+.3f} ppm"
+            )
+
         target_ip = str(transport.get("target_ip", "") or "--")
         target_port = int(transport.get("target_port", 0))
         local_ip = str(transport.get("local_ip", "") or "--")
@@ -985,6 +1080,12 @@ class PlotWindow(QWidget):
             "\n".join(
                 (
                     f"state: {clock_state}",
+                    f"strategy: {strategy_display}",
+                    f"model: {clock.get('model_name', '') or '--'}",
+                    "strategy switch: "
+                    f"{'pending' if strategy_switch_pending else 'settled'}",
+                    f"offset state: {offset_state}",
+                    f"drift state: {drift_state}",
                     f"blocked by: {blocker or '--'}",
                     "",
                     "transport",
@@ -1029,11 +1130,25 @@ class PlotWindow(QWidget):
                     "compatible intervals: "
                     f"{int(clock.get('compatible_count', 0))}/"
                     f"{int(clock.get('consensus_required_count', 0))} required",
-                    f"drift fit: {'valid' if clock.get('drift_fit_valid') else 'invalid'}",
+                    f"drift interval: {'valid' if clock.get('drift_fit_valid') else 'invalid'}",
                     "lock confirmation: "
                     f"{int(clock.get('healthy_fit_streak', 0))}/"
                     f"{int(clock.get('lock_confirm_updates', 0))}",
-                    f"drift: {drift_ppb / 1000.0:+.3f} ppm",
+                    f"applied drift: {drift_ppb / 1000.0:+.3f} ppm",
+                    f"selected candidate: {ppm_text(candidate_drift_ppb)}",
+                    "V4 physical candidate: "
+                    f"{ppm_text(physical_candidate_drift_ppb)}",
+                    "V3 statistical candidate: "
+                    f"{ppm_text(statistical_candidate_drift_ppb)}",
+                    "V3 statistical uncertainty: "
+                    f"{ppm_text(statistical_drift_uncertainty_ppb)}",
+                    "drift fit: "
+                    f"{'pending' if clock.get('drift_fit_pending') else 'idle'}, "
+                    f"last {float(clock.get('drift_fit_runtime_ms', 0.0)):.1f} ms",
+                    f"drift fit error: {clock.get('drift_fit_error', '') or '--'}",
+                    "drift bounds: "
+                    f"{float(clock.get('drift_lower_ppb', -math.inf)) / 1000.0:+.3f} / "
+                    f"{float(clock.get('drift_upper_ppb', math.inf)) / 1000.0:+.3f} ppm",
                     "drift uncertainty: "
                     f"{float(clock.get('drift_uncertainty_ppb', math.inf)) / 1000.0:.3f} ppm",
                     f"offset uncertainty: {uncertainty_us:.1f} us",
