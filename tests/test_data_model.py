@@ -232,6 +232,46 @@ class DataModelTest(unittest.TestCase):
 
         self.assertEqual(model.get_nearest_sample("value", 14.0), (10.0, 2.0))
 
+    def test_bracketing_samples_do_not_expose_future_as_previous(self):
+        model = DataModel([])
+        model.add_series(
+            "value",
+            "source",
+            timestamps=[0.0, 10.0, 20.0],
+            values=[1.0, 2.0, 3.0],
+        )
+
+        self.assertEqual(
+            model.get_bracketing_samples("value", 14.0),
+            ((10.0, 2.0), (20.0, 3.0)),
+        )
+        self.assertEqual(
+            model.get_bracketing_samples("value", -1.0),
+            (None, (0.0, 1.0)),
+        )
+
+    def test_series_window_ending_at_is_bounded_by_time_and_count(self):
+        model = DataModel([])
+        model.add_series(
+            "value",
+            "source",
+            timestamps=[0.0, 10.0, 20.0, 30.0],
+            values=[1.0, 2.0, 3.0, 4.0],
+        )
+
+        self.assertEqual(
+            model.get_series_window_ending_at("value", 25.0, 2),
+            ([10.0, 20.0], [2.0, 3.0]),
+        )
+
+    def test_time_bounds_span_selected_variable_sources(self):
+        model = DataModel([])
+        model.add_series("a", "source-a", [10.0, 20.0], [1.0, 2.0])
+        model.add_series("b", "source-b", [5.0, 30.0], [3.0, 4.0])
+
+        self.assertEqual(model.get_time_bounds(), (5.0, 30.0))
+        self.assertEqual(model.get_time_bounds(["a"]), (10.0, 20.0))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -348,6 +348,65 @@ class DataModel:
             float(var_bucket.value[best_idx]),
         )
 
+    def get_bracketing_samples(self, var: str, timestamp_ms: float):
+        """Return the samples immediately before/at and after a timestamp."""
+        storage = self._series_storage(var)
+        if storage is None:
+            return None, None
+        var_bucket, source_bucket, count = storage
+        target = float(timestamp_ms)
+        next_idx = bisect_right(source_bucket.recon_timestamp, target, 0, count)
+        previous = None
+        following = None
+        if next_idx > 0:
+            index = next_idx - 1
+            previous = (
+                float(source_bucket.recon_timestamp[index]),
+                float(var_bucket.value[index]),
+            )
+        if next_idx < count:
+            following = (
+                float(source_bucket.recon_timestamp[next_idx]),
+                float(var_bucket.value[next_idx]),
+            )
+        return previous, following
+
+    def get_series_window_ending_at(self, var: str, end_ms: float, max_samples: int):
+        """Return at most max_samples whose timestamps do not exceed end_ms."""
+        storage = self._series_storage(var)
+        if storage is None or max_samples <= 0:
+            return [], []
+        var_bucket, source_bucket, count = storage
+        end_idx = bisect_right(
+            source_bucket.recon_timestamp,
+            float(end_ms),
+            0,
+            count,
+        )
+        start_idx = max(0, end_idx - int(max_samples))
+        return self._series_slice(var_bucket, source_bucket, start_idx, end_idx)
+
+    def get_time_bounds(self, variable_names=None):
+        """Return the earliest and latest timestamps across available variables."""
+        names = self.vars.keys() if variable_names is None else variable_names
+        earliest = None
+        latest = None
+        seen_sources = set()
+        for name in names:
+            var_bucket = self.vars.get(name)
+            if var_bucket is None or var_bucket.src in seen_sources:
+                continue
+            storage = self._series_storage(name)
+            if storage is None:
+                continue
+            _values, source_bucket, count = storage
+            seen_sources.add(var_bucket.src)
+            first = float(source_bucket.recon_timestamp[0])
+            last = float(source_bucket.recon_timestamp[count - 1])
+            earliest = first if earliest is None else min(earliest, first)
+            latest = last if latest is None else max(latest, last)
+        return earliest, latest
+
     def get_series_tail(self, var: str, max_samples: int):
         """Return at most the newest max_samples without copying older history."""
         storage = self._series_storage(var)

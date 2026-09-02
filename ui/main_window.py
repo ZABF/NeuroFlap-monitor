@@ -22,6 +22,8 @@ from data_receiver import DataReceiver
 from data_transporter_thread import DataTransporterThread
 from monitor_csv import read_monitor_csv, write_monitor_csv
 from network_clock import ClockEstimatorStrategy
+from timeline_controller import TimelineController, TimelineState
+from ui.timeline_bar import TimelineBar
 from ui.reorderable_section_container import ReorderableSectionContainer
 from ui.task_variable_group import TaskVariableGroup, task_display_order
 from ui.theme import (
@@ -34,6 +36,7 @@ from ui.theme import (
     set_semantic_state,
 )
 from ui.variable_control import VariableControlItem
+from ui.flight_visualization_window import FlightVisualizationWindow
 from waveform_capture import WaveformCaptureWindow
 from enum import Enum
 from ui.curve_expression import (
@@ -96,6 +99,10 @@ class PlotWindow(QWidget):
         super().__init__()
         self.setWindowTitle("Monitor v3.3.1")
         self._layout_settings = QSettings("NeuroFlap", "Monitor") if persist_layout else None
+        self.timeline = TimelineController(parent=self)
+        self._timeline_data_revision = -1
+        self._timeline_playhead_ms = None
+        self._updating_playhead_line = False
         saved_section_order = (
             self._layout_settings.value(self.SECTION_ORDER_SETTINGS_KEY, [])
             if self._layout_settings is not None
@@ -213,6 +220,7 @@ class PlotWindow(QWidget):
         self.data_receiver.start()
         # 瀛愮獥鍙?
         self.waveform_capture_window = None
+        self.flight_visualization_window = None
 
         # csv filename edit
         self.export_filename_edit = QLineEdit(self)
@@ -256,6 +264,10 @@ class PlotWindow(QWidget):
 
         self.open_capture_btn = QPushButton("Waveform Capture")
         self.open_capture_btn.clicked.connect(self.open_waveform_capture)
+        self.open_flight_visualization_btn = QPushButton("Flight Visualization")
+        self.open_flight_visualization_btn.clicked.connect(
+            self.open_flight_visualization
+        )
 
         self.nf_ip_input = QLineEdit(self.esp32_ip)
         self.nf_ip_input.setFixedWidth(140)
@@ -531,6 +543,7 @@ class PlotWindow(QWidget):
         control_layout.addWidget(self.clear_btn)
         control_layout.addWidget(self.auto_scale_btn)
         control_layout.addStretch()
+        control_layout.addWidget(self.open_flight_visualization_btn)
         control_layout.addWidget(self.open_capture_btn)
 
         selected_plot_layout = QHBoxLayout()
@@ -632,10 +645,13 @@ class PlotWindow(QWidget):
 
         variable_layout.addWidget(tab_widget, 1)
 
+        self.timeline_bar = TimelineBar(self.timeline, parent=self)
+
         # 涓€绾у竷灞€
         main_layout = QVBoxLayout()
         main_layout.addLayout(setting_layout)
         main_layout.addWidget(self.plot_widget, 1)
+        main_layout.addWidget(self.timeline_bar)
         main_layout.addLayout(selected_plot_layout)
         main_layout.addLayout(control_layout)
         main_layout.addWidget(hline_1)  # 鈫?鎻掑叆姘村钩鍒嗛殧绾?
@@ -649,10 +665,10 @@ class PlotWindow(QWidget):
         self.plot_widget.viewport().installEventFilter(self)
 
         # 鐢诲竷鍐呯敾鍏夋爣鏄剧ず鏁板瓧绛?
-        self.now_line = pg.InfiniteLine(angle=90, movable=False,
+        self.now_line = pg.InfiniteLine(angle=90, movable=True,
                                         pen=pg.mkPen('y', width=2, style=Qt.CustomDashLine, dash=[5, 5, 1, 5]))
         self.begin_line = pg.InfiniteLine(angle=90, movable=False,
-                                          pen=pg.mkPen('y', width=2, style=Qt.CustomDashLine, dash=[5, 5, 1, 5]))
+                                          pen=pg.mkPen((130, 135, 145), width=1, style=Qt.DashLine))
         self.plot_widget.addItem(self.now_line)
         self.plot_widget.addItem(self.begin_line)
         self.selected_hover_marker = pg.ScatterPlotItem(
@@ -710,6 +726,12 @@ class PlotWindow(QWidget):
 
         self.plot_state = PlotState.IDLE
         self.last_plot_state = PlotState.IDLE
+        self.now_line.sigPositionChanged.connect(self._playhead_line_changed)
+        self.now_line.sigPositionChangeFinished.connect(
+            self._playhead_line_drag_finished
+        )
+        self.timeline.changed.connect(self._timeline_changed)
+        self._timeline_changed()
         self.update_nfv3_status()
 
     def toggle_mocap(self):
@@ -1339,9 +1361,8 @@ class PlotWindow(QWidget):
         self.reception_start_time = now
         self.window_now = now
         self.window_start = now - self.fixed_window_seconds * 1000.0
-        self.now_line.setValue(self.window_now)
-        self.begin_line.setValue(self.reception_start_time)
-        self.x_axis.set_start_time(self.reception_start_time)
+        self._timeline_data_revision = -1
+        self.timeline.begin_live()
         self._invalidate_curve_render_state()
         for curve in self.curves.values():
             curve.setData([], [])
@@ -1377,6 +1398,8 @@ class PlotWindow(QWidget):
         self._live_activation_requested = False
         self.data_receiver.set_data_ingestion_enabled(False)
         self.data_model.clear()
+        self.timeline.reset()
+        self._timeline_data_revision = -1
         self._invalidate_curve_render_state()
         self._hide_selected_hover_point()
         self._set_active_data_source(ActiveDataSource.replay(path))
@@ -1408,38 +1431,53 @@ class PlotWindow(QWidget):
             descriptors.append(desc)
         self.register_dataflow_export_descriptors(descriptors)
 
-        all_timestamps = []
+        earliest_timestamp = None
+        latest_timestamp = None
         source_prefix = f"csv:{os.path.basename(path)}:"
         for var_name, data in series.items():
+            timestamps = data["timestamps"]
             self.data_model.add_series(
                 var=var_name,
                 src=source_prefix + var_name,
-                timestamps=data["timestamps"],
+                timestamps=timestamps,
                 values=data["values"],
             )
-            all_timestamps.extend(data["timestamps"])
+            if timestamps:
+                series_start = min(timestamps)
+                series_end = max(timestamps)
+                earliest_timestamp = (
+                    series_start
+                    if earliest_timestamp is None
+                    else min(earliest_timestamp, series_start)
+                )
+                latest_timestamp = (
+                    series_end
+                    if latest_timestamp is None
+                    else max(latest_timestamp, series_end)
+                )
             desc = self.dynamic_signal_descriptors.get(var_name, {})
             if desc.get("descriptor_kind") == "task_latency" and data["values"]:
                 self.update_task_latency(desc["task_id"], data["values"][-1])
 
-        if all_timestamps:
-            self.reception_start_time = min(all_timestamps)
-            self.window_now = max(all_timestamps)
+        if earliest_timestamp is not None and latest_timestamp is not None:
+            self.reception_start_time = earliest_timestamp
+            self.window_now = self.reception_start_time
             self.window_start = self.reception_start_time
-            self.now_line.setValue(self.window_now)
-            self.begin_line.setValue(self.reception_start_time)
-            self.x_axis.set_start_time(self.reception_start_time)
-            self.plot_widget.setXRange(self.reception_start_time, self.window_now, padding=0)
+            self._timeline_data_revision = self.data_model.revision
+            self.timeline.begin_replay(
+                self.reception_start_time,
+                latest_timestamp,
+            )
+            self.plot_widget.setXRange(
+                self.reception_start_time,
+                latest_timestamp,
+                padding=0,
+            )
 
-        self.auto_scroll_enabled_before_pause = False
-        self.auto_y_enabled_before_pause = self.auto_y_enabled
         self.auto_scroll_enabled = False
         self.auto_y_enabled = True
         self._set_auto_checkboxes_silent(False, True)
         self.plot_widget.enableAutoRange(axis=1, enable=False)
-        self.plot_state = PlotState.STOPPED
-        self.toggle_reception_btn.setText("Resume")
-        set_semantic_state(self.toggle_reception_btn, "warning")
         self.refresh_all_curves(visible_only=True)
 
     def update_capture_plot(self):
@@ -1451,6 +1489,84 @@ class PlotWindow(QWidget):
         if not self.waveform_capture_window:
             self.waveform_capture_window = WaveformCaptureWindow(self)
         self.waveform_capture_window.show()
+
+    def open_flight_visualization(self):
+        if not self.flight_visualization_window:
+            self.flight_visualization_window = FlightVisualizationWindow(
+                self.data_model,
+                available_variables=lambda: self.available_raw_variables,
+                timeline=self.timeline,
+                parent=self,
+            )
+        self.flight_visualization_window.show()
+        self.flight_visualization_window.raise_()
+        self.flight_visualization_window.activateWindow()
+
+    def _refresh_timeline_bounds(self, force=False):
+        revision = self.data_model.revision
+        if not force and revision == self._timeline_data_revision:
+            return
+        self._timeline_data_revision = revision
+        names = self.available_raw_variables or self.data_model.vars.keys()
+        start_ms, latest_ms = self.data_model.get_time_bounds(names)
+        self.timeline.update_bounds(start_ms, latest_ms)
+
+    def _playhead_line_changed(self):
+        if self._updating_playhead_line or not self.timeline.has_range:
+            return
+        self.timeline.seek(float(self.now_line.value()))
+
+    def _playhead_line_drag_finished(self):
+        self._refresh_playhead_view()
+
+    def _refresh_playhead_view(self):
+        if not self.timeline.has_range or not self.auto_scroll_enabled:
+            return
+        self.plot_widget.setXRange(
+            self.window_start,
+            self.window_now + self.fixed_window_seconds * 100.0,
+            padding=0,
+        )
+        self.refresh_all_curves(visible_only=True)
+
+    def _timeline_changed(self):
+        has_range = self.timeline.has_range
+        playhead = self.timeline.playhead_ms
+        self.now_line.setMovable(
+            has_range and self.timeline.state != TimelineState.FOLLOW_LIVE
+        )
+        if has_range:
+            self.reception_start_time = self.timeline.start_ms
+            self.window_now = playhead
+            self.window_start = playhead - self.fixed_window_seconds * 1000.0
+            self.begin_line.setValue(self.timeline.start_ms)
+            self.x_axis.set_start_time(self.timeline.start_ms)
+            self._updating_playhead_line = True
+            self.now_line.setValue(playhead)
+            self._updating_playhead_line = False
+
+        if self.timeline.state == TimelineState.EMPTY:
+            if self.plot_state != PlotState.CLEARING:
+                self.plot_state = PlotState.IDLE
+            self.toggle_reception_btn.setText("Start Receive")
+            set_semantic_state(self.toggle_reception_btn, "warning")
+        elif self.timeline.is_running:
+            self.plot_state = PlotState.RUNNING
+            self.toggle_reception_btn.setText("Pause")
+            set_semantic_state(self.toggle_reception_btn, "accent")
+        else:
+            self.plot_state = PlotState.STOPPED
+            if self.timeline.source_kind == "live":
+                self.toggle_reception_btn.setText("Resume")
+            else:
+                self.toggle_reception_btn.setText("Play")
+            set_semantic_state(self.toggle_reception_btn, "warning")
+
+        if playhead == self._timeline_playhead_ms:
+            return
+        self._timeline_playhead_ms = playhead
+        if not getattr(self.now_line, "moving", False):
+            self._refresh_playhead_view()
 
     def update_window_duration(self, value):
         self.fixed_window_seconds = value
@@ -1573,53 +1689,23 @@ class PlotWindow(QWidget):
         )
 
     def toggle_reception(self):
-        now = time.time() * 1000  # ms
         if self.plot_state == PlotState.IDLE:
-            print(self.plot_state)
             self.data_receiver.first_ft_received_flag = False
             self.data_receiver.first_udp_received_flag = False
-            self.data_model.clear()  # 闃叉娈嬬暀鏁版嵁
+            self.data_model.clear()
             self._invalidate_curve_render_state()
-            self.reception_start_time = now
-            unix_time = time.time_ns() / 1000
-            # print(f"The latest window t0 corresponds to the unix time {unix_time} us")
+            self._timeline_data_revision = -1
             self.auto_x.setChecked(True)
             self.auto_y.setChecked(True)
-            self.toggle_reception_btn.setText("Pause")
-            set_semantic_state(self.toggle_reception_btn, "accent")
-            self.plot_state = PlotState.RUNNING
+            self.timeline.begin_live()
             return
-
-        if self.plot_state == PlotState.RUNNING:
-            print(self.plot_state)
-            # self.data_receiver.stop()
-            self.auto_scroll_enabled_before_pause = self.auto_scroll_enabled
-            self.auto_y_enabled_before_pause = self.auto_y_enabled
-            self.auto_scroll_enabled = False
-            self.auto_y_enabled = False
-            self._set_auto_checkboxes_silent(False, False)
-            self.plot_widget.enableAutoRange(axis=1, enable=False)
-            self.toggle_reception_btn.setText("Disable...")
-            set_semantic_state(self.toggle_reception_btn, "inactive")
-            self.plot_state = PlotState.STOPPING
-
-            self.update_plot()
-
-            self.toggle_reception_btn.setText("Resume")
-            set_semantic_state(self.toggle_reception_btn, "warning")
-            self.plot_state = PlotState.STOPPED
+        if (
+            self.timeline.source_kind == "live"
+            and self.timeline.state == TimelineState.PAUSED
+        ):
+            self.timeline.go_live()
             return
-
-        if self.plot_state == PlotState.STOPPED:
-            print(self.plot_state)
-            self.toggle_reception_btn.setText("Pause")
-            set_semantic_state(self.toggle_reception_btn, "accent")
-            self.auto_scroll_enabled = bool(self.auto_scroll_enabled_before_pause)
-            self.auto_y_enabled = bool(self.auto_y_enabled_before_pause)
-            self._set_auto_checkboxes_silent(self.auto_scroll_enabled, self.auto_y_enabled)
-            self.plot_state = PlotState.RUNNING
-            self.refresh_all_curves(visible_only=True)
-            return
+        self.timeline.toggle_playback()
 
 
     def auto_scale_all(self):
@@ -2311,7 +2397,10 @@ class PlotWindow(QWidget):
         if not x_range or len(x_range) < 2:
             return self.reception_start_time, self.window_now
         start = max(self.reception_start_time, float(x_range[0]))
-        end = min(self.window_now, float(x_range[1]))
+        available_end = self.window_now
+        if self.active_data_source.kind == "replay" and self.timeline.has_range:
+            available_end = self.timeline.latest_ms
+        end = min(available_end, float(x_range[1]))
         return (start, max(start, end))
 
     def _clip_curve_to_time_window(self, ts, vs):
@@ -3356,28 +3445,16 @@ class PlotWindow(QWidget):
 
     # plot window鏃堕棿鎴虫洿鏂?
     def update_cursor(self):
-        now = time.time() * 1000  # ms
-        self.begin_line.setValue(self.reception_start_time)
-        self.x_axis.set_start_time(self.reception_start_time)
-
-        if self.plot_state == PlotState.RUNNING:
-            self.window_now = now
-            self.window_start = self.window_now - self.fixed_window_seconds * 1000
-            self.now_line.setValue(self.window_now)  # 鑷姩璺熼殢鏃堕棿鍓嶈繘
-
-        elif self.plot_state == PlotState.CLEARING:
-            self.window_now = self.reception_start_time
-            self.window_start = self.window_now - self.fixed_window_seconds * 1000
-            self.now_line.setValue(self.window_now)
-
-        highlight_tick = [(self.window_now, f"T_now = {int(self.window_now - self.reception_start_time)} ms"),
-                          (self.window_now - 1000, f"{int(self.window_now - self.reception_start_time - 1000)} ms")]
-        if self.auto_scroll_enabled:
-            self.plot_widget.setXRange(self.window_start, self.window_now + self.fixed_window_seconds * 1000 / 10,
-                                       padding=0)
-            self.x_axis.setTicks([highlight_tick])
-        else:
-            self.x_axis.setTicks(None)
+        self._refresh_timeline_bounds()
+        self.timeline.tick()
+        if not self.timeline.has_range:
+            return
+        relative_ms = self.timeline.playhead_ms - self.timeline.start_ms
+        highlight_tick = [
+            (self.timeline.playhead_ms, f"T = {int(relative_ms)} ms"),
+            (self.timeline.playhead_ms - 1000.0, f"{int(relative_ms - 1000.0)} ms"),
+        ]
+        self.x_axis.setTicks([highlight_tick] if self.auto_scroll_enabled else None)
 
     def clear_data(self):
         """Clear all buffered data."""
@@ -3385,6 +3462,8 @@ class PlotWindow(QWidget):
         # CLEANING:
         self.plot_state = PlotState.CLEARING
         self.data_model.clear()
+        self.timeline.reset()
+        self._timeline_data_revision = -1
         self._invalidate_curve_render_state()
         self.update_cursor()
         self.update_plot()
@@ -3806,6 +3885,8 @@ class PlotWindow(QWidget):
             self._relayout_dataflow_export_section_items(section)
 
     def closeEvent(self, event):
+        if self.flight_visualization_window:
+            self.flight_visualization_window.close()
         try:
             self.data_receiver.disconnect_nfv3()
             self.data_receiver.stop()
