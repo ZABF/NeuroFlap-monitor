@@ -27,6 +27,7 @@ from flight_visualization import (
     aligned_pose,
     axis_rotation,
     box_faces,
+    downsample_trajectory,
     interpolate_sample,
     wing_vertices,
 )
@@ -41,6 +42,7 @@ from ui.theme import (
     set_semantic_state,
 )
 from ui.timeline_bar import TimelineBar
+from ui.signal_binding_selector import SignalBindingSelector, build_signal_choices
 
 
 BINDINGS = (
@@ -123,7 +125,7 @@ class FlightSceneCanvas(QWidget):
         if self.mode == "attitude":
             self.target = np.zeros(3)
             self.distance = 2.8
-        elif self.trail:
+        elif len(self.trail):
             self.fit_view()
         self.update()
 
@@ -140,7 +142,7 @@ class FlightSceneCanvas(QWidget):
         self.update()
 
     def fit_view(self):
-        if self.mode == "attitude" or not self.trail:
+        if self.mode == "attitude" or not len(self.trail):
             self.target = np.zeros(3)
             self.distance = 2.8
         else:
@@ -428,6 +430,7 @@ class FlightVisualizationWindow(QWidget):
         self,
         data_model,
         available_variables=None,
+        available_descriptors=None,
         settings=None,
         timeline=None,
         parent=None,
@@ -435,6 +438,7 @@ class FlightVisualizationWindow(QWidget):
         super().__init__(parent, Qt.Window)
         self.data_model = data_model
         self.available_variables = available_variables or (lambda: self.data_model.vars.keys())
+        self.available_descriptors = available_descriptors or (lambda: {})
         self.settings = settings or QSettings("NeuroFlap", "Monitor")
         self._owns_timeline = timeline is None
         self.timeline = timeline or TimelineController(parent=self)
@@ -444,13 +448,20 @@ class FlightVisualizationWindow(QWidget):
         self._last_variable_signature = None
         self._trail_start_ms = None
         self._timeline_source_signature = None
+        self._last_update_gate = None
+        self._last_scene_signature = None
+        self._trajectory_cache_key = None
+        self._trajectory_cache_revisions = None
+        self._trajectory_cache = np.empty((0, 3), dtype=float)
+        self._trajectory_last_timestamp_ms = None
+        self._trajectory_last_playhead_ms = None
         self._build_ui()
         self._load_settings()
         self._loading_settings = False
         self.refresh_variables(force=True)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_scene)
-        self.timer.start(33)
+        self.timer.setInterval(33)
 
     def _build_ui(self):
         self.setWindowTitle("Flight Visualization")
@@ -491,14 +502,10 @@ class FlightVisualizationWindow(QWidget):
         inputs_group = QGroupBox("Inputs")
         inputs_form = QFormLayout(inputs_group)
         for key, label, _hints in BINDINGS:
-            combo = QComboBox()
-            combo.setMinimumContentsLength(14)
-            combo.setMaximumWidth(230)
-            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-            combo.currentTextChanged.connect(combo.setToolTip)
-            combo.currentIndexChanged.connect(self._settings_changed)
-            self.binding_combos[key] = combo
-            inputs_form.addRow(label, combo)
+            selector = SignalBindingSelector()
+            selector.selectionChanged.connect(self._settings_changed)
+            self.binding_combos[key] = selector
+            inputs_form.addRow(label, selector)
         settings_layout.addWidget(inputs_group)
 
         pose_group = QGroupBox("Pose")
@@ -557,8 +564,8 @@ class FlightVisualizationWindow(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setMinimumWidth(300)
-        scroll.setMaximumWidth(380)
+        scroll.setMinimumWidth(440)
+        scroll.setMaximumWidth(540)
         scroll.setWidget(settings_widget)
 
         scene_layout = QVBoxLayout()
@@ -621,11 +628,16 @@ class FlightVisualizationWindow(QWidget):
         )
         for key, combo in self.binding_combos.items():
             self.settings.setValue(self._setting_key(f"binding/{key}"), combo.currentData() or "")
+        self._last_update_gate = None
+        self._last_scene_signature = None
+        self._invalidate_trajectory_cache()
         self.canvas.update()
 
     def _set_mode(self, mode):
         self.canvas.set_mode(mode)
         self.settings.setValue(self._setting_key("mode"), mode)
+        self._last_update_gate = None
+        self._last_scene_signature = None
 
     def _yaw_reference_changed(self, *_args):
         self._settings_changed()
@@ -645,22 +657,43 @@ class FlightVisualizationWindow(QWidget):
 
     def refresh_variables(self, force=False):
         variables = sorted(set(self.available_variables()) | set(self.data_model.vars.keys()))
-        signature = tuple(variables)
+        descriptors = dict(self.available_descriptors() or {})
+        descriptor_fields = (
+            "category",
+            "descriptor_kind",
+            "task_id",
+            "task_order",
+            "direction",
+            "slot",
+            "owner",
+            "display_name",
+            "group",
+            "group_order",
+            "node_no",
+            "section",
+        )
+        signature = (
+            tuple(variables),
+            tuple(
+                (name,)
+                + tuple(
+                    descriptors.get(name, {}).get(field)
+                    for field in descriptor_fields
+                )
+                for name in variables
+            ),
+        )
         if not force and signature == self._last_variable_signature:
             return
         self._last_variable_signature = signature
+        choices = build_signal_choices(variables, descriptors)
         selected_names = set()
         for key, _label, hints in BINDINGS:
-            combo = self.binding_combos[key]
+            selector = self.binding_combos[key]
             saved = str(self.settings.value(self._setting_key(f"binding/{key}"), ""))
-            current = combo.currentData() or saved
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItem("Not bound", "")
-            for name in variables:
-                combo.addItem(name, name)
-            selected = combo.findData(current)
-            if selected < 0 or not current:
+            current = selector.currentData() or saved
+            selected = current if current in variables else ""
+            if not selected:
                 ranked = sorted(
                     (
                         (self._binding_score(name, hints), name)
@@ -670,20 +703,30 @@ class FlightVisualizationWindow(QWidget):
                     reverse=True,
                 )
                 if ranked and ranked[0][0] >= 900:
-                    selected = combo.findData(ranked[0][1])
-            combo.setCurrentIndex(max(0, selected))
-            if combo.currentData():
-                selected_names.add(combo.currentData())
-            combo.blockSignals(False)
+                    selected = ranked[0][1]
+            selector.set_choices(choices, selected)
+            if selector.currentData():
+                selected_names.add(selector.currentData())
         self._settings_changed()
 
-    def _sample_at(self, key, timestamp_ms, default=0.0):
+    def _history_alignment_enabled(self):
+        return self.timeline.state != TimelineState.FOLLOW_LIVE
+
+    def _sample_at(
+        self,
+        key,
+        timestamp_ms,
+        default=0.0,
+        *,
+        align_history,
+    ):
         name = self.binding_combos[key].currentData()
         if not name:
             return None, float(default)
         previous, following = self.data_model.get_bracketing_samples(
             name,
             timestamp_ms,
+            align_history=align_history,
         )
         value = interpolate_sample(
             previous,
@@ -696,15 +739,21 @@ class FlightVisualizationWindow(QWidget):
             return None, float(default)
         return previous[0], value
 
-    def _current_sample(self):
+    def _current_sample(self, *, align_history=None):
         if not self.timeline.has_range:
             return None, list(key for key, _label, _hints in BINDINGS)
+        if align_history is None:
+            align_history = self._history_alignment_enabled()
         playhead_ms = self.timeline.playhead_ms
         values = {}
         timestamps = {}
         missing = []
         for key, _label, _hints in BINDINGS:
-            timestamp, value = self._sample_at(key, playhead_ms)
+            timestamp, value = self._sample_at(
+                key,
+                playhead_ms,
+                align_history=align_history,
+            )
             values[key] = value
             if timestamp is None:
                 missing.append(key)
@@ -728,7 +777,7 @@ class FlightVisualizationWindow(QWidget):
             right_actual_deg=values["right_actual"],
         ), missing
 
-    def _series_values_at(self, name, target_times):
+    def _series_values_at(self, name, target_times, *, align_history):
         if not len(target_times):
             return np.empty(0)
         timestamps, values = self.data_model.get_series_between(
@@ -737,6 +786,7 @@ class FlightVisualizationWindow(QWidget):
             float(target_times[-1]),
             before_samples=1,
             after_samples=1,
+            align_history=align_history,
         )
         if not timestamps:
             return np.full(len(target_times), np.nan)
@@ -769,20 +819,16 @@ class FlightVisualizationWindow(QWidget):
             )
         return result
 
-    def _trajectory_at(self, playhead_ms):
-        names = {
-            axis: self.binding_combos[f"position_{axis}"].currentData()
-            for axis in ("x", "y", "z")
-        }
-        if not all(names.values()):
-            return ()
-        timestamps, x_values = self.data_model.get_series_window_ending_at(
-            names["x"],
-            playhead_ms,
-            self.trail_points_spin.value(),
-        )
+    def _invalidate_trajectory_cache(self):
+        self._trajectory_cache_key = None
+        self._trajectory_cache_revisions = None
+        self._trajectory_cache = np.empty((0, 3), dtype=float)
+        self._trajectory_last_timestamp_ms = None
+        self._trajectory_last_playhead_ms = None
+
+    def _trajectory_points(self, names, timestamps, x_values, *, align_history):
         if not timestamps:
-            return ()
+            return np.empty((0, 3), dtype=float)
         times = np.asarray(timestamps, dtype=float)
         x_values = np.asarray(x_values, dtype=float)
         if self._trail_start_ms is not None:
@@ -790,26 +836,148 @@ class FlightVisualizationWindow(QWidget):
             times = times[keep]
             x_values = x_values[keep]
         if not len(times):
-            return ()
-        y_values = self._series_values_at(names["y"], times)
-        z_values = self._series_values_at(names["z"], times)
+            return np.empty((0, 3), dtype=float)
+        y_values = self._series_values_at(
+            names["y"], times, align_history=align_history
+        )
+        z_values = self._series_values_at(
+            names["z"], times, align_history=align_history
+        )
         valid = np.isfinite(x_values) & np.isfinite(y_values) & np.isfinite(z_values)
-        return tuple(
-            tuple(point)
-            for point in np.column_stack(
-                (x_values[valid], y_values[valid], z_values[valid])
-            )
+        return np.column_stack(
+            (x_values[valid], y_values[valid], z_values[valid])
         )
 
-    def update_scene(self):
+    def _trajectory_at(self, playhead_ms, *, align_history):
+        names = {
+            axis: self.binding_combos[f"position_{axis}"].currentData()
+            for axis in ("x", "y", "z")
+        }
+        if not all(names.values()):
+            self._invalidate_trajectory_cache()
+            return self._trajectory_cache
+
+        capacity = self.trail_points_spin.value()
+        ordered_names = tuple(names[axis] for axis in ("x", "y", "z"))
+        cache_key = (
+            ordered_names,
+            bool(align_history),
+            self._trail_start_ms,
+            capacity,
+            self.data_model.epoch,
+        )
+        revisions = tuple(
+            self.data_model.get_series_revision(
+                name,
+                align_history=align_history,
+            )
+            for name in ordered_names
+        )
+        can_append = (
+            self.timeline.state == TimelineState.FOLLOW_LIVE
+            and not align_history
+            and cache_key == self._trajectory_cache_key
+            and self._trajectory_last_timestamp_ms is not None
+            and self._trajectory_last_playhead_ms is not None
+            and playhead_ms >= self._trajectory_last_playhead_ms
+            and self._trajectory_cache_revisions is not None
+            and revisions[0] != self._trajectory_cache_revisions[0]
+            and revisions[1:] != self._trajectory_cache_revisions[1:]
+        )
+
+        if can_append:
+            timestamps, x_values = self.data_model.get_series_between(
+                names["x"],
+                self._trajectory_last_timestamp_ms,
+                playhead_ms,
+                align_history=False,
+            )
+            if timestamps:
+                keep = np.asarray(timestamps, dtype=float) > (
+                    self._trajectory_last_timestamp_ms + 1.0e-9
+                )
+                timestamps = np.asarray(timestamps, dtype=float)[keep].tolist()
+                x_values = np.asarray(x_values, dtype=float)[keep].tolist()
+            points = self._trajectory_points(
+                names,
+                timestamps,
+                x_values,
+                align_history=False,
+            )
+            if len(points):
+                self._trajectory_cache = np.vstack(
+                    (self._trajectory_cache, points)
+                )[-capacity:]
+            if timestamps:
+                self._trajectory_last_timestamp_ms = timestamps[-1]
+        elif (
+            cache_key != self._trajectory_cache_key
+            or revisions != self._trajectory_cache_revisions
+            or self._trajectory_last_playhead_ms != playhead_ms
+        ):
+            timestamps, x_values = self.data_model.get_series_window_ending_at(
+                names["x"],
+                playhead_ms,
+                capacity,
+                align_history=align_history,
+            )
+            self._trajectory_cache = self._trajectory_points(
+                names,
+                timestamps,
+                x_values,
+                align_history=align_history,
+            )[-capacity:]
+            self._trajectory_last_timestamp_ms = (
+                timestamps[-1] if timestamps else None
+            )
+
+        self._trajectory_cache_key = cache_key
+        self._trajectory_cache_revisions = revisions
+        self._trajectory_last_playhead_ms = playhead_ms
+        return self._trajectory_cache
+
+    def _scene_revision_signature(self, *, align_history):
+        names = tuple(
+            self.binding_combos[key].currentData()
+            for key, _label, _hints in BINDINGS
+        )
+        revisions = tuple(
+            self.data_model.get_series_revision(
+                name,
+                align_history=align_history,
+            )
+            if name
+            else None
+            for name in names
+        )
+        return names, revisions
+
+    def update_scene(self, force=False):
+        update_gate = (
+            self.data_model.revision,
+            self.timeline.state,
+            self.timeline.playhead_ms,
+            self.canvas.mode,
+            self._trail_start_ms,
+        )
+        if not force and update_gate == self._last_update_gate:
+            return
         self.refresh_variables()
         if self._owns_timeline:
-            start_ms, latest_ms = self.data_model.get_time_bounds(
-                self.available_variables()
-            )
             if self.timeline.state == TimelineState.EMPTY:
                 self.timeline.begin_live()
+            start_ms, latest_ms = self.data_model.get_time_bounds(
+                self.available_variables(),
+                align_history=self._history_alignment_enabled(),
+            )
             self.timeline.update_bounds(start_ms, latest_ms)
+        self._last_update_gate = (
+            self.data_model.revision,
+            self.timeline.state,
+            self.timeline.playhead_ms,
+            self.canvas.mode,
+            self._trail_start_ms,
+        )
         source_signature = (
             self.timeline.source_kind,
             self.timeline.start_ms,
@@ -818,25 +986,45 @@ class FlightVisualizationWindow(QWidget):
         if source_signature != self._timeline_source_signature:
             self._timeline_source_signature = source_signature
             self._trail_start_ms = None
+            self._invalidate_trajectory_cache()
 
-        sample, missing = self._current_sample()
+        align_history = self._history_alignment_enabled()
+        bound_signature = self._scene_revision_signature(
+            align_history=align_history
+        )
+        scene_signature = (
+            self.timeline.state,
+            self.timeline.playhead_ms,
+            self.canvas.mode,
+            self._trail_start_ms,
+            bound_signature,
+        )
+        if not force and scene_signature == self._last_scene_signature:
+            return
+        self._last_scene_signature = scene_signature
+
+        sample, missing = self._current_sample(align_history=align_history)
         if sample is None:
             self.canvas.sample = None
-            self.canvas.trail = ()
+            self.canvas.trail = np.empty((0, 3), dtype=float)
             self.canvas.update()
             self.status_label.setText("Waiting for inputs")
             set_semantic_state(self.status_label, "muted")
             return
         self.canvas.sample = sample
         if self.canvas.mode in ("trajectory", "combined"):
-            trail = list(self._trajectory_at(self.timeline.playhead_ms))
+            trail = self._trajectory_at(
+                self.timeline.playhead_ms,
+                align_history=align_history,
+            )
             position_keys = {"position_x", "position_y", "position_z"}
             if not position_keys.intersection(missing):
-                if not trail or not np.allclose(trail[-1], sample.position):
-                    trail.append(tuple(sample.position))
-            self.canvas.trail = tuple(trail[-self.trail_points_spin.value():])
+                if not len(trail) or not np.allclose(trail[-1], sample.position):
+                    trail = np.vstack((trail, np.asarray(sample.position, dtype=float)))
+            draw_limit = max(800, min(1200, int(self.canvas.width())))
+            self.canvas.trail = downsample_trajectory(trail, draw_limit)
         else:
-            self.canvas.trail = ()
+            self.canvas.trail = np.empty((0, 3), dtype=float)
         self.canvas.update()
         if missing:
             self.status_label.setText(f"Partial data | missing {len(missing)} inputs")
@@ -855,11 +1043,17 @@ class FlightVisualizationWindow(QWidget):
 
     def clear_trail(self):
         self._trail_start_ms = self.timeline.playhead_ms
-        self.canvas.trail = ()
+        self._invalidate_trajectory_cache()
+        self._last_update_gate = None
+        self._last_scene_signature = None
+        self.canvas.trail = np.empty((0, 3), dtype=float)
         self.canvas.update()
 
     def _trail_capacity_changed(self, capacity):
         self.settings.setValue(self._setting_key("trail_points"), int(capacity))
+        self._invalidate_trajectory_cache()
+        self._last_update_gate = None
+        self._last_scene_signature = None
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -868,3 +1062,16 @@ class FlightVisualizationWindow(QWidget):
         button = self.mode_buttons.get(mode, self.mode_buttons["combined"])
         button.setChecked(True)
         self.refresh_variables(force=True)
+        self._last_update_gate = None
+        self._last_scene_signature = None
+        self.update_scene(force=True)
+        if not self.timer.isActive():
+            self.timer.start()
+
+    def hideEvent(self, event):
+        self.timer.stop()
+        super().hideEvent(event)
+
+    def closeEvent(self, event):
+        self.timer.stop()
+        event.accept()

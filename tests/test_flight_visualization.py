@@ -13,6 +13,7 @@ from data_model import DataModel
 from flight_visualization import (
     aligned_pose,
     axis_rotation,
+    downsample_trajectory,
     euler_rotation,
     interpolate_sample,
     wing_vertices,
@@ -94,6 +95,21 @@ class FlightGeometryTest(unittest.TestCase):
         )
         self.assertAlmostEqual(value, 180.0)
 
+    def test_trajectory_downsampling_preserves_endpoints_and_budget(self):
+        points = np.column_stack(
+            (
+                np.arange(3000, dtype=float),
+                np.arange(3000, dtype=float) * 2.0,
+                np.arange(3000, dtype=float) * -1.0,
+            )
+        )
+
+        sampled = downsample_trajectory(points, 1000)
+
+        self.assertEqual(sampled.shape, (1000, 3))
+        np.testing.assert_array_equal(sampled[0], points[0])
+        np.testing.assert_array_equal(sampled[-1], points[-1])
+
 
 class FlightVisualizationWindowTest(unittest.TestCase):
     @classmethod
@@ -141,6 +157,64 @@ class FlightVisualizationWindowTest(unittest.TestCase):
         self.assertEqual(len(self.window.canvas.trail), 2)
         self.assertEqual(self.window.canvas.sample.left_actual_deg, 14.0)
         self.assertEqual(self.window.canvas.sample.right_command_deg, -12.0)
+
+    def test_unchanged_scene_does_not_query_samples_again(self):
+        self.window.update_scene()
+        calls = 0
+        refresh_calls = 0
+        original = self.window._current_sample
+        original_refresh = self.window.refresh_variables
+
+        def recording_sample(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
+
+        def recording_refresh(*args, **kwargs):
+            nonlocal refresh_calls
+            refresh_calls += 1
+            return original_refresh(*args, **kwargs)
+
+        self.window._current_sample = recording_sample
+        self.window.refresh_variables = recording_refresh
+        self.window.update_scene()
+
+        self.assertEqual(calls, 0)
+        self.assertEqual(refresh_calls, 0)
+
+    def test_live_trajectory_appends_without_rebuilding_history(self):
+        self.window.update_scene()
+        self.assertEqual(len(self.window._trajectory_cache), 2)
+
+        for index, (name, value) in enumerate(VARIABLES.items()):
+            self.model.add_data(
+                f"source-{index}",
+                1020.0,
+                1020.0,
+                {name: value + 1.0},
+            )
+
+        original = self.model.get_series_window_ending_at
+        self.model.get_series_window_ending_at = lambda *_args, **_kwargs: self.fail(
+            "Live trajectory updates must append instead of rebuilding history"
+        )
+        try:
+            self.window.update_scene()
+        finally:
+            self.model.get_series_window_ending_at = original
+
+        self.assertEqual(len(self.window._trajectory_cache), 3)
+
+    def test_timer_runs_only_while_window_is_visible(self):
+        self.assertFalse(self.window.timer.isActive())
+
+        self.window.show()
+        self.app.processEvents()
+        self.assertTrue(self.window.timer.isActive())
+
+        self.window.hide()
+        self.app.processEvents()
+        self.assertFalse(self.window.timer.isActive())
 
     def test_shared_timeline_selects_historical_interpolated_sample(self):
         timeline = TimelineController()

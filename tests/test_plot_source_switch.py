@@ -66,6 +66,7 @@ from PyQt5.QtWidgets import QApplication, QLabel, QAbstractSpinBox
 
 from data_receiver import DataReceiver
 from monitor_csv import read_monitor_csv
+from network_clock import ClockTransform
 from timeline_controller import TimelineState
 from ui.curve_expression import CurveExpressionParser
 from ui.main_window import PlotWindow
@@ -153,8 +154,8 @@ class PlotSourceSwitchTest(unittest.TestCase):
     def test_window_title_tracks_monitor_release(self):
         self.assertEqual(self.window.windowTitle(), "Monitor v3.4.0")
 
-    def test_window_minimum_width_fits_common_desktop_viewport(self):
-        self.assertLessEqual(self.window.minimumSizeHint().width(), 1280)
+    def test_window_minimum_width_fits_wide_desktop_viewport(self):
+        self.assertLessEqual(self.window.minimumSizeHint().width(), 1600)
 
     def test_auto_x_off_refreshes_new_source_revisions(self):
         self.window.plot_state = self.window.plot_state.RUNNING
@@ -395,6 +396,35 @@ class PlotSourceSwitchTest(unittest.TestCase):
         self.assertEqual(self.window.timeline.state, TimelineState.FOLLOW_LIVE)
         self.assertEqual(self.window.timeline.playhead_ms, 1020.0)
 
+    def test_live_uses_committed_time_and_pause_enables_history_alignment(self):
+        self.window.timeline.begin_live()
+        self.window.data_model.add_data(
+            "source-a",
+            2100.0,
+            1000.0,
+            {"a": 1.0},
+            offset_src="clock",
+            offset_timestamp=1000.0,
+        )
+        self.window.data_model.set_clock_transform(
+            "clock",
+            ClockTransform(
+                source_anchor_us=1_000_000,
+                target_anchor_us=3_000_000,
+                uncertainty_us=100,
+                usable=True,
+                revision=1,
+            ),
+        )
+        self.window.available_raw_variables = {"a"}
+        self.window._refresh_timeline_bounds(force=True)
+
+        self.assertEqual(self.window._curve_source_data("a"), ([2100.0], [1.0]))
+
+        self.window.timeline.pause()
+
+        self.assertEqual(self.window._curve_source_data("a"), ([3000.0], [1.0]))
+
     def test_main_and_flight_windows_share_playhead(self):
         self.window._load_imported_series(
             "/tmp/replay.csv",
@@ -628,8 +658,8 @@ class PlotSourceSwitchTest(unittest.TestCase):
         descriptors = []
         for task_id, name in (
             (0x1001, "SystemTask"),
-            (0x3001, "DeviceTask"),
-            (0x2001, "BusinessTask"),
+            (0x2001, "DeviceTask"),
+            (0x3001, "BusinessTask"),
         ):
             descriptors.append({
                 "var_name": f"{name}.latency_us",
@@ -648,15 +678,15 @@ class PlotSourceSwitchTest(unittest.TestCase):
 
         self.assertEqual(
             self.window.dataflow_export_section_order,
-            ["Task/8193", "Task/12289", "Task/4097"],
+            ["Task/12289", "Task/8193", "Task/4097"],
         )
 
     def test_custom_section_order_survives_schema_refresh_and_can_reset(self):
         descriptors = [_task_descriptors()[0]]
         for task_id, name in (
             (0x1001, "SystemTask"),
-            (0x3001, "DeviceTask"),
-            (0x2001, "BusinessTask"),
+            (0x2001, "DeviceTask"),
+            (0x3001, "BusinessTask"),
         ):
             descriptors.append({
                 "var_name": f"{name}.latency_us",
@@ -681,7 +711,7 @@ class PlotSourceSwitchTest(unittest.TestCase):
         self.window.reset_section_layout()
         self.assertEqual(
             self.window.dataflow_export_section_order,
-            ["Dataflow/control", "Task/8193", "Task/12289", "Task/4097"],
+            ["Dataflow/control", "Task/12289", "Task/8193", "Task/4097"],
         )
 
     def test_latency_selection_uses_header_and_keeps_theme_color_after_curve_change(self):

@@ -124,22 +124,22 @@ class TaskVariableGroupTest(unittest.TestCase):
         self.assertEqual(selected, ["MadgwickTask.input.roll"])
 
     def test_task_display_order_is_business_device_system(self):
-        task_ids = [0x1001, 0x3001, 0x2001]
+        task_ids = [0x1001, 0x2001, 0x3001]
         self.assertEqual(
             sorted(task_ids, key=task_display_order),
-            [0x2001, 0x3001, 0x1001],
+            [0x3001, 0x2001, 0x1001],
         )
-        self.assertEqual(task_section_kind(0x2001), "business")
-        self.assertEqual(task_section_kind(0x3001), "device")
+        self.assertEqual(task_section_kind(0x2001), "device")
+        self.assertEqual(task_section_kind(0x3001), "business")
         self.assertEqual(task_section_kind(0x1001), "system")
 
     def test_task_group_exposes_category_for_theme_accent(self):
         self.assertEqual(
-            TaskVariableGroup(0x2001, "BusinessTask", "latency").property("sectionKind"),
+            TaskVariableGroup(0x3001, "BusinessTask", "latency").property("sectionKind"),
             "business",
         )
         self.assertEqual(
-            TaskVariableGroup(0x3001, "DeviceTask", "latency").property("sectionKind"),
+            TaskVariableGroup(0x2001, "DeviceTask", "latency").property("sectionKind"),
             "device",
         )
         self.assertEqual(

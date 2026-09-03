@@ -17,8 +17,8 @@ from ui.theme import PANEL_BG_HEX, TEXT_HEX, set_section_kind
 def task_section_kind(task_id):
     category_base = int(task_id) & 0xF000
     return {
-        0x2000: "business",
-        0x3000: "device",
+        0x2000: "device",
+        0x3000: "business",
         0x1000: "system",
     }.get(category_base, "")
 

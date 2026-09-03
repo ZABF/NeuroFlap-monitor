@@ -34,6 +34,16 @@ def interpolate_sample(
     return float(previous_value) + delta * ratio
 
 
+def downsample_trajectory(points, max_points):
+    """Uniformly bound a trajectory while preserving both endpoints."""
+    points = np.asarray(points, dtype=float)
+    max_points = max(2, int(max_points))
+    if len(points) <= max_points:
+        return points
+    indexes = np.linspace(0, len(points) - 1, max_points, dtype=np.int64)
+    return points[indexes]
+
+
 def axis_rotation(axis, angle_deg):
     angle = math.radians(float(angle_deg))
     sine = math.sin(angle)

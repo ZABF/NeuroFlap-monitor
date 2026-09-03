@@ -91,6 +91,91 @@ class DataModelTest(unittest.TestCase):
         self.assertAlmostEqual(timestamps[1], 3000.1, places=6)
         self.assertEqual(values, [1.0, 2.0])
 
+    def test_live_query_keeps_committed_timestamps_after_alignment_changes(self):
+        model = DataModel([])
+        model.add_data(
+            "source",
+            2100.0,
+            1000.0,
+            {"value": 1.0},
+            offset_src="clock",
+            offset_timestamp=1000.0,
+        )
+
+        model.set_clock_transform(
+            "clock",
+            ClockTransform(
+                source_anchor_us=1_000_000,
+                target_anchor_us=3_000_000,
+                uncertainty_us=100,
+                usable=True,
+                revision=1,
+            ),
+        )
+
+        self.assertEqual(
+            model.get_series("value", align_history=False),
+            ([2100.0], [1.0]),
+        )
+        self.assertEqual(
+            model.get_series("value", align_history=True),
+            ([3000.0], [1.0]),
+        )
+
+    def test_aligned_range_maps_only_samples_in_requested_window(self):
+        model = DataModel([])
+        timestamps = [float(index) for index in range(1000)]
+        model.add_series("value", "source", timestamps, timestamps)
+        model.set_clock_transform(
+            "source",
+            ClockTransform(
+                source_anchor_us=0,
+                target_anchor_us=0,
+                drift_ppb=100_000,
+                uncertainty_us=100,
+                usable=True,
+                revision=1,
+            ),
+        )
+
+        map_calls = 0
+        original_map = model._map_timestamp
+
+        def recording_map(*args, **kwargs):
+            nonlocal map_calls
+            map_calls += 1
+            return original_map(*args, **kwargs)
+
+        model._map_timestamp = recording_map
+        result_timestamps, values = model.get_series_between(
+            "value",
+            400.0,
+            410.0,
+            align_history=True,
+        )
+
+        self.assertEqual(len(result_timestamps), len(values))
+        self.assertGreaterEqual(len(result_timestamps), 10)
+        self.assertLess(map_calls, 30)
+
+    def test_time_bounds_maps_only_source_endpoints(self):
+        model = DataModel([])
+        timestamps = [float(index) for index in range(1000)]
+        model.add_series("a", "source-a", timestamps, timestamps)
+        model.add_series("b", "source-b", timestamps, timestamps)
+
+        map_calls = 0
+        original_map = model._map_timestamp
+
+        def recording_map(*args, **kwargs):
+            nonlocal map_calls
+            map_calls += 1
+            return original_map(*args, **kwargs)
+
+        model._map_timestamp = recording_map
+        self.assertEqual(model.get_time_bounds(), (0.0, 999.0))
+        self.assertEqual(map_calls, 4)
+
     def test_forward_data_gap_does_not_create_a_new_clock_epoch(self):
         model = DataModel([])
         model.begin_clock_epoch("clock", 3)

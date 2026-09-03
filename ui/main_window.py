@@ -102,6 +102,7 @@ class PlotWindow(QWidget):
         self.timeline = TimelineController(parent=self)
         self._timeline_data_revision = -1
         self._timeline_playhead_ms = None
+        self._history_alignment_active = True
         self._updating_playhead_line = False
         saved_section_order = (
             self._layout_settings.value(self.SECTION_ORDER_SETTINGS_KEY, [])
@@ -559,15 +560,9 @@ class PlotWindow(QWidget):
         control_layout.addWidget(self.open_flight_visualization_btn)
         control_layout.addWidget(self.open_capture_btn)
 
-        selected_plot_layout = QVBoxLayout()
+        selected_plot_layout = QHBoxLayout()
         selected_plot_layout.setContentsMargins(0, 0, 0, 0)
-        selected_plot_layout.setSpacing(3)
-        selected_plot_identity_layout = QHBoxLayout()
-        selected_plot_identity_layout.setContentsMargins(0, 0, 0, 0)
-        selected_plot_identity_layout.setSpacing(6)
-        selected_plot_transform_layout = QHBoxLayout()
-        selected_plot_transform_layout.setContentsMargins(0, 0, 0, 0)
-        selected_plot_transform_layout.setSpacing(6)
+        selected_plot_layout.setSpacing(6)
         self.selected_plot_label = QLabel("Selected plot:")
         selected_plot_font = self.selected_plot_label.font()
         selected_plot_font.setBold(True)
@@ -637,29 +632,24 @@ class PlotWindow(QWidget):
         self.selected_reset_btn.setFocusPolicy(Qt.NoFocus)
         self.selected_reset_btn.clicked.connect(self.reset_selected_transform)
 
-        selected_plot_identity_layout.addWidget(self.selected_plot_label)
-        selected_plot_identity_layout.addWidget(self.selected_plot_value)
-        selected_plot_identity_layout.addWidget(self.selected_plot_error)
-        selected_plot_identity_layout.addWidget(self.selected_visible_check)
-        selected_plot_identity_layout.addWidget(self.selected_derived_btn)
-        selected_plot_identity_layout.addWidget(self.selected_derived_edit_btn)
-        selected_plot_identity_layout.addWidget(self.selected_derived_delete_btn)
-        selected_plot_identity_layout.addWidget(self.selected_coord_value)
-        selected_plot_identity_layout.addStretch()
-
-        selected_plot_transform_layout.addWidget(QLabel("color:"))
-        selected_plot_transform_layout.addWidget(self.selected_color_btn)
-        selected_plot_transform_layout.addWidget(QLabel("phase:"))
-        selected_plot_transform_layout.addWidget(self.selected_phase_spin)
-        selected_plot_transform_layout.addWidget(QLabel("offset:"))
-        selected_plot_transform_layout.addWidget(self.selected_offset_spin)
-        selected_plot_transform_layout.addWidget(QLabel("scale:"))
-        selected_plot_transform_layout.addWidget(self.selected_scale_spin)
-        selected_plot_transform_layout.addWidget(self.selected_reset_btn)
-        selected_plot_transform_layout.addStretch()
-
-        selected_plot_layout.addLayout(selected_plot_identity_layout)
-        selected_plot_layout.addLayout(selected_plot_transform_layout)
+        selected_plot_layout.addWidget(self.selected_plot_label)
+        selected_plot_layout.addWidget(self.selected_plot_value)
+        selected_plot_layout.addWidget(self.selected_plot_error)
+        selected_plot_layout.addWidget(self.selected_visible_check)
+        selected_plot_layout.addWidget(self.selected_derived_btn)
+        selected_plot_layout.addWidget(self.selected_derived_edit_btn)
+        selected_plot_layout.addWidget(self.selected_derived_delete_btn)
+        selected_plot_layout.addWidget(self.selected_coord_value)
+        selected_plot_layout.addWidget(QLabel("color:"))
+        selected_plot_layout.addWidget(self.selected_color_btn)
+        selected_plot_layout.addWidget(QLabel("phase:"))
+        selected_plot_layout.addWidget(self.selected_phase_spin)
+        selected_plot_layout.addWidget(QLabel("offset:"))
+        selected_plot_layout.addWidget(self.selected_offset_spin)
+        selected_plot_layout.addWidget(QLabel("scale:"))
+        selected_plot_layout.addWidget(self.selected_scale_spin)
+        selected_plot_layout.addWidget(self.selected_reset_btn)
+        selected_plot_layout.addStretch()
         self._update_selected_controls()
 
         hline_1 = QFrame()
@@ -1545,6 +1535,7 @@ class PlotWindow(QWidget):
             self.flight_visualization_window = FlightVisualizationWindow(
                 self.data_model,
                 available_variables=lambda: self.available_raw_variables,
+                available_descriptors=lambda: self.dynamic_signal_descriptors,
                 timeline=self.timeline,
                 parent=self,
             )
@@ -1558,8 +1549,14 @@ class PlotWindow(QWidget):
             return
         self._timeline_data_revision = revision
         names = self.available_raw_variables or self.data_model.vars.keys()
-        start_ms, latest_ms = self.data_model.get_time_bounds(names)
+        start_ms, latest_ms = self.data_model.get_time_bounds(
+            names,
+            align_history=self._history_alignment_enabled(),
+        )
         self.timeline.update_bounds(start_ms, latest_ms)
+
+    def _history_alignment_enabled(self):
+        return self.timeline.state != TimelineState.FOLLOW_LIVE
 
     def _playhead_line_changed(self):
         if self._updating_playhead_line or not self.timeline.has_range:
@@ -1582,6 +1579,12 @@ class PlotWindow(QWidget):
     def _timeline_changed(self):
         has_range = self.timeline.has_range
         playhead = self.timeline.playhead_ms
+        history_alignment = self._history_alignment_enabled()
+        alignment_changed = history_alignment != self._history_alignment_active
+        if alignment_changed:
+            self._history_alignment_active = history_alignment
+            self._timeline_data_revision = -1
+            self._invalidate_curve_render_state()
         self.now_line.setMovable(
             has_range and self.timeline.state != TimelineState.FOLLOW_LIVE
         )
@@ -1612,7 +1615,7 @@ class PlotWindow(QWidget):
                 self.toggle_reception_btn.setText("Play")
             set_semantic_state(self.toggle_reception_btn, "warning")
 
-        if playhead == self._timeline_playhead_ms:
+        if playhead == self._timeline_playhead_ms and not alignment_changed:
             return
         self._timeline_playhead_ms = playhead
         if not getattr(self.now_line, "moving", False):
@@ -1804,7 +1807,14 @@ class PlotWindow(QWidget):
         transform = self._curve_transform_signature(var_name)
         spec = self.curve_specs.get(var_name)
         if not spec or spec.get("kind") != "expr":
-            return ("raw", self.data_model.get_series_revision(var_name), transform)
+            return (
+                "raw",
+                self.data_model.get_series_revision(
+                    var_name,
+                    align_history=self._history_alignment_enabled(),
+                ),
+                transform,
+            )
         refs = sorted(expression_refs(spec.get("ast")))
         return (
             "expr",
@@ -1917,8 +1927,13 @@ class PlotWindow(QWidget):
                 range_end,
                 before_samples=2,
                 after_samples=2,
+                align_history=self._history_alignment_enabled(),
             )
-        return self.data_model.get_series(var_name, None)
+        return self.data_model.get_series(
+            var_name,
+            None,
+            align_history=self._history_alignment_enabled(),
+        )
 
     @staticmethod
     def _series_value(ts, vs):
@@ -3289,6 +3304,7 @@ class PlotWindow(QWidget):
             sample = self.data_model.get_nearest_sample(
                 var_name,
                 float(x_value) - phase_ms,
+                align_history=self._history_alignment_enabled(),
             )
             if sample is not None:
                 timestamp, value = sample
