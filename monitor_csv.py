@@ -319,7 +319,7 @@ def read_monitor_csv(path):
         reader = csv.reader(fp)
         headers = None
         for row in reader:
-            if not row:
+            if not row or not any(cell.strip() for cell in row):
                 continue
             tag = row[0].strip()
             if not tag.startswith("#"):

@@ -29,6 +29,27 @@ class CurveExpressionClipTest(unittest.TestCase):
 
         self.assertEqual(expression_validation_errors(ast), ["clip() expects 2 or 3 arguments"])
 
+    def test_validation_accepts_derived_filters(self):
+        for expression in (
+            "moving_average([AttRoll], 100)",
+            "moving_median([AttRoll], 100)",
+            "hampel([AttRoll], 100, 3)",
+        ):
+            with self.subTest(expression=expression):
+                ast = CurveExpressionParser(expression).parse()
+                self.assertEqual(expression_validation_errors(ast), [])
+
+    def test_validation_rejects_wrong_filter_arity(self):
+        cases = (
+            ("moving_average([AttRoll])", "moving_average() expects 2 arguments"),
+            ("moving_median([AttRoll])", "moving_median() expects 2 arguments"),
+            ("hampel([AttRoll], 100)", "hampel() expects 3 arguments"),
+        )
+        for expression, expected_error in cases:
+            with self.subTest(expression=expression):
+                ast = CurveExpressionParser(expression).parse()
+                self.assertEqual(expression_validation_errors(ast), [expected_error])
+
     def test_symmetric_bounds_use_absolute_limit(self):
         self.assertEqual(resolve_clip_bounds(20), (-20.0, 20.0))
         self.assertEqual(resolve_clip_bounds(-20), (-20.0, 20.0))

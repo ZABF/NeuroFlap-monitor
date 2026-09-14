@@ -48,7 +48,12 @@ from ui.curve_expression import (
     resolve_clip_bounds,
 )
 from ui.curve_state import ActiveDataSource, expression_refs, resolve_derived_health
-from ui.curve_data_engine import min_max_downsample
+from ui.curve_data_engine import (
+    hampel_filter,
+    min_max_downsample,
+    moving_average,
+    moving_median,
+)
 
 '''
 CURRENT STATE  |    start           stop            clear
@@ -97,7 +102,7 @@ class PlotWindow(QWidget):
 
     def __init__(self, persist_layout=True):
         super().__init__()
-        self.setWindowTitle("Monitor v3.4.0")
+        self.setWindowTitle("Monitor v3.4.1")
         self._layout_settings = QSettings("NeuroFlap", "Monitor") if persist_layout else None
         self.timeline = TimelineController(parent=self)
         self._timeline_data_revision = -1
@@ -1877,7 +1882,14 @@ class PlotWindow(QWidget):
         args = node[2]
         nested = max((self._expr_context_ms(arg, stack) for arg in args), default=0.0)
         window_arg = None
-        if name in ("smooth", "sg", "joint_tau") and len(args) > 1:
+        if name in (
+            "smooth",
+            "moving_average",
+            "moving_median",
+            "hampel",
+            "sg",
+            "joint_tau",
+        ) and len(args) > 1:
             window_arg = args[1]
         if window_arg is not None:
             try:
@@ -1984,45 +1996,7 @@ class PlotWindow(QWidget):
 
     @staticmethod
     def _smooth_curve_data(ts, vs, window_ms):
-        count = min(len(ts), len(vs))
-        if count == 0:
-            return [], []
-        window_ms = max(float(window_ms), 0.0)
-        if window_ms <= 0.0:
-            return list(ts)[:count], list(vs)[:count]
-
-        times = []
-        values = []
-        for i in range(count):
-            try:
-                t = float(ts[i])
-                v = float(vs[i])
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(t) and math.isfinite(v):
-                times.append(t)
-                values.append(v)
-
-        out_ts = []
-        out_vs = []
-        left = 0
-        right = 0
-        running_sum = 0.0
-        half_window = window_ms * 0.5
-        for i, t in enumerate(times):
-            while right < len(times) and times[right] <= t + half_window:
-                running_sum += values[right]
-                right += 1
-            while left < right and times[left] < t - half_window:
-                running_sum -= values[left]
-                left += 1
-            sample_count = right - left
-            if sample_count <= 0:
-                continue
-            out_ts.append(t)
-            out_vs.append(running_sum / sample_count)
-
-        return out_ts, out_vs
+        return moving_average(ts, vs, window_ms)
 
     @staticmethod
     def _savgol_curve_data(ts, vs, window_ms, order=3, derivative=0):
@@ -2334,6 +2308,39 @@ class PlotWindow(QWidget):
                 if not self._is_series_value(value) or not self._is_scalar_value(window):
                     return self._series_value([], [])
                 ts, vs = self._smooth_curve_data(value.get("ts", []), value.get("vs", []), window["value"])
+                return self._series_value(ts, vs)
+            if name in ("moving_average", "moving_median"):
+                if len(args) != 2:
+                    return self._series_value([], [])
+                value = self._eval_curve_expr(args[0], eval_stack, range_start, range_end)
+                window = self._eval_curve_expr(args[1], eval_stack, range_start, range_end)
+                if not self._is_series_value(value) or not self._is_scalar_value(window):
+                    return self._series_value([], [])
+                filter_fn = moving_average if name == "moving_average" else moving_median
+                ts, vs = filter_fn(
+                    value.get("ts", []),
+                    value.get("vs", []),
+                    window["value"],
+                )
+                return self._series_value(ts, vs)
+            if name == "hampel":
+                if len(args) != 3:
+                    return self._series_value([], [])
+                value = self._eval_curve_expr(args[0], eval_stack, range_start, range_end)
+                window = self._eval_curve_expr(args[1], eval_stack, range_start, range_end)
+                sigma = self._eval_curve_expr(args[2], eval_stack, range_start, range_end)
+                if (
+                    not self._is_series_value(value) or
+                    not self._is_scalar_value(window) or
+                    not self._is_scalar_value(sigma)
+                ):
+                    return self._series_value([], [])
+                ts, vs = hampel_filter(
+                    value.get("ts", []),
+                    value.get("vs", []),
+                    window["value"],
+                    sigma["value"],
+                )
                 return self._series_value(ts, vs)
             if name == "sg":
                 if len(args) != 4:
@@ -2727,6 +2734,8 @@ class PlotWindow(QWidget):
             return f"d_{ast[2][0][1]}"
         if ast[0] == "call" and ast[1].lower() in ("smooth", "soomth") and len(ast[2]) >= 1 and ast[2][0][0] == "ref":
             return f"smooth_{ast[2][0][1]}"
+        if ast[0] == "call" and ast[1].lower() in ("moving_average", "moving_median", "hampel") and len(ast[2]) >= 1 and ast[2][0][0] == "ref":
+            return f"{ast[1].lower()}_{ast[2][0][1]}"
         if ast[0] == "call" and ast[1].lower() == "sg" and len(ast[2]) >= 1 and ast[2][0][0] == "ref":
             suffix = "sg"
             if len(ast[2]) >= 4 and ast[2][3][0] == "num":
@@ -2856,6 +2865,9 @@ class PlotWindow(QWidget):
         insert_variable_btn = QPushButton("Insert")
         d_btn = QPushButton("d()")
         smooth_btn = QPushButton("smooth()")
+        moving_average_btn = QPushButton("moving_average()")
+        moving_median_btn = QPushButton("moving_median()")
+        hampel_btn = QPushButton("hampel()")
         sg0_btn = QPushButton("sg0()")
         sg1_btn = QPushButton("sg1()")
         sg2_btn = QPushButton("sg2()")
@@ -2883,6 +2895,24 @@ class PlotWindow(QWidget):
         smooth_btn.clicked.connect(
             lambda: (
                 self._insert_expr_wrapped(expr_edit, "smooth({}, 100)", current_variable_ref() or selected_ref),
+                None if editing else name_edit.setText(self._derive_name_from_expr(expr_edit.text()))
+            )
+        )
+        moving_average_btn.clicked.connect(
+            lambda: (
+                self._insert_expr_wrapped(expr_edit, "moving_average({}, 100)", current_variable_ref() or selected_ref),
+                None if editing else name_edit.setText(self._derive_name_from_expr(expr_edit.text()))
+            )
+        )
+        moving_median_btn.clicked.connect(
+            lambda: (
+                self._insert_expr_wrapped(expr_edit, "moving_median({}, 100)", current_variable_ref() or selected_ref),
+                None if editing else name_edit.setText(self._derive_name_from_expr(expr_edit.text()))
+            )
+        )
+        hampel_btn.clicked.connect(
+            lambda: (
+                self._insert_expr_wrapped(expr_edit, "hampel({}, 100, 3)", current_variable_ref() or selected_ref),
                 None if editing else name_edit.setText(self._derive_name_from_expr(expr_edit.text()))
             )
         )
@@ -2939,6 +2969,9 @@ class PlotWindow(QWidget):
         function_layout.addWidget(QLabel("Functions:"))
         function_layout.addWidget(d_btn)
         function_layout.addWidget(smooth_btn)
+        function_layout.addWidget(moving_average_btn)
+        function_layout.addWidget(moving_median_btn)
+        function_layout.addWidget(hampel_btn)
         function_layout.addWidget(sg0_btn)
         function_layout.addWidget(sg1_btn)
         function_layout.addWidget(sg2_btn)

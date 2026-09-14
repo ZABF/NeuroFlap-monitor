@@ -134,6 +134,18 @@ class MonitorCsvTest(unittest.TestCase):
         self.assertEqual(document.series["pitch"]["timestamps"], [10.0])
         self.assertEqual(document.series["roll"]["values"], [-2.0])
 
+    def test_v3_reader_skips_comma_padded_empty_separator_row(self):
+        with open(self.path, "w", newline="", encoding="utf-8") as fp:
+            writer = csv.writer(fp)
+            writer.writerow(["#NFMonitorCSV", "3"])
+            writer.writerow(["#meta", "time_unit", "us"])
+            writer.writerow(["", "", "", ""])
+            writer.writerow(["pitch_time_us", "pitch_value"])
+            writer.writerow(["0", "1.5"])
+
+        document = read_monitor_csv(self.path)
+        self.assertEqual(document.series["pitch"]["values"], [1.5])
+
     def test_duplicate_variable_names_are_rejected(self):
         item = {"name": "pitch", "timestamps": [0.0], "values": [1.0]}
         with self.assertRaisesRegex(ValueError, "Duplicate CSV variable name"):

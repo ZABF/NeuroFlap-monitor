@@ -152,7 +152,7 @@ class PlotSourceSwitchTest(unittest.TestCase):
         DataReceiver.start = self.original_start
 
     def test_window_title_tracks_monitor_release(self):
-        self.assertEqual(self.window.windowTitle(), "Monitor v3.4.0")
+        self.assertEqual(self.window.windowTitle(), "Monitor v3.4.1")
 
     def test_window_minimum_width_fits_wide_desktop_viewport(self):
         self.assertLessEqual(self.window.minimumSizeHint().width(), 1600)
