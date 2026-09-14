@@ -1,4 +1,4 @@
-# NFv3 TaskIO/DataNode Export Protocol
+# NFv3 TaskIO/Function Output Export Protocol
 
 NFv3 is the little-endian UDP protocol between NeuroFlap firmware and Monitor. The current compact NFv3 layout is incompatible with the former flat `endpoint_no` NFv3 layout.
 
@@ -30,10 +30,11 @@ Header `<HBBIIQHH>` (24 bytes):
 
 ```text
 magic, version, type, schema_generation, packet_seq,
-packet_time_us, task_frame_count, node_frame_count
+packet_time_us, task_frame_count, reserved_frame_count
 ```
 
-All TaskFrames follow the header, then all DataNodeFrames.
+All TaskFrames follow the header. Functions also use TaskFrames; there is no separate
+FunctionOutputFrame wire type. `reserved_frame_count` must be zero.
 
 ### TaskFrame
 
@@ -45,7 +46,7 @@ task_id, flags, input_age_us, output_age_us
 
 Flags:
 
-- bit 0: business enabled
+- bit 0: executable enabled
 - bit 1: inputs valid
 - bit 2: outputs valid
 - bits 3..7: snapshot contention count, saturated at 31
@@ -77,15 +78,23 @@ Frame size:
 
 A port with `timestamp_group == 0xFF` uses the task-level input/output age. Other values index the corresponding custom-age array.
 
-### DataNodeFrame
+### Function output
 
-`<HBII>` (11 bytes):
+A Function is represented by a Task entry with `category=function`:
 
-```text
-node_no, status, publish_age_us, raw
-```
+- `input_count` is zero;
+- `output_count` is the number of Function outputs;
+- outputs are described by TaskPort entries;
+- `input_age_us` is the invocation start age and `output_age_us` is the invocation
+  finish age;
+- all outputs use the task-level finish age, so outputs from one invocation share a
+  timestamp;
+- execution duration is `(packet_time_us - output_age_us) -
+  (packet_time_us - input_age_us)`.
 
-Status values: `0 Uninitialized`, `1 Valid`, `2 Stale`, `3 Error`, `4 Stopped`.
+The outputs are read from one atomic execution snapshot. The Function persistence key
+is not the wire entity ID; the exporter assigns a temporary ID within each schema
+generation.
 
 For every valid age:
 
@@ -112,6 +121,7 @@ Each entry starts with `<BH>`: `entry_kind, payload_len`.
 
 ```text
 task_id u16
+category u8
 input_count u8
 output_count u8
 input_timestamp_group_count u8
@@ -119,6 +129,10 @@ output_timestamp_group_count u8
 name_len u8
 name bytes
 ```
+
+Category values are `0 unknown`, `1 system`, `2 business`, `3 device`, and
+`4 function`. A Monitor must use this field instead of inferring a category from the
+numeric task ID. An old entry without this field may be treated as `unknown`.
 
 ### TaskPort entry, kind 2
 
@@ -136,29 +150,13 @@ unit bytes
 
 The runtime TaskPort key is `(task_id, direction, slot)`.
 
-### DataNode entry, kind 3
-
-```text
-node_no u16
-node_id u16
-scalar_type u8
-group_len u8
-name_len u8
-unit_len u8
-group bytes
-name bytes
-unit bytes
-```
-
-`node_no` is compact and generation-local. `node_id` is the logical stable ID.
-
 Scalar types: `0 Unknown`, `1 Bool`, `2 U8`, `3 U16`, `4 U32`, `5 I32`, `6 F32`.
 
 ## Session flow
 
 1. Send `CONNECT_REQ`; wait for `CONNECT_ACK` or handle `BUSY_ACK`.
 2. Send `SCHEMA_REQ`; collect every chunk for one generation and validate `total_entries`.
-3. Install Task, TaskPort, and DataNode schema.
+3. Install Task and TaskPort schema.
 4. Decode only DATA with the installed generation.
 5. Send `LINK_PING` every 2 seconds; treat 6 seconds without a pong as disconnected.
 6. Drop DATA with an unknown generation and request schema again.

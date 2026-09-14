@@ -3496,20 +3496,24 @@ class PlotWindow(QWidget):
     def _get_or_create_task_export_section(self, desc):
         section = desc["section"]
         task_id = int(desc["task_id"])
+        category = str(desc.get("category") or "unknown").lower()
         task_name = str(desc.get("owner") or f"Task{task_id}")
         latency_var_name = self.task_latency_vars.get(task_id, f"{task_name}.latency_us")
         info = self.dataflow_export_sections.get(section)
         if info is not None:
             info["order"] = int(desc.get("task_order", task_id))
+            info["category"] = category
+            set_section_kind(info["box"], category)
+            info["box"].category = category
             info["box"].set_identity(task_name, latency_var_name)
             return info
 
-        box = TaskVariableGroup(task_id, task_name, latency_var_name)
+        box = TaskVariableGroup(task_id, task_name, latency_var_name, category)
         box.latency_selected.connect(self.select_curve)
         info = {
             "box": box,
             "items": [],
-            "category": "task",
+            "category": category,
             "order": int(desc.get("task_order", task_id)),
             "task_id": task_id,
         }
@@ -3529,15 +3533,25 @@ class PlotWindow(QWidget):
     def _relayout_dataflow_export_sections(self):
         if self.dataflow_export_grid is None:
             return
-        category_order = {"derived": 0, "dataflow": 1, "task": 2}
+        category_order = {
+            "derived": 0,
+            "dataflow": 1,
+            "business": 2,
+            "device": 3,
+            "system": 4,
+            "function": 5,
+            "unknown": 6,
+        }
 
         def section_sort_key(section):
             info = self.dataflow_export_sections[section]
             category = info.get("category")
-            if category == "task":
+            if category in {"business", "device", "system", "function", "unknown"}:
                 task_id = int(info.get("task_id", 0xFFFF))
-                task_category, task_order = task_display_order(task_id)
-                return (category_order["task"], task_category, task_order, section)
+                task_category, task_order = task_display_order(
+                    task_id, category
+                )
+                return (category_order.get(category, 6), task_category, task_order, section)
             return (
                 category_order.get(category, 1),
                 int(info.get("order", 0)),
@@ -3583,7 +3597,9 @@ class PlotWindow(QWidget):
         info = self.dataflow_export_sections.get(section_name)
         if not info:
             return
-        if info.get("category") == "task":
+        if info.get("category") in {
+            "business", "device", "system", "function", "unknown", "task"
+        }:
             inputs = []
             outputs = []
             for var_name in info.get("items", []):
@@ -3626,7 +3642,9 @@ class PlotWindow(QWidget):
         self.dataflow_export_sections.pop(section, None)
         if section in self.dataflow_export_section_order:
             self.dataflow_export_section_order.remove(section)
-        if info.get("category") == "task":
+        if info.get("category") in {
+            "business", "device", "system", "function", "unknown", "task"
+        }:
             task_id = int(info.get("task_id", -1))
             self.task_variable_groups.pop(task_id, None)
             self.task_latency_vars.pop(task_id, None)
@@ -3745,7 +3763,9 @@ class PlotWindow(QWidget):
                     changed_sections.add(last_section)
                     self._remove_empty_dataflow_export_section(last_section)
             self.dynamic_signal_sections[var_name] = section
-            if category == "task":
+            if category in {
+                "business", "device", "system", "function", "unknown", "task"
+            }:
                 section_info = self._get_or_create_task_export_section(desc)
             else:
                 section_info = self._get_or_create_dataflow_export_section(

@@ -21,7 +21,8 @@ TYPE_DISCONNECT_REQ = 0x25
 
 SCHEMA_KIND_TASK = 1
 SCHEMA_KIND_TASK_PORT = 2
-SCHEMA_KIND_DATA_NODE = 3
+CATEGORY_DEVICE = 3
+CATEGORY_FUNCTION = 4
 PORT_INPUT = 0
 PORT_OUTPUT = 1
 DEFAULT_TIMESTAMP_GROUP = 0xFF
@@ -32,7 +33,6 @@ TYPE_F32 = 6
 
 DATA_HEADER_FMT = "<HBBIIQHH"
 TASK_FRAME_HEADER_FMT = "<HBII"
-NODE_FRAME_FMT = "<HBII"
 SCHEMA_REQ_FMT = "<HBBI"
 SCHEMA_RESP_HEADER_FMT = "<HBBIHHHH"
 SCHEMA_ENTRY_HEADER_FMT = "<BH"
@@ -67,14 +67,16 @@ class NFv3UdpSimulator:
         task_name = b"SimTask"
         task = schema_entry(
             SCHEMA_KIND_TASK,
-            struct.pack("<HBBBBB", 5, 2, 2, 0, 1, len(task_name)) + task_name,
+            struct.pack(
+                "<HBBBBBB", 5, CATEGORY_DEVICE, 2, 2, 0, 1, len(task_name)
+            ) + task_name,
         )
 
-        def port(direction, slot, scalar_type, timestamp_group, name, unit=b""):
+        def port(task_id, direction, slot, scalar_type, timestamp_group, name, unit=b""):
             name = name.encode()
             payload = struct.pack(
                 "<HBBBBBB",
-                5,
+                task_id,
                 direction,
                 slot,
                 scalar_type,
@@ -84,24 +86,28 @@ class NFv3UdpSimulator:
             ) + name + unit
             return schema_entry(SCHEMA_KIND_TASK_PORT, payload)
 
-        group = b"sim"
-        node_name = b"armed"
-        node_payload = struct.pack(
-            "<HHBBBB",
-            0,
-            1,
-            TYPE_BOOL,
-            len(group),
-            len(node_name),
-            0,
-        ) + group + node_name
+        function_name = b"sim_state"
+        function = schema_entry(
+            SCHEMA_KIND_TASK,
+            struct.pack(
+                "<HBBBBBB",
+                0x7000,
+                CATEGORY_FUNCTION,
+                0,
+                1,
+                0,
+                0,
+                len(function_name),
+            ) + function_name,
+        )
         return [
             task,
-            port(PORT_INPUT, 0, TYPE_F32, DEFAULT_TIMESTAMP_GROUP, "roll", b"deg"),
-            port(PORT_INPUT, 1, TYPE_F32, DEFAULT_TIMESTAMP_GROUP, "pitch", b"deg"),
-            port(PORT_OUTPUT, 0, TYPE_U16, DEFAULT_TIMESTAMP_GROUP, "pwm_left", b"us"),
-            port(PORT_OUTPUT, 1, TYPE_U16, 0, "pwm_right", b"us"),
-            schema_entry(SCHEMA_KIND_DATA_NODE, node_payload),
+            port(5, PORT_INPUT, 0, TYPE_F32, DEFAULT_TIMESTAMP_GROUP, "roll", b"deg"),
+            port(5, PORT_INPUT, 1, TYPE_F32, DEFAULT_TIMESTAMP_GROUP, "pitch", b"deg"),
+            port(5, PORT_OUTPUT, 0, TYPE_U16, DEFAULT_TIMESTAMP_GROUP, "pwm_left", b"us"),
+            port(5, PORT_OUTPUT, 1, TYPE_U16, 0, "pwm_right", b"us"),
+            function,
+            port(0x7000, PORT_OUTPUT, 0, TYPE_BOOL, DEFAULT_TIMESTAMP_GROUP, "armed"),
         ]
 
     def _schema_packets(self):
@@ -191,8 +197,8 @@ class NFv3UdpSimulator:
             self.schema_generation,
             self.packet_seq,
             packet_time_us,
-            1,
-            1,
+            2,
+            0,
         )
         flags = 0x07
         task = struct.pack(TASK_FRAME_HEADER_FMT, 5, flags, 100, 50)
@@ -204,9 +210,10 @@ class NFv3UdpSimulator:
             pwm_right & 0xFFFF,
         )
         task += struct.pack("<I", 25)
-        node = struct.pack(NODE_FRAME_FMT, 0, 1, 10, 1 if armed else 0)
+        function = struct.pack(TASK_FRAME_HEADER_FMT, 0x7000, 0x07, 20, 10)
+        function += struct.pack("<I", 1 if armed else 0)
         self.packet_seq = (self.packet_seq + 1) & 0xFFFFFFFF
-        return header + task + node
+        return header + task + function
 
     def run(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

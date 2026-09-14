@@ -14,22 +14,21 @@ from PyQt5.QtWidgets import (
 from ui.theme import PANEL_BG_HEX, TEXT_HEX, set_section_kind
 
 
-def task_section_kind(task_id):
-    category_base = int(task_id) & 0xF000
-    return {
-        0x2000: "business",
-        0x3000: "device",
-        0x1000: "system",
-    }.get(category_base, "")
+def task_section_kind(task_id, category="unknown"):
+    """Return the schema-declared category used for section styling."""
+    del task_id
+    return str(category or "unknown").lower()
 
 
-def task_display_order(task_id):
+def task_display_order(task_id, category="unknown"):
     task_id = int(task_id)
     category_order = {
         "business": 0,
         "device": 1,
         "system": 2,
-    }.get(task_section_kind(task_id), 3)
+        "function": 3,
+        "unknown": 4,
+    }.get(task_section_kind(task_id, category), 4)
     return category_order, task_id
 
 
@@ -60,12 +59,13 @@ class _LatencyLabel(QLabel):
 class TaskVariableGroup(QGroupBox):
     latency_selected = pyqtSignal(str)
 
-    def __init__(self, task_id, task_name, latency_var_name):
+    def __init__(self, task_id, task_name, latency_var_name, category="unknown"):
         super().__init__(str(task_name))
         self.task_id = int(task_id)
         self.task_name = str(task_name)
         self.latency_var_name = str(latency_var_name)
-        set_section_kind(self, task_section_kind(self.task_id))
+        self.category = str(category or "unknown").lower()
+        set_section_kind(self, task_section_kind(self.task_id, self.category))
 
         self.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
 
