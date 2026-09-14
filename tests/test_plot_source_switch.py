@@ -66,6 +66,8 @@ from PyQt5.QtWidgets import QApplication, QLabel, QAbstractSpinBox
 
 from data_receiver import DataReceiver
 from monitor_csv import read_monitor_csv
+from network_clock import ClockTransform
+from timeline_controller import TimelineState
 from ui.curve_expression import CurveExpressionParser
 from ui.main_window import PlotWindow
 
@@ -148,6 +150,12 @@ class PlotSourceSwitchTest(unittest.TestCase):
         self.window.close()
         self.app.processEvents()
         DataReceiver.start = self.original_start
+
+    def test_window_title_tracks_monitor_release(self):
+        self.assertEqual(self.window.windowTitle(), "Monitor v3.4.0")
+
+    def test_window_minimum_width_fits_wide_desktop_viewport(self):
+        self.assertLessEqual(self.window.minimumSizeHint().width(), 1600)
 
     def test_auto_x_off_refreshes_new_source_revisions(self):
         self.window.plot_state = self.window.plot_state.RUNNING
@@ -334,6 +342,109 @@ class PlotSourceSwitchTest(unittest.TestCase):
         self.assertEqual(self.window.colors["a"], (12, 34, 56))
         self.assertTrue(self.window.curves["a"].isVisible())
 
+    def test_imported_replay_starts_paused_at_first_sample(self):
+        self.window._load_imported_series(
+            "/tmp/replay.csv",
+            _series("a", [1.0, 2.0, 3.0]),
+        )
+
+        self.assertEqual(self.window.timeline.state, TimelineState.PAUSED)
+        self.assertEqual(self.window.timeline.playhead_ms, 1000.0)
+        self.assertEqual(self.window.timeline.latest_ms, 1020.0)
+        self.assertEqual(self.window.now_line.value(), 1000.0)
+        self.assertEqual(self.window.toggle_reception_btn.text(), "Play")
+
+        self.window.set_curve_visibility("a", True)
+        self.assertEqual(self.window.curves["a"].xData.tolist(), [1000.0, 1010.0, 1020.0])
+
+        self.window.now_line.setValue(1010.0)
+
+        self.assertEqual(self.window.timeline.playhead_ms, 1010.0)
+
+        self.window.timeline_bar.slider.setValue(750000)
+
+        self.assertEqual(self.window.timeline.playhead_ms, 1015.0)
+
+    def test_live_pause_keeps_receiving_bounds_without_moving_playhead(self):
+        self.window.timeline.begin_live()
+        self.window.data_model.add_series(
+            "a",
+            "source-a",
+            [1000.0, 1010.0],
+            [1.0, 2.0],
+        )
+        self.window.available_raw_variables = {"a"}
+        self.window._refresh_timeline_bounds(force=True)
+        self.window.timeline.pause()
+
+        self.window.data_model.add_data(
+            "source-a",
+            1020.0,
+            1020.0,
+            {"a": 3.0},
+        )
+        self.window._refresh_timeline_bounds(force=True)
+
+        self.assertEqual(self.window.timeline.playhead_ms, 1010.0)
+        self.assertEqual(self.window.timeline.latest_ms, 1020.0)
+        self.assertEqual(self.window.timeline.state, TimelineState.PAUSED)
+        self.assertEqual(self.window.toggle_reception_btn.text(), "Resume")
+        self.assertEqual(self.window.timeline_bar.live_button.text(), "Live")
+
+        self.window.toggle_reception()
+
+        self.assertEqual(self.window.timeline.state, TimelineState.FOLLOW_LIVE)
+        self.assertEqual(self.window.timeline.playhead_ms, 1020.0)
+
+    def test_live_uses_committed_time_and_pause_enables_history_alignment(self):
+        self.window.timeline.begin_live()
+        self.window.data_model.add_data(
+            "source-a",
+            2100.0,
+            1000.0,
+            {"a": 1.0},
+            offset_src="clock",
+            offset_timestamp=1000.0,
+        )
+        self.window.data_model.set_clock_transform(
+            "clock",
+            ClockTransform(
+                source_anchor_us=1_000_000,
+                target_anchor_us=3_000_000,
+                uncertainty_us=100,
+                usable=True,
+                revision=1,
+            ),
+        )
+        self.window.available_raw_variables = {"a"}
+        self.window._refresh_timeline_bounds(force=True)
+
+        self.assertEqual(self.window._curve_source_data("a"), ([2100.0], [1.0]))
+
+        self.window.timeline.pause()
+
+        self.assertEqual(self.window._curve_source_data("a"), ([3000.0], [1.0]))
+
+    def test_main_and_flight_windows_share_playhead(self):
+        self.window._load_imported_series(
+            "/tmp/replay.csv",
+            _series("MadgwickTask.output.roll", [1.0, 2.0, 3.0]),
+        )
+        self.window.open_flight_visualization()
+        visualization = self.window.flight_visualization_window
+        visualization.timer.stop()
+
+        self.window.timeline.seek(1010.0)
+
+        self.assertIs(visualization.timeline, self.window.timeline)
+        self.assertEqual(self.window.now_line.value(), 1010.0)
+        self.assertEqual(visualization.timeline.playhead_ms, 1010.0)
+        self.assertEqual(
+            self.window.timeline_bar.slider.value(),
+            visualization.timeline_bar.slider.value(),
+        )
+        visualization.close()
+
     def test_replay_changes_to_live_only_after_requested_schema_activation(self):
         self.window._load_imported_series("/tmp/replay.csv", _series("a", [1.0]))
         descriptors = [{"var_name": "a", "section": "Test"}]
@@ -362,19 +473,42 @@ class PlotSourceSwitchTest(unittest.TestCase):
         )
         self.assertEqual(self.window.active_data_source.kind, "none")
 
-    def test_source_and_reset_layout_share_connection_row(self):
-        row_widgets = [
+    def test_connection_and_status_controls_use_separate_rows(self):
+        connection_widgets = [
             self.window.nfv3_ctrl_layout.itemAt(index).widget()
             for index in range(self.window.nfv3_ctrl_layout.count())
         ]
-        self.assertIn(self.window.active_source_label, row_widgets)
-        self.assertIn(self.window.nf_clock_strategy_combo, row_widgets)
-        self.assertIn(self.window.nf_clock_label, row_widgets)
-        self.assertIs(row_widgets[-1], self.window.reset_section_layout_btn)
+        status_widgets = [
+            self.window.nfv3_status_layout.itemAt(index).widget()
+            for index in range(self.window.nfv3_status_layout.count())
+        ]
+
+        self.assertIn(self.window.nf_status_label, connection_widgets)
+        self.assertIs(connection_widgets[-1], self.window.reset_section_layout_btn)
+        self.assertNotIn(self.window.active_source_label, connection_widgets)
+        self.assertNotIn(self.window.nf_clock_strategy_combo, connection_widgets)
+
+        self.assertIn(self.window.active_source_label, status_widgets)
+        self.assertIn(self.window.nf_clock_label, status_widgets)
+        self.assertIn(self.window.nf_snapshot_contention_label, status_widgets)
+        self.assertIn(self.window.nf_clock_settings_btn, status_widgets)
+        self.assertNotIn(self.window.nf_clock_strategy_combo, status_widgets)
         self.assertNotIn(
             "ESP32 Dataflow Export (Dynamic):",
             [label.text() for label in self.window.findChildren(QLabel)],
         )
+
+    def test_clock_estimator_selection_lives_in_time_alignment_dialog(self):
+        self.window._show_clock_settings()
+
+        self.assertEqual(
+            self.window.clock_settings_dialog.windowTitle(), "Time Alignment"
+        )
+        self.assertIs(
+            self.window.nf_clock_strategy_combo.window(),
+            self.window.clock_settings_dialog,
+        )
+        self.assertTrue(self.window.clock_settings_dialog.isVisible())
 
     def test_clock_alignment_status_is_compact_and_has_detailed_tooltip(self):
         self.window.data_receiver.get_nfv3_status = lambda: {
@@ -641,6 +775,22 @@ class PlotSourceSwitchTest(unittest.TestCase):
         capture = self.window.waveform_capture_window
         self.assertEqual(capture.signal_names, self.window.signal_variables)
         capture.close()
+
+    def test_flight_visualization_uses_current_signal_registry(self):
+        self.window.available_raw_variables.add("FlightTask.output.pos_x")
+        self.window.open_flight_visualization()
+        visualization = self.window.flight_visualization_window
+        visualization.timer.stop()
+        visualization.refresh_variables(force=True)
+
+        self.assertIs(visualization.data_model, self.window.data_model)
+        self.assertGreaterEqual(
+            visualization.binding_combos["position_x"].findData(
+                "FlightTask.output.pos_x"
+            ),
+            0,
+        )
+        visualization.close()
 
     def test_v3_export_round_trip_restores_task_port_and_latency_metadata(self):
         self.window.register_dataflow_export_descriptors(_task_descriptors())

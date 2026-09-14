@@ -300,6 +300,7 @@ class WaveformCaptureWindow(QWidget):
         ts, vs = self.main_window.data_model.get_series_tail(
             self.reference_signal,
             5000,
+            align_history=self.main_window._history_alignment_enabled(),
         )
         if len(ts) < 10:
             return
@@ -364,7 +365,11 @@ class WaveformCaptureWindow(QWidget):
         # Load only recent process_time_s window (converted to ts units), then cap to 5000 pts
         data = {}
         for name in targets:
-            ts, vs = self.main_window.data_model.get_series_tail(name, 5000)
+            ts, vs = self.main_window.data_model.get_series_tail(
+                name,
+                5000,
+                align_history=self.main_window._history_alignment_enabled(),
+            )
             ts = np.asarray(ts, dtype=float); vs = np.asarray(vs, dtype=float)
             if ts.size:
                 span = self._seconds_to_ts_units(ts, self.process_time_s)
