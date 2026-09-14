@@ -123,28 +123,39 @@ class TaskVariableGroupTest(unittest.TestCase):
         control.mousePressEvent(event)
         self.assertEqual(selected, ["MadgwickTask.input.roll"])
 
-    def test_task_display_order_is_business_device_system(self):
-        task_ids = [0x1001, 0x3001, 0x2001]
+    def test_task_display_order_uses_declared_category(self):
+        task_ids = [0x7000, 0x1001, 0x3001, 0x2001]
+        categories = {
+            0x1001: "system",
+            0x3001: "device",
+            0x2001: "business",
+            0x7000: "function",
+        }
         self.assertEqual(
-            sorted(task_ids, key=task_display_order),
-            [0x2001, 0x3001, 0x1001],
+            sorted(task_ids, key=lambda task_id: task_display_order(task_id, categories[task_id])),
+            [0x2001, 0x3001, 0x1001, 0x7000],
         )
-        self.assertEqual(task_section_kind(0x2001), "business")
-        self.assertEqual(task_section_kind(0x3001), "device")
-        self.assertEqual(task_section_kind(0x1001), "system")
+        self.assertEqual(task_section_kind(0x2001, "business"), "business")
+        self.assertEqual(task_section_kind(0x3001, "device"), "device")
+        self.assertEqual(task_section_kind(0x1001, "system"), "system")
+        self.assertEqual(task_section_kind(0x7000, "function"), "function")
 
     def test_task_group_exposes_category_for_theme_accent(self):
         self.assertEqual(
-            TaskVariableGroup(0x2001, "BusinessTask", "latency").property("sectionKind"),
+            TaskVariableGroup(0x2001, "BusinessTask", "latency", "business").property("sectionKind"),
             "business",
         )
         self.assertEqual(
-            TaskVariableGroup(0x3001, "DeviceTask", "latency").property("sectionKind"),
+            TaskVariableGroup(0x3001, "DeviceTask", "latency", "device").property("sectionKind"),
             "device",
         )
         self.assertEqual(
-            TaskVariableGroup(0x1001, "SystemTask", "latency").property("sectionKind"),
+            TaskVariableGroup(0x1001, "SystemTask", "latency", "system").property("sectionKind"),
             "system",
+        )
+        self.assertEqual(
+            TaskVariableGroup(0x7000, "Mixer", "latency", "function").property("sectionKind"),
+            "function",
         )
 
 

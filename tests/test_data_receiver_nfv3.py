@@ -113,6 +113,7 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
             {
                 "entry_kind": self.parser.SCHEMA_KIND_TASK,
                 "task_id": 5,
+                "category": self.parser.CATEGORY_DEVICE,
                 "input_count": 1,
                 "output_count": 1,
                 "input_timestamp_group_count": 0,
@@ -138,15 +139,6 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
                 "timestamp_group": 0,
                 "name": "yaw",
                 "unit": "deg",
-            },
-            {
-                "entry_kind": self.parser.SCHEMA_KIND_DATA_NODE,
-                "node_no": 2,
-                "node_id": 41,
-                "scalar_type": self.parser.TYPE_BOOL,
-                "group": "control",
-                "name": "armed",
-                "unit": "",
             },
         ]
 
@@ -212,12 +204,12 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
             packet_seq,
             packet_time_us,
             1,
-            1,
+            0,
         )
         task = struct.pack(
             self.parser.TASK_FRAME_HEADER_FMT,
             5,
-            self.parser.TASK_FLAG_BUSINESS_ENABLED
+            self.parser.TASK_FLAG_EXECUTABLE_ENABLED
             | self.parser.TASK_FLAG_INPUTS_VALID
             | self.parser.TASK_FLAG_OUTPUTS_VALID
             | (
@@ -229,26 +221,21 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
         )
         task += struct.pack("<II", 0x3F800000, 0x40000000)
         task += struct.pack("<I", 25)
-        node = struct.pack(self.parser.NODE_FRAME_FMT, 2, 1, 10, 1)
-        return self.parser.parse_packet(header + task + node)
+        return self.parser.parse_packet(header + task)
 
-    def test_schema_response_builds_task_port_and_node_keys(self):
+    def test_schema_response_builds_task_port_keys(self):
         self._install_schema(generation=2, chunks=2)
 
         self.assertEqual(self.receiver.nf_schema_generation, 2)
         output_key = ("task", 5, self.parser.PORT_OUTPUT, 0)
-        node_key = ("node", 2)
         latency_key = ("task_latency", 5)
         self.assertEqual(self.receiver.nf_schema_by_key[output_key]["var_name"], "MadgwickTask.output.yaw")
-        self.assertEqual(self.receiver.nf_schema_by_key[node_key]["var_name"], "Dataflow.armed")
-        self.assertEqual(self.receiver.nf_schema_by_key[node_key]["section"], "Dataflow/control")
         self.assertEqual(self.receiver.nf_schema_by_key[latency_key]["var_name"], "MadgwickTask.latency_us")
         self.assertTrue(self.receiver.nf_schema_by_key[latency_key]["hidden_control"])
-        self.assertEqual(self.receiver.nf_schema_by_key[output_key]["category"], "task")
-        self.assertEqual(self.receiver.nf_schema_by_key[node_key]["category"], "dataflow")
-        self.assertEqual(len(self.window.live_descriptors), 4)
+        self.assertEqual(self.receiver.nf_schema_by_key[output_key]["category"], "device")
+        self.assertEqual(len(self.window.live_descriptors), 3)
 
-    def test_compact_frames_publish_default_custom_and_node_timestamps(self):
+    def test_compact_frames_publish_default_and_custom_timestamps(self):
         self._install_schema()
         packet = self._build_data_packet()
 
@@ -259,7 +246,6 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
         self.assertEqual(records["MadgwickTask.latency_us"][3], {"MadgwickTask.latency_us": 50.0})
         self.assertEqual(records["MadgwickTask.input.roll"][2], 999.9)
         self.assertEqual(records["MadgwickTask.output.yaw"][2], 999.975)
-        self.assertEqual(records["Dataflow.armed"][2], 999.99)
         self.assertEqual(records["MadgwickTask.output.yaw"][3], {"MadgwickTask.output.yaw": 2.0})
         self.assertEqual(records["MadgwickTask.output.yaw"][4]["offset_timestamp"], 1000.0)
         self.assertEqual(self.window.latency_updates, [(5, 50)])
@@ -278,6 +264,85 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
         names = [next(iter(record[3])) for record in self.model.records]
         self.assertNotIn("MadgwickTask.latency_us", names)
         self.assertEqual(self.window.latency_updates, [])
+
+    def test_function_uses_task_frame_and_shared_finish_timestamp(self):
+        entries = [
+            {
+                "entry_kind": self.parser.SCHEMA_KIND_TASK,
+                "task_id": 0x7000,
+                "category": self.parser.CATEGORY_FUNCTION,
+                "input_count": 0,
+                "output_count": 2,
+                "input_timestamp_group_count": 0,
+                "output_timestamp_group_count": 0,
+                "name": "offset_mixer",
+            },
+            {
+                "entry_kind": self.parser.SCHEMA_KIND_TASK_PORT,
+                "task_id": 0x7000,
+                "direction": self.parser.PORT_OUTPUT,
+                "slot": 0,
+                "scalar_type": self.parser.TYPE_F32,
+                "timestamp_group": self.parser.DEFAULT_TIMESTAMP_GROUP,
+                "name": "left",
+                "unit": "deg",
+            },
+            {
+                "entry_kind": self.parser.SCHEMA_KIND_TASK_PORT,
+                "task_id": 0x7000,
+                "direction": self.parser.PORT_OUTPUT,
+                "slot": 1,
+                "scalar_type": self.parser.TYPE_F32,
+                "timestamp_group": self.parser.DEFAULT_TIMESTAMP_GROUP,
+                "name": "right",
+                "unit": "deg",
+            },
+        ]
+        self.receiver._handle_nfv3_schema_response(
+            {
+                "schema_generation": 3,
+                "chunk_index": 0,
+                "chunk_total": 1,
+                "total_entries": len(entries),
+                "entries": entries,
+            }
+        )
+        packet_time_us = 1_000_000
+        header = struct.pack(
+            self.parser.DATA_HEADER_FMT,
+            self.parser.MAGIC,
+            self.parser.VERSION,
+            self.parser.TYPE_DATA,
+            3,
+            1,
+            packet_time_us,
+            1,
+            0,
+        )
+        frame = struct.pack(
+            self.parser.TASK_FRAME_HEADER_FMT,
+            0x7000,
+            self.parser.TASK_FLAG_OUTPUTS_VALID,
+            120,
+            20,
+        ) + struct.pack("<II", 0x3F800000, 0x40000000)
+        packet = self.parser.parse_packet(header + frame)
+        self.receiver._process_nfv3_data(packet, unix_ts=2000.0)
+
+        left = self.model.records[-2]
+        right = self.model.records[-1]
+        self.assertEqual(left[3], {"offset_mixer.output.left": 1.0})
+        self.assertEqual(right[3], {"offset_mixer.output.right": 2.0})
+        self.assertEqual(left[2], 999.98)
+        self.assertEqual(right[2], 999.98)
+        self.assertEqual(
+            self.receiver.nf_schema_by_key[("task", 0x7000, self.parser.PORT_OUTPUT, 0)]["category"],
+            "function",
+        )
+        self.assertEqual(
+            self.receiver.nf_schema_by_key[("task", 0x7000, self.parser.PORT_OUTPUT, 0)]["section"],
+            "Function/offset_mixer",
+        )
 
     def test_zero_port_task_still_exposes_and_publishes_latency(self):
         entry = {
@@ -312,7 +377,7 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
         task = struct.pack(
             self.parser.TASK_FRAME_HEADER_FMT,
             9,
-            self.parser.TASK_FLAG_BUSINESS_ENABLED,
+            self.parser.TASK_FLAG_EXECUTABLE_ENABLED,
             40,
             10,
         )

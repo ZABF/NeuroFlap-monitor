@@ -9,17 +9,29 @@ def schema_entry(kind, payload):
     return struct.pack("<BH", kind, len(payload)) + payload
 
 
-def task_entry(parser, task_id=5, input_count=2, output_count=1, input_groups=1, output_groups=1):
+def task_entry(parser, task_id=5, input_count=2, output_count=1, input_groups=1, output_groups=1, category=None):
     name = b"MadgwickTask"
-    payload = struct.pack(
-        "<HBBBBB",
-        task_id,
-        input_count,
-        output_count,
-        input_groups,
-        output_groups,
-        len(name),
-    ) + name
+    if category is None:
+        payload = struct.pack(
+            "<HBBBBB",
+            task_id,
+            input_count,
+            output_count,
+            input_groups,
+            output_groups,
+            len(name),
+        ) + name
+    else:
+        payload = struct.pack(
+            "<HBBBBBB",
+            task_id,
+            category,
+            input_count,
+            output_count,
+            input_groups,
+            output_groups,
+            len(name),
+        ) + name
     return schema_entry(parser.SCHEMA_KIND_TASK, payload)
 
 
@@ -38,29 +50,13 @@ def port_entry(parser, direction, slot, scalar_type, timestamp_group, name, unit
     return schema_entry(parser.SCHEMA_KIND_TASK_PORT, payload)
 
 
-def node_entry(parser):
-    group = b"control"
-    name = b"mix"
-    unit = b"deg"
-    payload = struct.pack(
-        "<HHBBBB",
-        2,
-        41,
-        parser.TYPE_F32,
-        len(group),
-        len(name),
-        len(unit),
-    ) + group + name + unit
-    return schema_entry(parser.SCHEMA_KIND_DATA_NODE, payload)
-
-
 class NFv3ParserTest(unittest.TestCase):
     def setUp(self):
         self.parser = NFv3Parser()
 
     def _schema_packet(self):
         entries = [
-            task_entry(self.parser),
+            task_entry(self.parser, category=self.parser.CATEGORY_DEVICE),
             port_entry(
                 self.parser,
                 self.parser.PORT_INPUT,
@@ -87,7 +83,6 @@ class NFv3ParserTest(unittest.TestCase):
                 "angle",
                 b"deg",
             ),
-            node_entry(self.parser),
         ]
         header = struct.pack(
             self.parser.SCHEMA_RESP_HEADER_FMT,
@@ -107,15 +102,15 @@ class NFv3ParserTest(unittest.TestCase):
 
         self.assertIsNotNone(packet)
         self.assertEqual(packet["schema_generation"], 7)
-        self.assertEqual(packet["total_entries"], 5)
+        self.assertEqual(packet["total_entries"], 4)
         self.assertTrue(self.parser.install_schema(7, packet["entries"]))
         task = self.parser.schema_tasks[5]
         self.assertEqual(task["name"], "MadgwickTask")
+        self.assertEqual(task["category_name"], "device")
         self.assertEqual([item["name"] for item in task["inputs"]], ["roll", "speed"])
         self.assertEqual(task["outputs"][0]["unit"], "deg")
-        self.assertEqual(self.parser.schema_nodes[2]["name"], "mix")
 
-    def test_parse_compact_task_and_node_frames(self):
+    def test_parse_compact_task_frame(self):
         schema = self._schema_packet()
         self.assertTrue(self.parser.install_schema(7, schema["entries"]))
         packet_time_us = 1_000_000
@@ -128,12 +123,12 @@ class NFv3ParserTest(unittest.TestCase):
             12,
             packet_time_us,
             1,
-            1,
+            0,
         )
         task_frame = struct.pack(
             self.parser.TASK_FRAME_HEADER_FMT,
             5,
-            self.parser.TASK_FLAG_BUSINESS_ENABLED
+            self.parser.TASK_FLAG_EXECUTABLE_ENABLED
             | self.parser.TASK_FLAG_INPUTS_VALID
             | self.parser.TASK_FLAG_OUTPUTS_VALID,
             100,
@@ -141,9 +136,7 @@ class NFv3ParserTest(unittest.TestCase):
         )
         task_frame += struct.pack("<III", 0x3F800000, 1200, 0x40000000)
         task_frame += struct.pack("<II", 80, 30)
-        node_frame = struct.pack(self.parser.NODE_FRAME_FMT, 2, 1, 25, 0x40400000)
-
-        packet = self.parser.parse_packet(header + task_frame + node_frame)
+        packet = self.parser.parse_packet(header + task_frame)
 
         self.assertTrue(packet["schema_available"])
         self.assertEqual(packet["packet_time_us"], packet_time_us)
@@ -153,12 +146,11 @@ class NFv3ParserTest(unittest.TestCase):
         self.assertEqual(frame["inputs"][1]["capture_age_us"], 80)
         self.assertEqual(frame["outputs"][0]["capture_age_us"], 30)
         self.assertEqual(self.parser.raw_to_value(frame["outputs"][0]["scalar_type"], frame["outputs"][0]["raw"]), 2.0)
-        self.assertEqual(packet["node_frames"][0]["publish_age_us"], 25)
 
     def test_task_frame_flags_include_snapshot_contention(self):
         schema = self._schema_packet()
         self.assertTrue(self.parser.install_schema(7, schema["entries"]))
-        state_flags = self.parser.TASK_FLAG_BUSINESS_ENABLED
+        state_flags = self.parser.TASK_FLAG_EXECUTABLE_ENABLED
         flags = state_flags | (7 << self.parser.TASK_CONTENTION_SHIFT)
         header = struct.pack(
             self.parser.DATA_HEADER_FMT,
@@ -189,6 +181,23 @@ class NFv3ParserTest(unittest.TestCase):
             frame["flags"] & self.parser.TASK_FLAG_STATE_MASK,
             state_flags,
         )
+
+    def test_nonzero_reserved_frame_count_is_rejected(self):
+        schema = self._schema_packet()
+        self.assertTrue(self.parser.install_schema(7, schema["entries"]))
+        header = struct.pack(
+            self.parser.DATA_HEADER_FMT,
+            self.parser.MAGIC,
+            self.parser.VERSION,
+            self.parser.TYPE_DATA,
+            7,
+            1,
+            1000,
+            0,
+            1,
+        )
+
+        self.assertIsNone(self.parser.parse_packet(header))
 
     def test_unknown_generation_returns_header_for_schema_resync(self):
         schema = self._schema_packet()
@@ -227,6 +236,30 @@ class NFv3ParserTest(unittest.TestCase):
         packet = self.parser.parse_packet(header + raw)
         self.assertTrue(self.parser.install_schema(3, packet["entries"]))
         self.assertEqual(self.parser.schema_tasks[9]["inputs"], [])
+
+    def test_old_task_schema_is_accepted_as_unknown(self):
+        raw = task_entry(
+            self.parser,
+            input_count=0,
+            output_count=0,
+            input_groups=0,
+            output_groups=0,
+        )
+        header = struct.pack(
+            self.parser.SCHEMA_RESP_HEADER_FMT,
+            self.parser.MAGIC,
+            self.parser.VERSION,
+            self.parser.TYPE_SCHEMA_RESP,
+            1,
+            0,
+            1,
+            1,
+            1,
+        )
+        packet = self.parser.parse_packet(header + raw)
+        self.assertIsNotNone(packet)
+        self.assertTrue(self.parser.install_schema(1, packet["entries"]))
+        self.assertEqual(self.parser.schema_tasks[5]["category_name"], "unknown")
 
     def test_parse_network_diagnostic_probe(self):
         packet_size = 1200

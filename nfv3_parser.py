@@ -65,11 +65,15 @@ class NFv3Parser:
 
     SCHEMA_KIND_TASK = 1
     SCHEMA_KIND_TASK_PORT = 2
-    SCHEMA_KIND_DATA_NODE = 3
+    CATEGORY_UNKNOWN = 0
+    CATEGORY_SYSTEM = 1
+    CATEGORY_BUSINESS = 2
+    CATEGORY_DEVICE = 3
+    CATEGORY_FUNCTION = 4
     PORT_INPUT = 0
     PORT_OUTPUT = 1
 
-    TASK_FLAG_BUSINESS_ENABLED = 1 << 0
+    TASK_FLAG_EXECUTABLE_ENABLED = 1 << 0
     TASK_FLAG_INPUTS_VALID = 1 << 1
     TASK_FLAG_OUTPUTS_VALID = 1 << 2
     TASK_FLAG_STATE_MASK = 0x07
@@ -81,7 +85,6 @@ class NFv3Parser:
     # DATA header: generation, packet sequence, packet build time, frame counts.
     DATA_HEADER_FMT = "<HBBIIQHH"
     TASK_FRAME_HEADER_FMT = "<HBII"
-    NODE_FRAME_FMT = "<HBII"
     SCHEMA_REQ_FMT = "<HBBI"
     # Includes total entry count so chunk aggregation can be validated.
     SCHEMA_RESP_HEADER_FMT = "<HBBIHHHH"
@@ -99,7 +102,6 @@ class NFv3Parser:
 
     DATA_HEADER_SIZE = struct.calcsize(DATA_HEADER_FMT)
     TASK_FRAME_HEADER_SIZE = struct.calcsize(TASK_FRAME_HEADER_FMT)
-    NODE_FRAME_SIZE = struct.calcsize(NODE_FRAME_FMT)
     SCHEMA_REQ_SIZE = struct.calcsize(SCHEMA_REQ_FMT)
     SCHEMA_RESP_HEADER_SIZE = struct.calcsize(SCHEMA_RESP_HEADER_FMT)
     SCHEMA_ENTRY_HEADER_SIZE = struct.calcsize(SCHEMA_ENTRY_HEADER_FMT)
@@ -129,12 +131,19 @@ class NFv3Parser:
     def clear_schema(self):
         self.schema_generation = None
         self.schema_tasks = {}
-        self.schema_nodes = {}
+
+    @classmethod
+    def category_name(cls, category):
+        return {
+            cls.CATEGORY_SYSTEM: "system",
+            cls.CATEGORY_BUSINESS: "business",
+            cls.CATEGORY_DEVICE: "device",
+            cls.CATEGORY_FUNCTION: "function",
+        }.get(int(category), "unknown")
 
     def install_schema(self, schema_generation: int, entries) -> bool:
         tasks = {}
         ports = []
-        nodes = {}
         for entry in entries:
             kind = int(entry.get("entry_kind", 0))
             if kind == self.SCHEMA_KIND_TASK:
@@ -148,11 +157,6 @@ class NFv3Parser:
                 }
             elif kind == self.SCHEMA_KIND_TASK_PORT:
                 ports.append(dict(entry))
-            elif kind == self.SCHEMA_KIND_DATA_NODE:
-                node_no = int(entry["node_no"])
-                if node_no in nodes:
-                    return False
-                nodes[node_no] = dict(entry)
             else:
                 return False
 
@@ -190,7 +194,6 @@ class NFv3Parser:
 
         self.schema_generation = int(schema_generation) & 0xFFFFFFFF
         self.schema_tasks = tasks
-        self.schema_nodes = nodes
         return True
 
     def build_schema_request(self, request_id: int) -> bytes:
@@ -598,7 +601,7 @@ class NFv3Parser:
             packet_seq,
             packet_time_us,
             task_frame_count,
-            node_frame_count,
+            reserved_frame_count,
         ) = struct.unpack_from(self.DATA_HEADER_FMT, data, 0)
         packet = {
             "type": "data",
@@ -606,9 +609,8 @@ class NFv3Parser:
             "packet_seq": packet_seq,
             "packet_time_us": packet_time_us,
             "task_frame_count": task_frame_count,
-            "node_frame_count": node_frame_count,
+            "reserved_frame_count": reserved_frame_count,
             "task_frames": [],
-            "node_frames": [],
             "schema_available": self.schema_generation == schema_generation,
         }
         if not packet["schema_available"]:
@@ -666,18 +668,8 @@ class NFv3Parser:
                 }
             )
 
-        for _ in range(node_frame_count):
-            if offset + self.NODE_FRAME_SIZE > len(data):
-                return None
-            node_no, status, publish_age_us, raw = struct.unpack_from(self.NODE_FRAME_FMT, data, offset)
-            offset += self.NODE_FRAME_SIZE
-            node = self.schema_nodes.get(int(node_no))
-            if node is None:
-                return None
-            packet["node_frames"].append(
-                {**node, "status": int(status), "publish_age_us": int(publish_age_us), "raw": int(raw)}
-            )
-
+        if reserved_frame_count != 0:
+            return None
         return packet if offset == len(data) else None
 
     def _parse_schema_response(self, data: bytes):
@@ -724,19 +716,41 @@ class NFv3Parser:
 
     def _parse_schema_entry(self, kind: int, data: bytes, offset: int, end: int):
         if kind == self.SCHEMA_KIND_TASK:
-            fixed_fmt = "<HBBBBB"
-            fixed_size = struct.calcsize(fixed_fmt)
-            if offset + fixed_size > end:
+            # Current schema adds one category byte.  Retain structural
+            # compatibility with older monitors/firmware by accepting the
+            # previous payload shape and marking its category unknown.
+            new_fmt = "<HBBBBBB"
+            new_size = struct.calcsize(new_fmt)
+            old_fmt = "<HBBBBB"
+            old_size = struct.calcsize(old_fmt)
+            if offset + old_size > end:
                 return None
-            task_id, input_count, output_count, input_groups, output_groups, name_len = struct.unpack_from(
-                fixed_fmt, data, offset
-            )
-            offset += fixed_size
+
+            category = self.CATEGORY_UNKNOWN
+            if offset + new_size <= end:
+                values = struct.unpack_from(new_fmt, data, offset)
+                candidate_name_len = int(values[-1])
+                if offset + new_size + candidate_name_len == end:
+                    (task_id, category, input_count, output_count,
+                     input_groups, output_groups, name_len) = values
+                    offset += new_size
+                else:
+                    values = struct.unpack_from(old_fmt, data, offset)
+                    (task_id, input_count, output_count, input_groups,
+                     output_groups, name_len) = values
+                    offset += old_size
+            else:
+                values = struct.unpack_from(old_fmt, data, offset)
+                (task_id, input_count, output_count, input_groups,
+                 output_groups, name_len) = values
+                offset += old_size
             if offset + name_len != end:
                 return None
             return {
                 "entry_kind": kind,
                 "task_id": int(task_id),
+                "category": int(category),
+                "category_name": self.category_name(category),
                 "input_count": int(input_count),
                 "output_count": int(output_count),
                 "input_timestamp_group_count": int(input_groups),
@@ -769,31 +783,6 @@ class NFv3Parser:
                 "unit": unit,
             }
 
-        if kind == self.SCHEMA_KIND_DATA_NODE:
-            fixed_fmt = "<HHBBBB"
-            fixed_size = struct.calcsize(fixed_fmt)
-            if offset + fixed_size > end:
-                return None
-            node_no, node_id, scalar_type, group_len, name_len, unit_len = struct.unpack_from(
-                fixed_fmt, data, offset
-            )
-            offset += fixed_size
-            if offset + group_len + name_len + unit_len != end:
-                return None
-            group = data[offset:offset + group_len].decode("utf-8", errors="ignore")
-            offset += group_len
-            name = data[offset:offset + name_len].decode("utf-8", errors="ignore")
-            offset += name_len
-            unit = data[offset:offset + unit_len].decode("utf-8", errors="ignore")
-            return {
-                "entry_kind": kind,
-                "node_no": int(node_no),
-                "node_id": int(node_id),
-                "scalar_type": int(scalar_type),
-                "group": group,
-                "name": name,
-                "unit": unit,
-            }
         return None
 
     def _parse_control(self, data: bytes, name: str):

@@ -1936,7 +1936,7 @@ class DataReceiver:
         used_names = set()
         ordered_descriptors = []
         task_order_by_id = {}
-        dataflow_group_order = {}
+        task_section_by_id = {}
 
         def add_descriptor(key, desc, base_name, suffix):
             var_name = base_name
@@ -1953,21 +1953,28 @@ class DataReceiver:
             if int(entry.get("entry_kind", 0)) != self.nf_parser.SCHEMA_KIND_TASK:
                 continue
             task_id = int(entry["task_id"])
+            category = self.nf_parser.category_name(entry.get("category", 0))
             owner = entry.get("name") or f"Task{task_id}"
+            section = (
+                f"Function/{owner}"
+                if category == "function"
+                else f"Task/{task_id}"
+            )
             task_order = len(task_order_by_id)
             task_order_by_id[task_id] = task_order
+            task_section_by_id[task_id] = section
             add_descriptor(
                 ("task_latency", task_id),
                 {
                     "descriptor_kind": "task_latency",
-                    "category": "task",
+                    "category": category,
                     "task_id": task_id,
                     "task_order": task_order,
                     "owner": owner,
                     "name": "latency_us",
                     "display_name": "latency_us",
                     "unit": "us",
-                    "section": f"Task/{task_id}",
+                    "section": section,
                     "source": f"{self.NF_SOURCE_PREFIX}task:{task_id}:latency",
                     "hidden_control": True,
                 },
@@ -1986,6 +1993,7 @@ class DataReceiver:
                 slot = int(entry["slot"])
                 task = self.nf_parser.schema_tasks.get(task_id, {})
                 owner = task.get("name") or f"Task{task_id}"
+                category = self.nf_parser.category_name(task.get("category", 0))
                 endpoint_name = entry.get("name") or f"port_{slot}"
                 if direction == self.nf_parser.PORT_INPUT:
                     direction_name = "input"
@@ -1997,7 +2005,7 @@ class DataReceiver:
                 desc = {
                     "entry_kind": entry_kind,
                     "descriptor_kind": "task_port",
-                    "category": "task",
+                    "category": category,
                     "task_id": task_id,
                     "task_order": task_order_by_id.get(task_id, task_id),
                     "direction": direction,
@@ -2008,38 +2016,13 @@ class DataReceiver:
                     "name": endpoint_name,
                     "display_name": endpoint_name,
                     "unit": entry.get("unit", ""),
-                    "section": f"Task/{task_id}",
-                    "source": source,
-                }
-            elif entry_kind == self.nf_parser.SCHEMA_KIND_DATA_NODE:
-                node_no = int(entry["node_no"])
-                group = entry.get("group") or "Dataflow"
-                if group not in dataflow_group_order:
-                    dataflow_group_order[group] = len(dataflow_group_order)
-                endpoint_name = entry.get("name") or f"node_{node_no}"
-                key = ("node", node_no)
-                base_name = f"Dataflow.{endpoint_name}"
-                source = f"{self.NF_SOURCE_PREFIX}node:{node_no}"
-                desc = {
-                    "entry_kind": entry_kind,
-                    "descriptor_kind": "data_node",
-                    "category": "dataflow",
-                    "group": group,
-                    "group_order": dataflow_group_order[group],
-                    "node_no": node_no,
-                    "node_id": int(entry["node_id"]),
-                    "scalar_type": int(entry["scalar_type"]),
-                    "owner": "Dataflow",
-                    "name": endpoint_name,
-                    "display_name": endpoint_name,
-                    "unit": entry.get("unit", ""),
-                    "section": f"Dataflow/{group}",
+                    "section": task_section_by_id.get(task_id, f"Task/{task_id}"),
                     "source": source,
                 }
             else:
                 continue
 
-            suffix = desc.get("node_no", desc.get("slot", 0))
+            suffix = desc.get("slot", 0)
             add_descriptor(key, desc, base_name, suffix)
 
         self.nf_schema = schema
@@ -2164,11 +2147,6 @@ class DataReceiver:
                         item["raw"],
                         item["capture_age_us"],
                     )
-
-        for frame in packet["node_frames"]:
-            if int(frame.get("status", 0)) != 1:
-                continue
-            publish(("node", int(frame["node_no"])), frame["raw"], frame["publish_age_us"])
 
     def _process_udp_packet(self, data, unix_ts, meta):
         remote_addr = meta.get("remote_addr")
