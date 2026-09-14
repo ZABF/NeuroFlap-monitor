@@ -23,6 +23,7 @@ SECTION_DATAFLOW = (255, 107, 107)
 SECTION_BUSINESS = (185, 133, 255)
 SECTION_DEVICE = (88, 214, 141)
 SECTION_SYSTEM = (78, 161, 255)
+SECTION_FUNCTION = (80, 201, 190)
 
 
 def _hex(rgb):
@@ -127,6 +128,7 @@ QGroupBox[sectionKind="dataflow"] {{ border: 2px solid {_hex(SECTION_DATAFLOW)};
 QGroupBox[sectionKind="business"] {{ border: 2px solid {_hex(SECTION_BUSINESS)}; }}
 QGroupBox[sectionKind="device"] {{ border: 2px solid {_hex(SECTION_DEVICE)}; }}
 QGroupBox[sectionKind="system"] {{ border: 2px solid {_hex(SECTION_SYSTEM)}; }}
+QGroupBox[sectionKind="function"] {{ border: 2px solid {_hex(SECTION_FUNCTION)}; }}
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
     background-color: {INPUT_BG_HEX};
     color: {TEXT_HEX};

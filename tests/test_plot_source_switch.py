@@ -89,7 +89,7 @@ def _task_descriptors():
             "var_name": "Dataflow.armed",
             "section": "Dataflow/control",
             "category": "dataflow",
-            "descriptor_kind": "data_node",
+            "descriptor_kind": "dataflow_value",
             "display_name": "armed",
             "group_order": 0,
         },
@@ -656,15 +656,15 @@ class PlotSourceSwitchTest(unittest.TestCase):
 
     def test_task_groups_sort_business_then_device_then_system(self):
         descriptors = []
-        for task_id, name in (
-            (0x1001, "SystemTask"),
-            (0x2001, "DeviceTask"),
-            (0x3001, "BusinessTask"),
+        for task_id, name, category in (
+            (0x1001, "SystemTask", "system"),
+            (0x3001, "DeviceTask", "device"),
+            (0x2001, "BusinessTask", "business"),
         ):
             descriptors.append({
                 "var_name": f"{name}.latency_us",
                 "section": f"Task/{task_id}",
-                "category": "task",
+                "category": category,
                 "descriptor_kind": "task_latency",
                 "task_id": task_id,
                 "task_order": 0,
@@ -678,20 +678,20 @@ class PlotSourceSwitchTest(unittest.TestCase):
 
         self.assertEqual(
             self.window.dataflow_export_section_order,
-            ["Task/12289", "Task/8193", "Task/4097"],
+            ["Task/8193", "Task/12289", "Task/4097"],
         )
 
     def test_custom_section_order_survives_schema_refresh_and_can_reset(self):
         descriptors = [_task_descriptors()[0]]
-        for task_id, name in (
-            (0x1001, "SystemTask"),
-            (0x2001, "DeviceTask"),
-            (0x3001, "BusinessTask"),
+        for task_id, name, category in (
+            (0x1001, "SystemTask", "system"),
+            (0x3001, "DeviceTask", "device"),
+            (0x2001, "BusinessTask", "business"),
         ):
             descriptors.append({
                 "var_name": f"{name}.latency_us",
                 "section": f"Task/{task_id}",
-                "category": "task",
+                "category": category,
                 "descriptor_kind": "task_latency",
                 "task_id": task_id,
                 "owner": name,
@@ -711,7 +711,7 @@ class PlotSourceSwitchTest(unittest.TestCase):
         self.window.reset_section_layout()
         self.assertEqual(
             self.window.dataflow_export_section_order,
-            ["Dataflow/control", "Task/12289", "Task/8193", "Task/4097"],
+            ["Dataflow/control", "Task/8193", "Task/12289", "Task/4097"],
         )
 
     def test_latency_selection_uses_header_and_keeps_theme_color_after_curve_change(self):

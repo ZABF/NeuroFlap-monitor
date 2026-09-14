@@ -12,6 +12,7 @@ _CATEGORY_LABELS = {
     "business": "Business",
     "device": "Device",
     "system": "System",
+    "function": "Function",
     "node": "Node",
     "task": "Task",
     "derived": "Derived",
@@ -65,10 +66,12 @@ def signal_choice(variable, descriptor=None):
     ):
         owner, direction, display_name = _task_parts(variable, descriptor)
         task_id = descriptor.get("task_id")
-        task_domain = (
-            task_section_kind(task_id) if task_id not in (None, "") else ""
+        declared_domain = task_section_kind(task_id, category)
+        domain = (
+            declared_domain
+            if declared_domain in ("business", "device", "system", "function", "task")
+            else "task"
         )
-        domain = task_domain or "task"
         direction_label = {0: "Input", 1: "Output"}.get(direction, "Runtime")
         task_order = descriptor.get("task_order")
         task_order = int(

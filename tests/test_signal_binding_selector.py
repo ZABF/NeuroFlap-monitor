@@ -14,7 +14,7 @@ from ui.signal_binding_selector import (
 DESCRIPTORS = {
     "MadgwickTask.input.acc_x": {
         "descriptor_kind": "task_port",
-        "category": "task",
+        "category": "business",
         "task_id": 0x3001,
         "task_order": 1,
         "direction": 0,
@@ -24,7 +24,7 @@ DESCRIPTORS = {
     },
     "MadgwickTask.output.roll": {
         "descriptor_kind": "task_port",
-        "category": "task",
+        "category": "business",
         "task_id": 0x3001,
         "task_order": 1,
         "direction": 1,
@@ -34,7 +34,7 @@ DESCRIPTORS = {
     },
     "SensorTask.output.acc_x": {
         "descriptor_kind": "task_port",
-        "category": "task",
+        "category": "device",
         "task_id": 0x2001,
         "task_order": 0,
         "direction": 1,
@@ -44,7 +44,7 @@ DESCRIPTORS = {
     },
     "SysDataflowExportTask.output.ready": {
         "descriptor_kind": "task_port",
-        "category": "task",
+        "category": "system",
         "task_id": 0x1001,
         "task_order": 0,
         "direction": 1,
