@@ -4,6 +4,7 @@ import time
 
 from network_clock import AffineClockEstimator
 from nfv4_codec import NFv4Codec
+from host_clock import HostClockSample, capture_host_clocks_us
 
 
 class NFv4ClockClient:
@@ -186,12 +187,22 @@ class NFv4ClockClient:
             stage=stage,
             flags=flags,
         )
-        t1_us = send_packet(packet)
-        if not t1_us:
+        sent_at = send_packet(packet)
+        if not sent_at:
             with self._lock:
                 self._request_send_failures += 1
                 self._last_failure = "sync request send failed"
             return False
+
+        if isinstance(sent_at, HostClockSample):
+            t1_us = int(sent_at.raw_us)
+            t1_monotonic_us = int(sent_at.monotonic_us)
+        elif isinstance(sent_at, (tuple, list)) and len(sent_at) >= 2:
+            t1_us = int(sent_at[0])
+            t1_monotonic_us = int(sent_at[1])
+        else:
+            t1_us = int(sent_at)
+            t1_monotonic_us = t1_us
 
         with self._lock:
             if session_id != self._session_id:
@@ -199,9 +210,11 @@ class NFv4ClockClient:
                 self._last_failure = "session changed while sending request"
                 return False
             self._requests_sent += 1
-            self._last_send_us = int(t1_us)
+            self._last_send_us = t1_monotonic_us
             self._outstanding[sequence] = (
-                int(t1_us),
+                t1_monotonic_us,
+                t1_us,
+                t1_monotonic_us,
                 context,
                 int(stage) & 0xFF,
             )
@@ -209,8 +222,22 @@ class NFv4ClockClient:
                 self._outstanding.popitem(last=False)
         return True
 
-    def handle_response(self, data, t4_us=None):
-        t4_us = int(t4_us or time.monotonic_ns() // 1000)
+    def handle_response(
+        self,
+        data,
+        t4_us=None,
+        *,
+        t4_monotonic_us=None,
+        now_us=None,
+    ):
+        if t4_us is None:
+            captured = capture_host_clocks_us()
+            t4_us = captured.raw_us
+            t4_monotonic_us = captured.monotonic_us
+        else:
+            t4_us = int(t4_us)
+            t4_monotonic_us = int(t4_monotonic_us or t4_us)
+        now_us = int(now_us or t4_monotonic_us)
         with self._lock:
             self._responses_seen += 1
         packet = self.codec.parse_sync_response(data)
@@ -220,7 +247,7 @@ class NFv4ClockClient:
                 self._last_failure = "invalid sync response"
             return False
         with self._lock:
-            self._prune_expired_locked(t4_us)
+            self._prune_expired_locked(now_us)
             if packet["session_id"] != self._session_id:
                 self._response_session_mismatches += 1
                 self._last_failure = "sync response session mismatch"
@@ -230,7 +257,13 @@ class NFv4ClockClient:
                 self._response_unknown_sequences += 1
                 self._last_failure = "sync response sequence not outstanding"
                 return False
-            t1_us, context, stage = pending
+            (
+                _sent_monotonic_us,
+                t1_us,
+                t1_monotonic_us,
+                context,
+                stage,
+            ) = pending
             if (
                 packet["context"] != context
                 or packet["stage"] != stage
@@ -238,9 +271,9 @@ class NFv4ClockClient:
                 self._response_context_mismatches += 1
                 self._last_failure = "sync response context mismatch"
                 return False
-            self._last_response_us = t4_us
+            self._last_response_us = now_us
             if context == 0:
-                self._last_baseline_response_us = t4_us
+                self._last_baseline_response_us = now_us
             self._responses_matched += 1
             self._last_failure = ""
 
@@ -294,6 +327,8 @@ class NFv4ClockClient:
                 "t2_us": packet["t2_us"],
                 "t3_us": packet["t3_us"],
                 "t4_us": t4_us,
+                "t1_monotonic_us": t1_monotonic_us,
+                "t4_monotonic_us": t4_monotonic_us,
                 "upload_us": upload_us,
                 "download_us": download_us,
                 "rtt_us": rtt_us,

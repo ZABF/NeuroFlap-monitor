@@ -8,6 +8,7 @@ from network_clock import (
 )
 from nfv4_clock_client import NFv4ClockClient
 from nfv4_codec import NFv4Codec
+from host_clock import HostClockSample
 
 
 class NFv4ClockClientTest(unittest.TestCase):
@@ -117,6 +118,36 @@ class NFv4ClockClientTest(unittest.TestCase):
         )
         self.assertEqual(len(loaded), 1)
         self.assertEqual(len(baseline), 1)
+
+    def test_protocol_uses_raw_while_timeout_uses_monotonic(self):
+        sent = []
+        self.assertTrue(
+            self.client.tick(
+                lambda packet: sent.append(packet)
+                or HostClockSample(50_000_000, 2_000_000),
+                now_us=2_000_000,
+            )
+        )
+        response = self.response(
+            sent[0],
+            t2_us=49_500_700,
+            t3_us=49_500_740,
+        )
+
+        self.assertTrue(
+            self.client.handle_response(
+                response,
+                50_001_600,
+                t4_monotonic_us=2_001_600,
+                now_us=2_001_600,
+            )
+        )
+        measurement = self.client.take_measurement()
+        self.assertEqual(measurement["t1_us"], 50_000_000)
+        self.assertEqual(measurement["t4_us"], 50_001_600)
+        self.assertEqual(measurement["t1_monotonic_us"], 2_000_000)
+        self.assertEqual(measurement["t4_monotonic_us"], 2_001_600)
+        self.assertEqual(self.client.last_response_us, 2_001_600)
 
     def test_baseline_interval_is_fixed_at_ten_hz(self):
         sent = []

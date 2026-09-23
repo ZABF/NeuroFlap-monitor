@@ -58,6 +58,7 @@ CLOCK_MODEL_FIELDS = (
     "domain",
     "session",
     "mode",
+    "host_clock",
     "source_anchor_us",
     "target_anchor_unix_us",
     "offset_us",
@@ -79,8 +80,11 @@ CLOCK_OBSERVATION_FIELDS = (
     "t2_us",
     "t3_us",
     "t4_us",
+    "t1_monotonic_us",
+    "t4_monotonic_us",
     "source_us",
     "receive_us",
+    "receive_monotonic_us",
 )
 
 
@@ -210,7 +214,12 @@ def write_monitor_csv(path, series, metadata=None, clock_data=None):
     file_metadata["active_alignment_mode"] = clock_data.get(
         "active_mode", "realtime"
     )
-    for key in ("monitor_monotonic_anchor_us", "monitor_unix_anchor_us"):
+    for key in (
+        "monitor_clock",
+        "monitor_raw_anchor_us",
+        "monitor_monotonic_anchor_us",
+        "monitor_unix_anchor_us",
+    ):
         value = clock_data.get(key)
         if value not in (None, ""):
             file_metadata[key] = value
@@ -223,6 +232,8 @@ def write_monitor_csv(path, series, metadata=None, clock_data=None):
             "value_space",
             "timestamp_space",
             "active_alignment_mode",
+            "monitor_clock",
+            "monitor_raw_anchor_us",
             "monitor_monotonic_anchor_us",
             "monitor_unix_anchor_us",
             "protocol",
@@ -531,11 +542,13 @@ def read_monitor_csv(path):
         }
 
         active_mode = metadata.get("active_alignment_mode", "realtime")
+        primary_host_clock = metadata.get("monitor_clock", "monotonic")
         model_index = {
             (
                 model.get("domain", ""),
                 _optional_int(model.get("session", "")) or 1,
                 model.get("mode", ""),
+                model.get("host_clock", "") or primary_host_clock,
             ): model
             for model in clock_models
         }
@@ -556,9 +569,13 @@ def read_monitor_csv(path):
                 if unit == "raw_us":
                     raw_us = int(round(timestamp))
                     domain = series[name].get("clock_domain", "monitor")
-                    model = model_index.get((domain, session, active_mode))
+                    model = model_index.get(
+                        (domain, session, active_mode, primary_host_clock)
+                    )
                     if model is None and active_mode == "calibrated":
-                        model = model_index.get((domain, session, "realtime"))
+                        model = model_index.get(
+                            (domain, session, "realtime", primary_host_clock)
+                        )
                     aligned_us = (
                         _clock_model_transform(model, raw_us)
                         if model is not None

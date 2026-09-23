@@ -180,12 +180,15 @@ class MonitorCsvTest(unittest.TestCase):
             }],
             clock_data={
                 "active_mode": "calibrated",
+                "monitor_clock": "monotonic_raw",
+                "monitor_raw_anchor_us": 90,
                 "monitor_monotonic_anchor_us": 100,
                 "monitor_unix_anchor_us": 1_000_100,
                 "models": [{
                     "domain": "ft",
                     "session": 2,
                     "mode": "calibrated",
+                    "host_clock": "monotonic_raw",
                     "source_anchor_us": 1_000_000,
                     "target_anchor_unix_us": 2_000_000,
                     "offset_us": 1_000_000,
@@ -203,6 +206,7 @@ class MonitorCsvTest(unittest.TestCase):
                     "session": 2,
                     "source_us": 1_000_000,
                     "receive_us": 1_500_000,
+                    "receive_monotonic_us": 1_500_010,
                 }],
             },
         )
@@ -217,7 +221,12 @@ class MonitorCsvTest(unittest.TestCase):
             document.series["F_X"]["timestamps"][1], 2001.0001
         )
         self.assertEqual(document.clock_models[0]["domain"], "ft")
+        self.assertEqual(document.clock_models[0]["host_clock"], "monotonic_raw")
         self.assertEqual(document.clock_observations[0]["receive_us"], "1500000")
+        self.assertEqual(
+            document.clock_observations[0]["receive_monotonic_us"],
+            "1500010",
+        )
 
     def test_v4_clock_evidence_survives_without_data_columns(self):
         write_monitor_csv(

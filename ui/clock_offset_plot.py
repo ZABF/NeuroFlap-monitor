@@ -75,7 +75,11 @@ class ClockOffsetPlot(QWidget):
     def set_data(self, payload):
         self._payload = payload
         count = int(payload.get("count", 0))
-        identity = (payload.get("domain"), payload.get("session"))
+        identity = (
+            payload.get("domain"),
+            payload.get("session"),
+            payload.get("host_clock"),
+        )
         identity_changed = identity != self._series_identity
         self._series_identity = identity
 
@@ -89,10 +93,20 @@ class ClockOffsetPlot(QWidget):
 
         domain = str(payload["domain"])
         domain_name = "NeuroFlap" if domain == "neuroflap" else "FT"
+        host_clock = str(payload.get("host_clock", "monotonic_raw"))
+        clock_name = (
+            "CLOCK_MONOTONIC"
+            if host_clock == "monotonic"
+            else "CLOCK_MONOTONIC_RAW"
+        )
         baseline_ms = float(payload["baseline_offset_ms"])
+        fitted_ppm = payload.get("calibrated_ppm")
+        fit_text = (
+            "" if fitted_ppm is None else f" | fit {float(fitted_ppm):+.2f} ppm"
+        )
         self.summary_label.setText(
-            f"{domain_name} | session {int(payload['session'])} | "
-            f"{count} observations | reference {baseline_ms:.3f} ms"
+            f"{domain_name} | {clock_name} | session {int(payload['session'])} | "
+            f"{count} observations | reference {baseline_ms:.3f} ms{fit_text}"
         )
 
         x_values = payload["elapsed_s"]

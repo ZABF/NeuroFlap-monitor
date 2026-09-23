@@ -193,6 +193,14 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
             model.has_calibrated_clock_transform(receiver.NF_CLOCK_SOURCE, 1)
         )
         self.assertEqual(window.clock_calibration_updates, 1)
+        self.assertIn(
+            ("neuroflap", 1, "monotonic_raw"),
+            receiver.clock_comparison_models,
+        )
+        self.assertIn(
+            ("neuroflap", 1, "monotonic"),
+            receiver.clock_comparison_models,
+        )
         plot_data = receiver.get_clock_offset_plot_data("neuroflap")
         self.assertEqual(plot_data["count"], 40)
         self.assertEqual(len(plot_data["lower_delta_ms"]), 40)

@@ -17,6 +17,7 @@ import serial.tools.list_ports
 
 from data_transporter import DataTransporter
 from clock_alignment import AlignmentMode
+from host_clock import HOST_CLOCK_MONOTONIC, HOST_CLOCK_RAW
 from ui.RelativeTimeAxis import RelativeTimeAxis
 from ui.clock_offset_plot import ClockOffsetPlot
 from data_model import DataModel
@@ -302,6 +303,12 @@ class PlotWindow(QWidget):
         self.clock_domain_combo.addItem("NeuroFlap", "neuroflap")
         self.clock_domain_combo.addItem("FT", "ft")
         self.clock_domain_combo.currentIndexChanged.connect(
+            lambda _index: self._refresh_clock_offset_plot(force=True)
+        )
+        self.clock_host_combo = QComboBox()
+        self.clock_host_combo.addItem("CLOCK_MONOTONIC_RAW", HOST_CLOCK_RAW)
+        self.clock_host_combo.addItem("CLOCK_MONOTONIC", HOST_CLOCK_MONOTONIC)
+        self.clock_host_combo.currentIndexChanged.connect(
             lambda _index: self._refresh_clock_offset_plot(force=True)
         )
         self.clock_offset_plot = None
@@ -848,6 +855,7 @@ class PlotWindow(QWidget):
         form.addRow("Calibration:", self.clock_align_btn)
         form.addRow("Status:", self.clock_alignment_status_label)
         form.addRow("Domain:", self.clock_domain_combo)
+        form.addRow("Host clock:", self.clock_host_combo)
 
         self.clock_offset_plot = ClockOffsetPlot(dialog)
 
@@ -923,7 +931,7 @@ class PlotWindow(QWidget):
             model = item.get("model")
             if model:
                 calibrated.append(
-                    f"{domain} {model['rating']} "
+                    f"{domain} RAW {model['rating']} "
                     f"{float(model['drift_ppm']):+.2f} ppm"
                 )
         self.clock_alignment_status_label.setText(
@@ -943,12 +951,15 @@ class PlotWindow(QWidget):
         ):
             return
         domain = str(self.clock_domain_combo.currentData() or "neuroflap")
-        signature = self.data_receiver.get_clock_offset_plot_signature(domain)
+        host_clock = str(self.clock_host_combo.currentData() or HOST_CLOCK_RAW)
+        signature = self.data_receiver.get_clock_offset_plot_signature_for_clock(
+            domain, host_clock
+        )
         if not force and signature == self._clock_offset_plot_signature:
             return
         self._clock_offset_plot_signature = signature
         self.clock_offset_plot.set_data(
-            self.data_receiver.get_clock_offset_plot_data(domain)
+            self.data_receiver.get_clock_offset_plot_data(domain, host_clock)
         )
 
     @staticmethod
