@@ -1,11 +1,47 @@
 import unittest
 from array import array
 
+from clock_alignment import AlignmentMode
 from data_model import DataModel
 from network_clock import ClockTransform
 
 
 class DataModelTest(unittest.TestCase):
+    def test_alignment_mode_switches_complete_history_between_models(self):
+        model = DataModel([])
+        model.add_data(
+            "source",
+            2_000.0,
+            1_000.0,
+            {"value": 1.0},
+            offset_src="clock",
+        )
+        model.set_clock_transform(
+            "clock",
+            ClockTransform(
+                source_anchor_us=1_000_000,
+                target_anchor_us=2_000_000,
+                usable=True,
+                epoch=1,
+            ),
+        )
+        model.set_calibrated_clock_transform(
+            "clock",
+            ClockTransform(
+                source_anchor_us=1_000_000,
+                target_anchor_us=3_000_000,
+                drift_ppb=100_000,
+                usable=True,
+                epoch=1,
+            ),
+        )
+
+        self.assertEqual(model.get_series("value"), ([2000.0], [1.0]))
+        model.set_alignment_mode(AlignmentMode.CALIBRATED)
+        self.assertEqual(model.get_series("value"), ([3000.0], [1.0]))
+        model.set_alignment_mode(AlignmentMode.REALTIME)
+        self.assertEqual(model.get_series("value"), ([2000.0], [1.0]))
+
     def test_history_uses_compact_numeric_arrays(self):
         model = DataModel([])
         model.add_data("source", 1000.0, 10.0, {"value": 3.0})
@@ -14,6 +50,14 @@ class DataModelTest(unittest.TestCase):
         self.assertIsInstance(model.sources["source"].recon_timestamp, array)
         self.assertIsInstance(model.sources["source"].session, array)
         self.assertIsInstance(model.vars["value"].value, array)
+
+    def test_replacing_series_clears_compact_arrays(self):
+        model = DataModel([])
+        model.add_series("value", "source", [1.0], [2.0])
+
+        model.add_series("value", "source", [3.0, 4.0], [5.0, 6.0])
+
+        self.assertEqual(model.get_series("value"), ([3.0, 4.0], [5.0, 6.0]))
 
     def test_time_range_returns_only_requested_samples(self):
         model = DataModel([])

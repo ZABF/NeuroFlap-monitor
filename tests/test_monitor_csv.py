@@ -16,7 +16,7 @@ class MonitorCsvTest(unittest.TestCase):
         if os.path.exists(self.path):
             os.unlink(self.path)
 
-    def test_v3_round_trip_preserves_independent_time_axes_and_task_metadata(self):
+    def test_v4_round_trip_preserves_raw_time_axes_and_task_metadata(self):
         series = [
             {
                 "name": "MadgwickTask.input.pitch",
@@ -61,20 +61,23 @@ class MonitorCsvTest(unittest.TestCase):
         self.assertEqual(count, 2)
         with open(self.path, "r", newline="", encoding="utf-8") as fp:
             rows = list(csv.reader(fp))
-        self.assertEqual(rows[0], ["#NFMonitorCSV", "3"])
+        self.assertEqual(rows[0], ["#NFMonitorCSV", "4"])
         header = next(row for row in rows if row and not row[0].startswith("#"))
         self.assertEqual(
             header,
             [
-                "MadgwickTask.input.pitch_time_us",
+                "MadgwickTask.input.pitch_time_raw_us",
+                "MadgwickTask.input.pitch_session",
                 "MadgwickTask.input.pitch_value",
-                "MadgwickTask.latency_us_time_us",
+                "MadgwickTask.latency_us_time_raw_us",
+                "MadgwickTask.latency_us_session",
                 "MadgwickTask.latency_us_value",
             ],
         )
         first_data_index = rows.index(header) + 1
-        self.assertEqual(rows[first_data_index][0], "0")
-        self.assertEqual(rows[first_data_index][2], "80")
+        self.assertEqual(rows[first_data_index][0], "1784700000000000")
+        self.assertEqual(rows[first_data_index][1], "1")
+        self.assertEqual(rows[first_data_index][3], "1784700000000080")
 
         document = read_monitor_csv(self.path)
         self.assertEqual(document.metadata["protocol"], "NFv3")
@@ -159,11 +162,90 @@ class MonitorCsvTest(unittest.TestCase):
     def test_newer_format_version_is_rejected(self):
         with open(self.path, "w", newline="", encoding="utf-8") as fp:
             writer = csv.writer(fp)
-            writer.writerow(["#NFMonitorCSV", "4"])
+            writer.writerow(["#NFMonitorCSV", "5"])
             writer.writerow(["pitch_time_us", "pitch_value"])
             writer.writerow(["0", "1"])
         with self.assertRaisesRegex(ValueError, "Unsupported NFMonitorCSV version"):
             read_monitor_csv(self.path)
+
+    def test_v4_clock_models_and_observations_round_trip(self):
+        write_monitor_csv(
+            self.path,
+            [{
+                "name": "F_X",
+                "raw_timestamps": [1000.0, 1001.0],
+                "sessions": [2, 2],
+                "values": [1.0, 2.0],
+                "clock_domain": "ft",
+            }],
+            clock_data={
+                "active_mode": "calibrated",
+                "monitor_monotonic_anchor_us": 100,
+                "monitor_unix_anchor_us": 1_000_100,
+                "models": [{
+                    "domain": "ft",
+                    "session": 2,
+                    "mode": "calibrated",
+                    "source_anchor_us": 1_000_000,
+                    "target_anchor_unix_us": 2_000_000,
+                    "offset_us": 1_000_000,
+                    "drift_ppm": 100.0,
+                    "uncertainty_us": 20.0,
+                    "rating": "Good",
+                    "sample_count": 10,
+                    "representative_count": 5,
+                    "span_us": 10_000_000,
+                    "residual_us": 10.0,
+                    "drift_uncertainty_ppb": 500.0,
+                }],
+                "observations": [{
+                    "domain": "ft",
+                    "session": 2,
+                    "source_us": 1_000_000,
+                    "receive_us": 1_500_000,
+                }],
+            },
+        )
+
+        document = read_monitor_csv(self.path)
+
+        self.assertEqual(document.metadata["active_alignment_mode"], "calibrated")
+        self.assertEqual(document.series["F_X"]["raw_timestamps"], [1000.0, 1001.0])
+        self.assertEqual(document.series["F_X"]["sessions"], [2, 2])
+        self.assertEqual(document.series["F_X"]["timestamps"][0], 2000.0)
+        self.assertAlmostEqual(
+            document.series["F_X"]["timestamps"][1], 2001.0001
+        )
+        self.assertEqual(document.clock_models[0]["domain"], "ft")
+        self.assertEqual(document.clock_observations[0]["receive_us"], "1500000")
+
+    def test_v4_clock_evidence_survives_without_data_columns(self):
+        write_monitor_csv(
+            self.path,
+            [],
+            clock_data={
+                "models": [{
+                    "domain": "neuroflap",
+                    "session": 3,
+                    "mode": "realtime",
+                }],
+                "observations": [{
+                    "domain": "neuroflap",
+                    "session": 3,
+                    "sequence": 9,
+                    "t1_us": 10,
+                    "t2_us": 20,
+                    "t3_us": 30,
+                    "t4_us": 40,
+                }],
+            },
+        )
+
+        document = read_monitor_csv(self.path)
+
+        self.assertEqual(document.series, {})
+        self.assertEqual(document.clock_models[0]["session"], "3")
+        self.assertEqual(document.clock_observations[0]["sequence"], "9")
 
 
 if __name__ == "__main__":

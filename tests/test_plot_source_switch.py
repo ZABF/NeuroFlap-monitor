@@ -152,7 +152,7 @@ class PlotSourceSwitchTest(unittest.TestCase):
         DataReceiver.start = self.original_start
 
     def test_window_title_tracks_monitor_release(self):
-        self.assertEqual(self.window.windowTitle(), "Monitor v3.4.1")
+        self.assertEqual(self.window.windowTitle(), "Monitor v3.5.0")
 
     def test_window_minimum_width_fits_wide_desktop_viewport(self):
         self.assertLessEqual(self.window.minimumSizeHint().width(), 1600)
@@ -396,7 +396,7 @@ class PlotSourceSwitchTest(unittest.TestCase):
         self.assertEqual(self.window.timeline.state, TimelineState.FOLLOW_LIVE)
         self.assertEqual(self.window.timeline.playhead_ms, 1020.0)
 
-    def test_live_uses_committed_time_and_pause_enables_history_alignment(self):
+    def test_live_and_pause_use_the_selected_clock_model(self):
         self.window.timeline.begin_live()
         self.window.data_model.add_data(
             "source-a",
@@ -419,7 +419,7 @@ class PlotSourceSwitchTest(unittest.TestCase):
         self.window.available_raw_variables = {"a"}
         self.window._refresh_timeline_bounds(force=True)
 
-        self.assertEqual(self.window._curve_source_data("a"), ([2100.0], [1.0]))
+        self.assertEqual(self.window._curve_source_data("a"), ([3000.0], [1.0]))
 
         self.window.timeline.pause()
 
@@ -486,29 +486,44 @@ class PlotSourceSwitchTest(unittest.TestCase):
         self.assertIn(self.window.nf_status_label, connection_widgets)
         self.assertIs(connection_widgets[-1], self.window.reset_section_layout_btn)
         self.assertNotIn(self.window.active_source_label, connection_widgets)
-        self.assertNotIn(self.window.nf_clock_strategy_combo, connection_widgets)
 
         self.assertIn(self.window.active_source_label, status_widgets)
         self.assertIn(self.window.nf_clock_label, status_widgets)
         self.assertIn(self.window.nf_snapshot_contention_label, status_widgets)
         self.assertIn(self.window.nf_clock_settings_btn, status_widgets)
-        self.assertNotIn(self.window.nf_clock_strategy_combo, status_widgets)
         self.assertNotIn(
             "ESP32 Dataflow Export (Dynamic):",
             [label.text() for label in self.window.findChildren(QLabel)],
         )
 
-    def test_clock_estimator_selection_lives_in_time_alignment_dialog(self):
+    def test_time_alignment_dialog_contains_offset_plot(self):
         self.window._show_clock_settings()
 
         self.assertEqual(
             self.window.clock_settings_dialog.windowTitle(), "Time Alignment"
         )
         self.assertIs(
-            self.window.nf_clock_strategy_combo.window(),
+            self.window.alignment_mode_combo.window(),
+            self.window.clock_settings_dialog,
+        )
+        self.assertIs(
+            self.window.clock_offset_plot.window(),
             self.window.clock_settings_dialog,
         )
         self.assertTrue(self.window.clock_settings_dialog.isVisible())
+
+    def test_time_alignment_plot_shows_all_neuroflap_offsets(self):
+        observations = self.window.data_receiver.clock_observations
+        observations.add_neuroflap(1, 1, 1_000, 900, 910, 1_020)
+        observations.add_neuroflap(1, 2, 2_000, 1_895, 1_905, 2_030)
+
+        self.window._show_clock_settings()
+
+        plot = self.window.clock_offset_plot
+        self.assertEqual(len(plot.observed_curve.xData), 2)
+        self.assertEqual(len(plot.lower_curve.xData), 2)
+        self.assertEqual(len(plot.upper_curve.xData), 2)
+        self.assertIn("2 observations", plot.summary_label.text())
 
     def test_clock_alignment_status_is_compact_and_has_detailed_tooltip(self):
         self.window.data_receiver.get_nfv3_status = lambda: {
@@ -532,7 +547,7 @@ class PlotSourceSwitchTest(unittest.TestCase):
 
         self.assertEqual(
             self.window.nf_clock_label.text(),
-            "Sync: Locked +/-0.18 ms | +72.4 ppm",
+            "Sync: Realtime offset +/-0.18 ms",
         )
         self.assertIn("minimum RTT: 900.0 us", self.window.nf_clock_label.toolTip())
 
@@ -556,26 +571,17 @@ class PlotSourceSwitchTest(unittest.TestCase):
 
         self.assertEqual(
             self.window.nf_clock_label.text(),
-            "Sync: Offset Usable | Drift Candidate +81.5 ppm 69 s",
+            "Sync: Realtime offset +/-0.30 ms",
         )
         tooltip = self.window.nf_clock_label.toolTip()
         self.assertIn("applied drift: +0.000 ppm", tooltip)
         self.assertIn("selected candidate: +81.500 ppm", tooltip)
 
-    def test_clock_strategy_combo_switches_estimator_online(self):
-        self.window.data_receiver.nf_connected = True
-        epoch = self.window.data_receiver.nf_clock_estimator.epoch
-
-        self.window.nf_clock_strategy_combo.setCurrentIndex(
-            self.window.nf_clock_strategy_combo.findData("v3")
-        )
-
+    def test_realtime_estimator_is_fixed_to_offset_only(self):
         estimator = self.window.data_receiver.nf_clock_estimator
-        self.assertEqual(estimator.strategy.value, "v3")
-        self.assertEqual(estimator.epoch, epoch)
-        self.assertTrue(
-            self.window.data_receiver._clock_strategy_switch_pending
-        )
+
+        self.assertFalse(estimator.switch_strategy("v3"))
+        self.assertEqual(estimator.transform.drift_ppb, 0.0)
 
     def test_clock_acquiring_status_exposes_transport_progress(self):
         self.window.data_receiver.get_nfv3_status = lambda: {

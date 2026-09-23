@@ -286,6 +286,8 @@ class NFv4ClockClient:
         upload_us = max(0, int(upload_value)) if one_way_valid else None
         with self._lock:
             self._last_measurement = {
+                "session_id": self._session_id,
+                "sequence": packet["sequence"],
                 "context": context,
                 "stage": stage,
                 "t1_us": t1_us,
