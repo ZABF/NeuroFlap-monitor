@@ -4,6 +4,7 @@ import types
 import unittest
 
 from clock_alignment import AlignmentMode
+from host_clock import ALIGNMENT_CLOCK
 from data_model import DataModel
 from nfv3_parser import NFv3Parser
 
@@ -193,13 +194,9 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
             model.has_calibrated_clock_transform(receiver.NF_CLOCK_SOURCE, 1)
         )
         self.assertEqual(window.clock_calibration_updates, 1)
-        self.assertIn(
-            ("neuroflap", 1, "monotonic_raw"),
-            receiver.clock_comparison_models,
-        )
-        self.assertIn(
-            ("neuroflap", 1, "monotonic"),
-            receiver.clock_comparison_models,
+        self.assertEqual(
+            receiver.calibrated_clock_models[("neuroflap", 1)].host_clock,
+            ALIGNMENT_CLOCK,
         )
         plot_data = receiver.get_clock_offset_plot_data("neuroflap")
         self.assertEqual(plot_data["count"], 40)

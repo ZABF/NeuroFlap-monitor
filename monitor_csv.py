@@ -80,11 +80,8 @@ CLOCK_OBSERVATION_FIELDS = (
     "t2_us",
     "t3_us",
     "t4_us",
-    "t1_monotonic_us",
-    "t4_monotonic_us",
     "source_us",
     "receive_us",
-    "receive_monotonic_us",
 )
 
 
@@ -216,8 +213,7 @@ def write_monitor_csv(path, series, metadata=None, clock_data=None):
     )
     for key in (
         "monitor_clock",
-        "monitor_raw_anchor_us",
-        "monitor_monotonic_anchor_us",
+        "monitor_alignment_anchor_us",
         "monitor_unix_anchor_us",
     ):
         value = clock_data.get(key)
@@ -233,8 +229,7 @@ def write_monitor_csv(path, series, metadata=None, clock_data=None):
             "timestamp_space",
             "active_alignment_mode",
             "monitor_clock",
-            "monitor_raw_anchor_us",
-            "monitor_monotonic_anchor_us",
+            "monitor_alignment_anchor_us",
             "monitor_unix_anchor_us",
             "protocol",
             "schema_generation",

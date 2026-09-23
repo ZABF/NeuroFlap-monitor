@@ -4,6 +4,7 @@ import pyqtgraph as pg
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget
 
+from host_clock import alignment_clock_label
 from ui.theme import ACCENT, PLOT_BG_HEX, SUCCESS, TEXT_MUTED, WARNING
 
 
@@ -94,11 +95,7 @@ class ClockOffsetPlot(QWidget):
         domain = str(payload["domain"])
         domain_name = "NeuroFlap" if domain == "neuroflap" else "FT"
         host_clock = str(payload.get("host_clock", "monotonic_raw"))
-        clock_name = (
-            "CLOCK_MONOTONIC"
-            if host_clock == "monotonic"
-            else "CLOCK_MONOTONIC_RAW"
-        )
+        clock_name = alignment_clock_label(host_clock)
         baseline_ms = float(payload["baseline_offset_ms"])
         fitted_ppm = payload.get("calibrated_ppm")
         fit_text = (

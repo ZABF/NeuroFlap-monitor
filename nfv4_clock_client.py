@@ -195,7 +195,7 @@ class NFv4ClockClient:
             return False
 
         if isinstance(sent_at, HostClockSample):
-            t1_us = int(sent_at.raw_us)
+            t1_us = int(sent_at.alignment_us)
             t1_monotonic_us = int(sent_at.monotonic_us)
         elif isinstance(sent_at, (tuple, list)) and len(sent_at) >= 2:
             t1_us = int(sent_at[0])
@@ -232,7 +232,7 @@ class NFv4ClockClient:
     ):
         if t4_us is None:
             captured = capture_host_clocks_us()
-            t4_us = captured.raw_us
+            t4_us = captured.alignment_us
             t4_monotonic_us = captured.monotonic_us
         else:
             t4_us = int(t4_us)
@@ -327,8 +327,6 @@ class NFv4ClockClient:
                 "t2_us": packet["t2_us"],
                 "t3_us": packet["t3_us"],
                 "t4_us": t4_us,
-                "t1_monotonic_us": t1_monotonic_us,
-                "t4_monotonic_us": t4_monotonic_us,
                 "upload_us": upload_us,
                 "download_us": download_us,
                 "rtt_us": rtt_us,

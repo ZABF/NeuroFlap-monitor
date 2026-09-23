@@ -17,11 +17,7 @@ from clock_types import (
     OffsetAlignmentState,
 )
 from clock_v3_fit import fit_v3_statistical_drift
-from host_clock import (
-    HOST_CLOCK_MONOTONIC,
-    HOST_CLOCK_RAW,
-    normalize_host_clock,
-)
+from host_clock import ALIGNMENT_CLOCK
 
 
 NEUROFLAP_CLOCK_DOMAIN = "neuroflap"
@@ -62,7 +58,7 @@ class AlignmentModel:
     transform: ClockTransform
     quality: AlignmentQuality
     fitted_monotonic_us: int = 0
-    host_clock: str = HOST_CLOCK_RAW
+    host_clock: str = ALIGNMENT_CLOCK
 
     def to_dict(self, target_epoch_offset_us=0):
         target_anchor_us = self.transform.target_anchor_us + float(target_epoch_offset_us)
@@ -92,8 +88,6 @@ class NeuroFlapObservation:
     t2_us: int
     t3_us: int
     t4_us: int
-    t1_monotonic_us: int = 0
-    t4_monotonic_us: int = 0
 
 
 @dataclass(frozen=True)
@@ -101,7 +95,6 @@ class FtObservation:
     session: int
     source_us: int
     receive_us: int
-    receive_monotonic_us: int = 0
 
 
 class ClockObservationStore:
@@ -117,12 +110,9 @@ class ClockObservationStore:
         self._nf_t2 = array("Q")
         self._nf_t3 = array("Q")
         self._nf_t4 = array("Q")
-        self._nf_t1_monotonic = array("Q")
-        self._nf_t4_monotonic = array("Q")
         self._ft_session = array("I")
         self._ft_source = array("Q")
         self._ft_receive = array("Q")
-        self._ft_receive_monotonic = array("Q")
 
     def clear(self):
         with self._lock:
@@ -133,12 +123,9 @@ class ClockObservationStore:
                 self._nf_t2,
                 self._nf_t3,
                 self._nf_t4,
-                self._nf_t1_monotonic,
-                self._nf_t4_monotonic,
                 self._ft_session,
                 self._ft_source,
                 self._ft_receive,
-                self._ft_receive_monotonic,
             ):
                 del values[:]
             self._nf_revision += 1
@@ -160,15 +147,9 @@ class ClockObservationStore:
         t2_us,
         t3_us,
         t4_us,
-        t1_monotonic_us=None,
-        t4_monotonic_us=None,
     ):
         values = tuple(int(value) for value in (t1_us, t2_us, t3_us, t4_us))
         if min(values) <= 0 or values[3] < values[0] or values[2] < values[1]:
-            return False
-        t1_monotonic_us = int(t1_monotonic_us or values[0])
-        t4_monotonic_us = int(t4_monotonic_us or values[3])
-        if t1_monotonic_us <= 0 or t4_monotonic_us < t1_monotonic_us:
             return False
         with self._lock:
             self._nf_session.append(int(session) & 0xFFFFFFFF)
@@ -177,24 +158,18 @@ class ClockObservationStore:
             self._nf_t2.append(values[1])
             self._nf_t3.append(values[2])
             self._nf_t4.append(values[3])
-            self._nf_t1_monotonic.append(t1_monotonic_us)
-            self._nf_t4_monotonic.append(t4_monotonic_us)
             self._nf_revision += 1
         return True
 
-    def add_ft(self, session, source_us, receive_us, receive_monotonic_us=None):
+    def add_ft(self, session, source_us, receive_us):
         source_us = int(source_us)
         receive_us = int(receive_us)
         if source_us < 0 or receive_us <= 0:
-            return False
-        receive_monotonic_us = int(receive_monotonic_us or receive_us)
-        if receive_monotonic_us <= 0:
             return False
         with self._lock:
             self._ft_session.append(int(session) & 0xFFFFFFFF)
             self._ft_source.append(source_us)
             self._ft_receive.append(receive_us)
-            self._ft_receive_monotonic.append(receive_monotonic_us)
             self._ft_revision += 1
         return True
 
@@ -209,8 +184,6 @@ class ClockObservationStore:
                     int(self._nf_t2[index]),
                     int(self._nf_t3[index]),
                     int(self._nf_t4[index]),
-                    int(self._nf_t1_monotonic[index]),
-                    int(self._nf_t4_monotonic[index]),
                 )
                 for index in range(len(self._nf_session))
                 if int(self._nf_session[index]) == session
@@ -224,7 +197,6 @@ class ClockObservationStore:
                     int(self._ft_session[index]),
                     int(self._ft_source[index]),
                     int(self._ft_receive[index]),
-                    int(self._ft_receive_monotonic[index]),
                 )
                 for index in range(len(self._ft_session))
                 if int(self._ft_session[index]) == session
@@ -241,8 +213,6 @@ class ClockObservationStore:
                     "t2_us": int(self._nf_t2[index]),
                     "t3_us": int(self._nf_t3[index]),
                     "t4_us": int(self._nf_t4[index]),
-                    "t1_monotonic_us": int(self._nf_t1_monotonic[index]),
-                    "t4_monotonic_us": int(self._nf_t4_monotonic[index]),
                 }
                 for index in range(len(self._nf_session))
             ]
@@ -252,9 +222,6 @@ class ClockObservationStore:
                     "session": int(self._ft_session[index]),
                     "source_us": int(self._ft_source[index]),
                     "receive_us": int(self._ft_receive[index]),
-                    "receive_monotonic_us": int(
-                        self._ft_receive_monotonic[index]
-                    ),
                 }
                 for index in range(len(self._ft_session))
             ]
@@ -557,22 +524,13 @@ def _quality(sample_count, representative_count, span_us, residuals, drift_uncer
     )
 
 
-def fit_neuroflap(session, observations, host_clock=HOST_CLOCK_RAW):
-    host_clock = normalize_host_clock(host_clock)
+def fit_neuroflap(session, observations):
     samples = tuple(
         FourTimestampSample.target_initiated(
-            (
-                item.t1_monotonic_us
-                if host_clock == HOST_CLOCK_MONOTONIC
-                else item.t1_us
-            ),
+            item.t1_us,
             item.t2_us,
             item.t3_us,
-            (
-                item.t4_monotonic_us
-                if host_clock == HOST_CLOCK_MONOTONIC
-                else item.t4_us
-            ),
+            item.t4_us,
         )
         for item in observations
     )
@@ -628,7 +586,7 @@ def fit_neuroflap(session, observations, host_clock=HOST_CLOCK_RAW):
         transform,
         quality,
         time.monotonic_ns() // 1000,
-        host_clock,
+        ALIGNMENT_CLOCK,
     )
 
 
@@ -655,19 +613,13 @@ def _robust_line(points):
     return anchor_x, intercept, slope, residuals
 
 
-def fit_ft(session, observations, host_clock=HOST_CLOCK_RAW):
-    host_clock = normalize_host_clock(host_clock)
+def fit_ft(session, observations):
     if len(observations) < 3:
         raise ValueError("FT calibration requires at least three timestamp pairs")
     buckets = {}
     for item in observations:
         bucket = int(item.source_us // 1_000_000)
-        receive_us = (
-            item.receive_monotonic_us
-            if host_clock == HOST_CLOCK_MONOTONIC
-            else item.receive_us
-        )
-        delay = int(receive_us - item.source_us)
+        delay = int(item.receive_us - item.source_us)
         previous = buckets.get(bucket)
         if previous is None or delay < previous[1]:
             buckets[bucket] = (item.source_us, delay)
@@ -712,5 +664,5 @@ def fit_ft(session, observations, host_clock=HOST_CLOCK_RAW):
         transform,
         quality,
         time.monotonic_ns() // 1000,
-        host_clock,
+        ALIGNMENT_CLOCK,
     )

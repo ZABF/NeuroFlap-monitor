@@ -119,7 +119,7 @@ class NFv4ClockClientTest(unittest.TestCase):
         self.assertEqual(len(loaded), 1)
         self.assertEqual(len(baseline), 1)
 
-    def test_protocol_uses_raw_while_timeout_uses_monotonic(self):
+    def test_protocol_uses_alignment_clock_while_timeout_uses_monotonic(self):
         sent = []
         self.assertTrue(
             self.client.tick(
@@ -145,8 +145,6 @@ class NFv4ClockClientTest(unittest.TestCase):
         measurement = self.client.take_measurement()
         self.assertEqual(measurement["t1_us"], 50_000_000)
         self.assertEqual(measurement["t4_us"], 50_001_600)
-        self.assertEqual(measurement["t1_monotonic_us"], 2_000_000)
-        self.assertEqual(measurement["t4_monotonic_us"], 2_001_600)
         self.assertEqual(self.client.last_response_us, 2_001_600)
 
     def test_baseline_interval_is_fixed_at_ten_hz(self):

@@ -26,11 +26,8 @@ from nfv3_parser import NFv3Parser
 from nfv4_clock_client import NFv4ClockClient
 from nfv4_codec import NFv4Codec
 from host_clock import (
-    HOST_CLOCK_MONOTONIC,
-    HOST_CLOCK_RAW,
-    HOST_CLOCKS,
+    ALIGNMENT_CLOCK,
     capture_host_clocks_us,
-    normalize_host_clock,
 )
 from network_clock import (
     ClockEstimatorStrategy,
@@ -119,13 +116,9 @@ class DataReceiver:
         )
         host_anchor = capture_host_clocks_us()
         self._clock_wall_anchor_us = time.time_ns() // 1000
-        self._clock_raw_anchor_us = host_anchor.raw_us
-        self._clock_monotonic_anchor_us = host_anchor.monotonic_us
+        self._clock_alignment_anchor_us = host_anchor.alignment_us
         self._clock_capture_epoch_offset_us = (
-            self._clock_wall_anchor_us - self._clock_raw_anchor_us
-        )
-        self._clock_monotonic_epoch_offset_us = (
-            self._clock_wall_anchor_us - self._clock_monotonic_anchor_us
+            self._clock_wall_anchor_us - self._clock_alignment_anchor_us
         )
         self._clock_last_published_revision = -1
         self._clock_next_publish_us = 0
@@ -135,7 +128,6 @@ class DataReceiver:
         self._nf_realtime_clock = RealtimeOffsetTracker()
         self._ft_realtime_clock = RealtimeOffsetTracker()
         self.calibrated_clock_models = {}
-        self.clock_comparison_models = {}
         self._clock_calibration_results = queue.SimpleQueue()
         self._clock_calibration_thread = None
         self._clock_calibration_error = ""
@@ -232,26 +224,24 @@ class DataReceiver:
         self._nf_realtime_clock.clear()
         self._ft_realtime_clock.clear()
         self.calibrated_clock_models.clear()
-        self.clock_comparison_models.clear()
         self._clock_calibration_error = ""
         self._clock_capture_epoch_offset_us = (
-            self._clock_wall_anchor_us - self._clock_raw_anchor_us
-        )
-        self._clock_monotonic_epoch_offset_us = (
-            self._clock_wall_anchor_us - self._clock_monotonic_anchor_us
+            self._clock_wall_anchor_us - self._clock_alignment_anchor_us
         )
 
     def load_clock_capture(self, metadata, models, observations):
         self.clear_clock_capture()
-        raw_anchor = int(metadata.get("monitor_raw_anchor_us", 0) or 0)
+        alignment_anchor = int(
+            metadata.get("monitor_alignment_anchor_us", 0)
+            or metadata.get("monitor_raw_anchor_us", 0)
+            or 0
+        )
         monotonic_anchor = int(metadata.get("monitor_monotonic_anchor_us", 0) or 0)
         unix_anchor = int(metadata.get("monitor_unix_anchor_us", 0) or 0)
-        if raw_anchor and unix_anchor:
-            self._clock_capture_epoch_offset_us = unix_anchor - raw_anchor
+        if alignment_anchor and unix_anchor:
+            self._clock_capture_epoch_offset_us = unix_anchor - alignment_anchor
         elif monotonic_anchor and unix_anchor:
             self._clock_capture_epoch_offset_us = unix_anchor - monotonic_anchor
-        if monotonic_anchor and unix_anchor:
-            self._clock_monotonic_epoch_offset_us = unix_anchor - monotonic_anchor
 
         for item in observations:
             domain = item.get("domain", "")
@@ -263,15 +253,12 @@ class DataReceiver:
                     item.get("t2_us", 0),
                     item.get("t3_us", 0),
                     item.get("t4_us", 0),
-                    item.get("t1_monotonic_us"),
-                    item.get("t4_monotonic_us"),
                 )
             elif domain == FT_CLOCK_DOMAIN:
                 self.clock_observations.add_ft(
                     item.get("session", 1),
                     item.get("source_us", 0),
                     item.get("receive_us", 0),
-                    item.get("receive_monotonic_us"),
                 )
 
         for item in models:
@@ -279,20 +266,18 @@ class DataReceiver:
                 domain = str(item.get("domain", ""))
                 session = int(item.get("session", 1))
                 mode = AlignmentMode.parse(item.get("mode"))
-                host_clock = normalize_host_clock(
+                host_clock = str(
                     item.get("host_clock")
-                    or metadata.get("monitor_clock", HOST_CLOCK_MONOTONIC)
+                    or metadata.get("monitor_clock", "monotonic")
                 )
+                capture_clock = str(metadata.get("monitor_clock", host_clock))
+                if item.get("host_clock") and host_clock != capture_clock:
+                    continue
                 target_unix_us = float(item["target_anchor_unix_us"])
-                target_epoch_offset_us = (
-                    self._clock_monotonic_epoch_offset_us
-                    if host_clock == HOST_CLOCK_MONOTONIC
-                    else self._clock_capture_epoch_offset_us
-                )
                 transform = ClockTransform(
                     source_anchor_us=float(item["source_anchor_us"]),
                     target_anchor_us=(
-                        target_unix_us - target_epoch_offset_us
+                        target_unix_us - self._clock_capture_epoch_offset_us
                     ),
                     drift_ppb=float(item.get("drift_ppm", 0.0)) * 1000.0,
                     uncertainty_us=float(item.get("uncertainty_us") or math.inf),
@@ -336,14 +321,10 @@ class DataReceiver:
                 quality,
                 host_clock=host_clock,
             )
-            self.clock_comparison_models[(domain, session, host_clock)] = model
-            if host_clock == HOST_CLOCK_RAW or (
-                domain, session
-            ) not in self.calibrated_clock_models:
-                self.calibrated_clock_models[(domain, session)] = model
-                self.data_model.set_calibrated_clock_transform(
-                    clock_source, wall_transform
-                )
+            self.calibrated_clock_models[(domain, session)] = model
+            self.data_model.set_calibrated_clock_transform(
+                clock_source, wall_transform
+            )
         self.data_model.set_alignment_mode(
             metadata.get("active_alignment_mode", AlignmentMode.REALTIME.value)
         )
@@ -382,15 +363,14 @@ class DataReceiver:
             models = {}
             errors = {}
             for domain, (session, observations) in snapshots.items():
-                for host_clock in HOST_CLOCKS:
-                    try:
-                        models[(domain, host_clock)] = (
-                            fit_neuroflap(session, observations, host_clock)
-                            if domain == NEUROFLAP_CLOCK_DOMAIN
-                            else fit_ft(session, observations, host_clock)
-                        )
-                    except Exception as exc:
-                        errors[(domain, host_clock)] = str(exc)
+                try:
+                    models[domain] = (
+                        fit_neuroflap(session, observations)
+                        if domain == NEUROFLAP_CLOCK_DOMAIN
+                        else fit_ft(session, observations)
+                    )
+                except Exception as exc:
+                    errors[domain] = str(exc)
             self._clock_calibration_results.put((models, errors))
 
         self._clock_calibration_thread = threading.Thread(
@@ -408,24 +388,14 @@ class DataReceiver:
                 models, errors = self._clock_calibration_results.get_nowait()
             except queue.Empty:
                 break
-            primary_errors = {
-                domain: message
-                for (domain, host_clock), message in errors.items()
-                if host_clock == HOST_CLOCK_RAW
-            }
-            if primary_errors:
+            if errors:
                 self._clock_calibration_error = "; ".join(
                     f"{domain}: {message}"
-                    for domain, message in sorted(primary_errors.items())
+                    for domain, message in sorted(errors.items())
                 )
                 continue
             wall_offset_us = self._clock_capture_epoch_offset_us
-            for (domain, host_clock), model in models.items():
-                self.clock_comparison_models[
-                    (domain, model.session, host_clock)
-                ] = model
-                if host_clock != HOST_CLOCK_RAW:
-                    continue
+            for domain, model in models.items():
                 clock_source = (
                     self.NF_CLOCK_SOURCE
                     if domain == NEUROFLAP_CLOCK_DOMAIN
@@ -483,18 +453,8 @@ class DataReceiver:
         return source, int(self.data_model.ensure_source(source).current_session)
 
     def get_clock_offset_plot_signature(self, domain):
-        return self.get_clock_offset_plot_signature_for_clock(
-            domain, HOST_CLOCK_RAW
-        )
-
-    def get_clock_offset_plot_signature_for_clock(self, domain, host_clock):
-        host_clock = normalize_host_clock(host_clock)
         source, session = self._clock_domain_session(domain)
-        model = self.clock_comparison_models.get(
-            (domain, session, host_clock)
-        )
-        if model is None and host_clock == HOST_CLOCK_RAW:
-            model = self.calibrated_clock_models.get((domain, session))
+        model = self.calibrated_clock_models.get((domain, session))
         transform = None if model is None else model.transform
         model_signature = (
             None
@@ -509,38 +469,26 @@ class DataReceiver:
         return (
             source,
             session,
-            host_clock,
             self.clock_observations.revision(domain),
             model_signature,
         )
 
-    def get_clock_offset_plot_data(self, domain, host_clock=HOST_CLOCK_RAW):
-        host_clock = normalize_host_clock(host_clock)
+    def get_clock_offset_plot_data(self, domain):
         _source, session = self._clock_domain_session(domain)
         if domain == NEUROFLAP_CLOCK_DOMAIN:
             observations = self.clock_observations.neuroflap_snapshot(session)
             rows = []
             for item in observations:
-                t1_us = (
-                    item.t1_monotonic_us
-                    if host_clock == HOST_CLOCK_MONOTONIC
-                    else item.t1_us
-                )
-                t4_us = (
-                    item.t4_monotonic_us
-                    if host_clock == HOST_CLOCK_MONOTONIC
-                    else item.t4_us
-                )
                 source_us = (item.t2_us + item.t3_us) * 0.5
-                lower_us = float(t1_us - item.t2_us)
-                upper_us = float(t4_us - item.t3_us)
+                lower_us = float(item.t1_us - item.t2_us)
+                upper_us = float(item.t4_us - item.t3_us)
                 if lower_us > upper_us:
                     lower_us, upper_us = upper_us, lower_us
                 midpoint_us = (lower_us + upper_us) * 0.5
                 rtt_us = max(
                     0.0,
                     float(
-                        (t4_us - t1_us)
+                        (item.t4_us - item.t1_us)
                         - (item.t3_us - item.t2_us)
                     ),
                 )
@@ -552,12 +500,7 @@ class DataReceiver:
             observations = self.clock_observations.ft_snapshot(session)
             rows = []
             for item in observations:
-                receive_us = (
-                    item.receive_monotonic_us
-                    if host_clock == HOST_CLOCK_MONOTONIC
-                    else item.receive_us
-                )
-                offset_us = float(receive_us - item.source_us)
+                offset_us = float(item.receive_us - item.source_us)
                 rows.append(
                     (
                         float(item.source_us),
@@ -573,7 +516,7 @@ class DataReceiver:
         if not rows:
             return {
                 "domain": domain,
-                "host_clock": host_clock,
+                "host_clock": ALIGNMENT_CLOCK,
                 "session": session,
                 "count": 0,
                 "has_interval": has_interval,
@@ -607,11 +550,7 @@ class DataReceiver:
 
         calibrated_offsets = []
         calibrated_ppm = None
-        model = self.clock_comparison_models.get(
-            (domain, session, host_clock)
-        )
-        if model is None and host_clock == HOST_CLOCK_RAW:
-            model = self.calibrated_clock_models.get((domain, session))
+        model = self.calibrated_clock_models.get((domain, session))
         if model is not None:
             transform = model.transform
             calibrated_ppm = transform.drift_ppb / 1000.0
@@ -626,7 +565,7 @@ class DataReceiver:
 
         return {
             "domain": domain,
-            "host_clock": host_clock,
+            "host_clock": ALIGNMENT_CLOCK,
             "session": session,
             "count": len(rows),
             "has_interval": has_interval,
@@ -643,10 +582,7 @@ class DataReceiver:
         }
 
     def get_clock_export_data(self):
-        wall_offsets_us = {
-            HOST_CLOCK_RAW: self._clock_capture_epoch_offset_us,
-            HOST_CLOCK_MONOTONIC: self._clock_monotonic_epoch_offset_us,
-        }
+        wall_offset_us = self._clock_capture_epoch_offset_us
         models = []
         realtime_keys = set()
         for (clock_source, session), transform in (
@@ -665,7 +601,7 @@ class DataReceiver:
                     "domain": domain,
                     "session": int(session),
                     "mode": AlignmentMode.REALTIME.value,
-                    "host_clock": HOST_CLOCK_RAW,
+                    "host_clock": ALIGNMENT_CLOCK,
                     "source_anchor_us": int(round(transform.source_anchor_us)),
                     "target_anchor_unix_us": int(
                         round(transform.target_anchor_us)
@@ -691,7 +627,7 @@ class DataReceiver:
                     "domain": FT_CLOCK_DOMAIN,
                     "session": int(session),
                     "mode": AlignmentMode.REALTIME.value,
-                    "host_clock": HOST_CLOCK_RAW,
+                    "host_clock": ALIGNMENT_CLOCK,
                     "source_anchor_us": 0,
                     "target_anchor_unix_us": int(round(offset_ms * 1000.0)),
                     "offset_us": offset_ms * 1000.0,
@@ -706,18 +642,17 @@ class DataReceiver:
                 }
             )
         models.extend(
-            model.to_dict(
-                target_epoch_offset_us=wall_offsets_us[model.host_clock]
-            )
-            for model in self.clock_comparison_models.values()
+            model.to_dict(target_epoch_offset_us=wall_offset_us)
+            for model in self.calibrated_clock_models.values()
         )
         return {
             "active_mode": self.data_model.alignment_mode.value,
-            "monitor_clock": HOST_CLOCK_RAW,
-            "monitor_raw_anchor_us": int(self._clock_raw_anchor_us),
-            "monitor_monotonic_anchor_us": int(self._clock_monotonic_anchor_us),
+            "monitor_clock": ALIGNMENT_CLOCK,
+            "monitor_alignment_anchor_us": int(
+                self._clock_alignment_anchor_us
+            ),
             "monitor_unix_anchor_us": int(
-                self._clock_raw_anchor_us
+                self._clock_alignment_anchor_us
                 + self._clock_capture_epoch_offset_us
             ),
             "models": models,
@@ -1381,8 +1316,7 @@ class DataReceiver:
         timestamp_unix = time.time() * 1000.0
         metadata = dict(meta or {})
         captured = capture_host_clocks_us()
-        metadata.setdefault("receive_raw_us", captured.raw_us)
-        metadata.setdefault("receive_monotonic_us", captured.monotonic_us)
+        metadata.setdefault("receive_alignment_us", captured.alignment_us)
         self.pending_queue.append((data_source, data, timestamp_unix, metadata))
 
     def _send_udp_packet(self, packet, target=None):
@@ -1854,7 +1788,7 @@ class DataReceiver:
         if packet["type"] == "sync_response":
             matched = self.nf_v4_clock.handle_response(
                 data,
-                received_at.raw_us,
+                received_at.alignment_us,
                 t4_monotonic_us=received_at.monotonic_us,
                 now_us=received_at.monotonic_us,
             )
@@ -1870,8 +1804,6 @@ class DataReceiver:
                         measurement["t2_us"],
                         measurement["t3_us"],
                         measurement["t4_us"],
-                        measurement["t1_monotonic_us"],
-                        measurement["t4_monotonic_us"],
                     )
                     self._publish_realtime_neuroflap_(measurement)
                 if measurement and int(measurement["context"]) != 0:
@@ -2884,17 +2816,21 @@ class DataReceiver:
                 session = self.data_model.add_data(
                     data_source, unix_ts, source_ts, corrected_data
                 )
+                receive_alignment_us = int(
+                    meta.get(
+                        "receive_alignment_us",
+                        meta.get("receive_raw_us", 0),
+                    )
+                )
                 self.clock_observations.add_ft(
                     session,
                     int(round(float(source_ts) * 1000.0)),
-                    int(meta.get("receive_raw_us", 0)),
-                    int(meta.get("receive_monotonic_us", 0)),
+                    receive_alignment_us,
                 )
                 realtime_transform = self._ft_realtime_clock.add(
                     float(source_ts) * 1000.0,
-                    int(meta.get("receive_raw_us", 0)),
-                    int(meta.get("receive_raw_us", 0))
-                    - float(source_ts) * 1000.0,
+                    receive_alignment_us,
+                    receive_alignment_us - float(source_ts) * 1000.0,
                     session,
                 )
                 if realtime_transform is not None:

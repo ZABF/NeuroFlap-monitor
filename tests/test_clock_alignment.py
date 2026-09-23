@@ -10,7 +10,6 @@ from clock_alignment import (
     fit_ft,
     fit_neuroflap,
 )
-from host_clock import HOST_CLOCK_MONOTONIC, HOST_CLOCK_RAW
 
 
 class ClockAlignmentTest(unittest.TestCase):
@@ -35,46 +34,6 @@ class ClockAlignmentTest(unittest.TestCase):
         self.assertAlmostEqual(model.transform.drift_ppb / 1000.0, 80.0, delta=1.0)
         self.assertEqual(model.quality.rating, "Good")
         self.assertEqual(model.quality.sample_count, 200)
-
-    def test_neuroflap_fit_distinguishes_raw_and_adjusted_host_clocks(self):
-        raw_scale = 1.0 + 40.0e-6
-        monotonic_scale = 1.0 + 280.0e-6
-        observations = []
-        for index in range(120):
-            t2 = 10_000_000 + index * 1_000_000
-            t3 = t2 + 100
-            t1_raw = int(t2 * raw_scale + 500_000 - 900)
-            t4_raw = int(t3 * raw_scale + 500_000 + 1_100)
-            t1_monotonic = int(t2 * monotonic_scale + 900_000 - 900)
-            t4_monotonic = int(t3 * monotonic_scale + 900_000 + 1_100)
-            observations.append(
-                NeuroFlapObservation(
-                    7,
-                    index,
-                    t1_raw,
-                    t2,
-                    t3,
-                    t4_raw,
-                    t1_monotonic,
-                    t4_monotonic,
-                )
-            )
-
-        raw_model = fit_neuroflap(7, observations, HOST_CLOCK_RAW)
-        monotonic_model = fit_neuroflap(
-            7, observations, HOST_CLOCK_MONOTONIC
-        )
-
-        self.assertAlmostEqual(
-            raw_model.transform.drift_ppb / 1000.0, 40.0, delta=1.0
-        )
-        self.assertAlmostEqual(
-            monotonic_model.transform.drift_ppb / 1000.0,
-            280.0,
-            delta=1.0,
-        )
-        self.assertEqual(raw_model.host_clock, HOST_CLOCK_RAW)
-        self.assertEqual(monotonic_model.host_clock, HOST_CLOCK_MONOTONIC)
 
     def test_ft_batch_fit_uses_low_delay_envelope(self):
         scale = 1.0 - 45.0e-6
@@ -103,20 +62,6 @@ class ClockAlignmentTest(unittest.TestCase):
         self.assertEqual(store.neuroflap_snapshot(2)[0].sequence, 2)
         self.assertEqual(store.ft_snapshot(1)[0].source_us, 100)
         self.assertEqual(store.ft_snapshot(2)[0].receive_us, 400)
-
-    def test_observation_store_preserves_both_host_clock_timestamps(self):
-        store = ClockObservationStore()
-        store.add_neuroflap(1, 9, 100, 80, 90, 120, 1_100, 1_120)
-        store.add_ft(1, 200, 500, 1_500)
-
-        nf = store.neuroflap_snapshot(1)[0]
-        ft = store.ft_snapshot(1)[0]
-        exported = store.export()
-
-        self.assertEqual((nf.t1_monotonic_us, nf.t4_monotonic_us), (1_100, 1_120))
-        self.assertEqual(ft.receive_monotonic_us, 1_500)
-        self.assertEqual(exported[0]["t1_monotonic_us"], 1_100)
-        self.assertEqual(exported[1]["receive_monotonic_us"], 1_500)
 
     def test_realtime_tracker_is_offset_only_and_rate_limited(self):
         tracker = RealtimeOffsetTracker()

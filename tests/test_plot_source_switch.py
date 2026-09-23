@@ -510,33 +510,7 @@ class PlotSourceSwitchTest(unittest.TestCase):
             self.window.clock_offset_plot.window(),
             self.window.clock_settings_dialog,
         )
-        self.assertEqual(
-            self.window.clock_host_combo.currentText(), "CLOCK_MONOTONIC_RAW"
-        )
         self.assertTrue(self.window.clock_settings_dialog.isVisible())
-
-    def test_time_alignment_plot_can_select_adjusted_monotonic_clock(self):
-        observations = self.window.data_receiver.clock_observations
-        observations.add_neuroflap(
-            1, 1, 1_000, 900, 910, 1_020, 2_000, 2_020
-        )
-        observations.add_neuroflap(
-            1, 2, 2_000, 1_895, 1_905, 2_030, 3_100, 3_130
-        )
-        self.window._show_clock_settings()
-        raw_values = list(self.window.clock_offset_plot.observed_curve.yData)
-
-        index = self.window.clock_host_combo.findData("monotonic")
-        self.window.clock_host_combo.setCurrentIndex(index)
-
-        monotonic_values = list(
-            self.window.clock_offset_plot.observed_curve.yData
-        )
-        self.assertNotEqual(raw_values, monotonic_values)
-        self.assertIn(
-            "CLOCK_MONOTONIC",
-            self.window.clock_offset_plot.summary_label.text(),
-        )
 
     def test_time_alignment_plot_shows_all_neuroflap_offsets(self):
         observations = self.window.data_receiver.clock_observations
