@@ -160,6 +160,9 @@ def expression_validation_errors(node):
     expected = {
         "d": (1,),
         "smooth": (2,),
+        "moving_average": (2,),
+        "moving_median": (2,),
+        "hampel": (3,),
         "sg": (4,),
         "sign": (1,),
         "clip": (2, 3),

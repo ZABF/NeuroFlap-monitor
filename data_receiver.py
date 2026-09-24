@@ -1,19 +1,38 @@
 ﻿import socket
 import threading
 import time
+import math
+import secrets
 from collections import defaultdict, deque
+from dataclasses import replace
+import queue
 
 import numpy as np
 
 from bota_lite import BotaSerialSensor
+from clock_alignment import (
+    AlignmentModel,
+    AlignmentMode,
+    AlignmentQuality,
+    ClockObservationStore,
+    FT_CLOCK_DOMAIN,
+    NEUROFLAP_CLOCK_DOMAIN,
+    OffsetOnlyClockEstimator,
+    RealtimeOffsetTracker,
+    fit_ft,
+    fit_neuroflap,
+)
 from data_parser import DataParser
 from nfv3_parser import NFv3Parser
 from nfv4_clock_client import NFv4ClockClient
 from nfv4_codec import NFv4Codec
+from host_clock import (
+    ALIGNMENT_CLOCK,
+    capture_host_clocks_us,
+)
 from network_clock import (
     ClockEstimatorStrategy,
     ClockTransform,
-    SelectableClockEstimator,
 )
 import MoCap.LuMo.LuMoSDKClient as LuMoSDKClient
 
@@ -90,17 +109,29 @@ class DataReceiver:
         self.parser = DataParser()
         self.nf_parser = NFv3Parser()
         self.nf_v4_codec = NFv4Codec(self.nf_parser)
-        self.nf_clock_estimator = SelectableClockEstimator(clock_strategy)
+        del clock_strategy
+        self.nf_clock_estimator = OffsetOnlyClockEstimator()
         self.nf_v4_clock = NFv4ClockClient(
             estimator=self.nf_clock_estimator,
             codec=self.nf_v4_codec,
         )
+        host_anchor = capture_host_clocks_us()
         self._clock_wall_anchor_us = time.time_ns() // 1000
-        self._clock_monotonic_anchor_us = time.monotonic_ns() // 1000
+        self._clock_alignment_anchor_us = host_anchor.alignment_us
+        self._clock_capture_epoch_offset_us = (
+            self._clock_wall_anchor_us - self._clock_alignment_anchor_us
+        )
         self._clock_last_published_revision = -1
         self._clock_next_publish_us = 0
         self._clock_strategy_switch_pending = False
         self._clock_strategy_holdover = False
+        self.clock_observations = ClockObservationStore()
+        self._nf_realtime_clock = RealtimeOffsetTracker()
+        self._ft_realtime_clock = RealtimeOffsetTracker()
+        self.calibrated_clock_models = {}
+        self._clock_calibration_results = queue.SimpleQueue()
+        self._clock_calibration_thread = None
+        self._clock_calibration_error = ""
         self.first_ft_received_flag = False
         self.first_udp_received_flag = False
         self.data_ingestion_enabled = True
@@ -163,7 +194,7 @@ class DataReceiver:
         self.nf_connected = False
         self.nf_connecting = False
         self.nf_protocol = 0
-        self.nf_client_nonce = time.monotonic_ns() & 0xFFFFFFFF
+        self.nf_client_nonce = self._new_nf_client_nonce_()
         self.nf_session_id = 0
         self.nf_accepted_features = 0
         self.nf_aux_port = 0
@@ -188,6 +219,447 @@ class DataReceiver:
 
     def set_data_ingestion_enabled(self, enabled):
         self.data_ingestion_enabled = bool(enabled)
+
+    def clear_clock_capture(self):
+        self.clock_observations.clear()
+        self._nf_realtime_clock.clear()
+        self._ft_realtime_clock.clear()
+        self.calibrated_clock_models.clear()
+        self._clock_calibration_error = ""
+        self._clock_capture_epoch_offset_us = (
+            self._clock_wall_anchor_us - self._clock_alignment_anchor_us
+        )
+
+    def load_clock_capture(self, metadata, models, observations):
+        self.clear_clock_capture()
+        alignment_anchor = int(
+            metadata.get("monitor_alignment_anchor_us", 0)
+            or metadata.get("monitor_raw_anchor_us", 0)
+            or 0
+        )
+        monotonic_anchor = int(metadata.get("monitor_monotonic_anchor_us", 0) or 0)
+        unix_anchor = int(metadata.get("monitor_unix_anchor_us", 0) or 0)
+        if alignment_anchor and unix_anchor:
+            self._clock_capture_epoch_offset_us = unix_anchor - alignment_anchor
+        elif monotonic_anchor and unix_anchor:
+            self._clock_capture_epoch_offset_us = unix_anchor - monotonic_anchor
+
+        for item in observations:
+            domain = item.get("domain", "")
+            if domain == NEUROFLAP_CLOCK_DOMAIN:
+                self.clock_observations.add_neuroflap(
+                    item.get("session", 1),
+                    item.get("sequence", 0),
+                    item.get("t1_us", 0),
+                    item.get("t2_us", 0),
+                    item.get("t3_us", 0),
+                    item.get("t4_us", 0),
+                )
+            elif domain == FT_CLOCK_DOMAIN:
+                self.clock_observations.add_ft(
+                    item.get("session", 1),
+                    item.get("source_us", 0),
+                    item.get("receive_us", 0),
+                )
+
+        for item in models:
+            try:
+                domain = str(item.get("domain", ""))
+                session = int(item.get("session", 1))
+                mode = AlignmentMode.parse(item.get("mode"))
+                host_clock = str(
+                    item.get("host_clock")
+                    or metadata.get("monitor_clock", "monotonic")
+                )
+                capture_clock = str(metadata.get("monitor_clock", host_clock))
+                if item.get("host_clock") and host_clock != capture_clock:
+                    continue
+                target_unix_us = float(item["target_anchor_unix_us"])
+                transform = ClockTransform(
+                    source_anchor_us=float(item["source_anchor_us"]),
+                    target_anchor_us=(
+                        target_unix_us - self._clock_capture_epoch_offset_us
+                    ),
+                    drift_ppb=float(item.get("drift_ppm", 0.0)) * 1000.0,
+                    uncertainty_us=float(item.get("uncertainty_us") or math.inf),
+                    usable=True,
+                    locked=mode == AlignmentMode.CALIBRATED,
+                    epoch=session,
+                    revision=int(item.get("revision", 1) or 1),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            clock_source = (
+                self.NF_CLOCK_SOURCE
+                if domain == NEUROFLAP_CLOCK_DOMAIN
+                else "ft" if domain == FT_CLOCK_DOMAIN else domain
+            )
+            wall_transform = replace(
+                transform,
+                target_anchor_us=target_unix_us,
+            )
+            if mode == AlignmentMode.REALTIME:
+                self.data_model.set_clock_transform(clock_source, wall_transform)
+                continue
+            quality = AlignmentQuality(
+                sample_count=int(item.get("sample_count", 0) or 0),
+                representative_count=int(
+                    item.get("representative_count", 0) or 0
+                ),
+                span_us=int(item.get("span_us", 0) or 0),
+                residual_us=float(item.get("residual_us") or math.inf),
+                uncertainty_us=float(item.get("uncertainty_us") or math.inf),
+                drift_uncertainty_ppb=float(
+                    item.get("drift_uncertainty_ppb") or math.inf
+                ),
+                rating=str(item.get("rating", "Imported")),
+            )
+            model = AlignmentModel(
+                domain,
+                session,
+                mode,
+                transform,
+                quality,
+                host_clock=host_clock,
+            )
+            self.calibrated_clock_models[(domain, session)] = model
+            self.data_model.set_calibrated_clock_transform(
+                clock_source, wall_transform
+            )
+        self.data_model.set_alignment_mode(
+            metadata.get("active_alignment_mode", AlignmentMode.REALTIME.value)
+        )
+
+    def set_alignment_mode(self, mode):
+        if hasattr(self.data_model, "set_alignment_mode"):
+            self.data_model.set_alignment_mode(mode)
+
+    def request_clock_calibration(self):
+        if self._clock_calibration_thread and self._clock_calibration_thread.is_alive():
+            return False
+        nf_session = self.data_model.ensure_source(
+            self.NF_CLOCK_SOURCE
+        ).current_session
+        ft_session = self.data_model.ensure_source("ft").current_session
+        snapshots = {
+            NEUROFLAP_CLOCK_DOMAIN: (
+                nf_session,
+                self.clock_observations.neuroflap_snapshot(nf_session),
+            ),
+            FT_CLOCK_DOMAIN: (
+                ft_session,
+                self.clock_observations.ft_snapshot(ft_session),
+            ),
+        }
+        snapshots = {
+            domain: value for domain, value in snapshots.items() if value[1]
+        }
+        if not snapshots:
+            self._clock_calibration_error = "No clock observations are available"
+            return False
+
+        self._clock_calibration_error = ""
+
+        def run():
+            models = {}
+            errors = {}
+            for domain, (session, observations) in snapshots.items():
+                try:
+                    models[domain] = (
+                        fit_neuroflap(session, observations)
+                        if domain == NEUROFLAP_CLOCK_DOMAIN
+                        else fit_ft(session, observations)
+                    )
+                except Exception as exc:
+                    errors[domain] = str(exc)
+            self._clock_calibration_results.put((models, errors))
+
+        self._clock_calibration_thread = threading.Thread(
+            target=run,
+            name="ClockCalibration",
+            daemon=True,
+        )
+        self._clock_calibration_thread.start()
+        return True
+
+    def _apply_clock_calibration_results(self):
+        applied = False
+        while True:
+            try:
+                models, errors = self._clock_calibration_results.get_nowait()
+            except queue.Empty:
+                break
+            if errors:
+                self._clock_calibration_error = "; ".join(
+                    f"{domain}: {message}"
+                    for domain, message in sorted(errors.items())
+                )
+                continue
+            wall_offset_us = self._clock_capture_epoch_offset_us
+            for domain, model in models.items():
+                clock_source = (
+                    self.NF_CLOCK_SOURCE
+                    if domain == NEUROFLAP_CLOCK_DOMAIN
+                    else "ft"
+                )
+                wall_transform = replace(
+                    model.transform,
+                    target_anchor_us=(
+                        model.transform.target_anchor_us + wall_offset_us
+                    ),
+                )
+                self.data_model.set_calibrated_clock_transform(
+                    clock_source, wall_transform
+                )
+                self.calibrated_clock_models[(domain, model.session)] = model
+            self.data_model.set_alignment_mode(AlignmentMode.CALIBRATED)
+            self._clock_calibration_error = ""
+            applied = True
+        if applied and hasattr(self.main_window, "clock_calibration_updated"):
+            self.main_window.clock_calibration_updated()
+
+    def get_clock_alignment_status(self):
+        nf_session = self.data_model.ensure_source(
+            self.NF_CLOCK_SOURCE
+        ).current_session
+        ft_session = self.data_model.ensure_source("ft").current_session
+        domains = {}
+        for domain, session in (
+            (NEUROFLAP_CLOCK_DOMAIN, nf_session),
+            (FT_CLOCK_DOMAIN, ft_session),
+        ):
+            model = self.calibrated_clock_models.get((domain, session))
+            domains[domain] = {
+                "session": int(session),
+                "calibrated": model is not None,
+                "model": model.to_dict() if model is not None else None,
+            }
+        return {
+            "mode": self.data_model.alignment_mode.value,
+            "fitting": bool(
+                self._clock_calibration_thread
+                and self._clock_calibration_thread.is_alive()
+            ),
+            "error": self._clock_calibration_error,
+            "domains": domains,
+        }
+
+    def _clock_domain_session(self, domain):
+        if domain == NEUROFLAP_CLOCK_DOMAIN:
+            source = self.NF_CLOCK_SOURCE
+        elif domain == FT_CLOCK_DOMAIN:
+            source = "ft"
+        else:
+            raise ValueError(f"Unsupported clock domain: {domain}")
+        return source, int(self.data_model.ensure_source(source).current_session)
+
+    def get_clock_offset_plot_signature(self, domain):
+        source, session = self._clock_domain_session(domain)
+        model = self.calibrated_clock_models.get((domain, session))
+        transform = None if model is None else model.transform
+        model_signature = (
+            None
+            if transform is None
+            else (
+                transform.source_anchor_us,
+                transform.target_anchor_us,
+                transform.drift_ppb,
+                transform.revision,
+            )
+        )
+        return (
+            source,
+            session,
+            self.clock_observations.revision(domain),
+            model_signature,
+        )
+
+    def get_clock_offset_plot_data(self, domain):
+        _source, session = self._clock_domain_session(domain)
+        if domain == NEUROFLAP_CLOCK_DOMAIN:
+            observations = self.clock_observations.neuroflap_snapshot(session)
+            rows = []
+            for item in observations:
+                source_us = (item.t2_us + item.t3_us) * 0.5
+                lower_us = float(item.t1_us - item.t2_us)
+                upper_us = float(item.t4_us - item.t3_us)
+                if lower_us > upper_us:
+                    lower_us, upper_us = upper_us, lower_us
+                midpoint_us = (lower_us + upper_us) * 0.5
+                rtt_us = max(
+                    0.0,
+                    float(
+                        (item.t4_us - item.t1_us)
+                        - (item.t3_us - item.t2_us)
+                    ),
+                )
+                rows.append(
+                    (source_us, lower_us, midpoint_us, upper_us, rtt_us)
+                )
+            has_interval = True
+        else:
+            observations = self.clock_observations.ft_snapshot(session)
+            rows = []
+            for item in observations:
+                offset_us = float(item.receive_us - item.source_us)
+                rows.append(
+                    (
+                        float(item.source_us),
+                        offset_us,
+                        offset_us,
+                        offset_us,
+                        offset_us,
+                    )
+                )
+            has_interval = False
+
+        rows.sort(key=lambda item: item[0])
+        if not rows:
+            return {
+                "domain": domain,
+                "host_clock": ALIGNMENT_CLOCK,
+                "session": session,
+                "count": 0,
+                "has_interval": has_interval,
+                "elapsed_s": [],
+                "lower_delta_ms": [],
+                "midpoint_delta_ms": [],
+                "upper_delta_ms": [],
+                "realtime_delta_ms": [],
+                "calibrated_delta_ms": [],
+                "absolute_midpoint_ms": [],
+                "rtt_ms": [],
+                "baseline_offset_ms": 0.0,
+            }
+
+        source_origin_us = rows[0][0]
+        baseline_offset_us = rows[0][2]
+        elapsed_s = [(row[0] - source_origin_us) / 1.0e6 for row in rows]
+        lower_delta_ms = [(row[1] - baseline_offset_us) / 1000.0 for row in rows]
+        midpoint_delta_ms = [(row[2] - baseline_offset_us) / 1000.0 for row in rows]
+        upper_delta_ms = [(row[3] - baseline_offset_us) / 1000.0 for row in rows]
+
+        realtime_offsets = []
+        recent = deque()
+        for row in rows:
+            recent.append(row)
+            cutoff = row[0] - RealtimeOffsetTracker.WINDOW_US
+            while recent and recent[0][0] < cutoff:
+                recent.popleft()
+            best = min(recent, key=lambda item: item[4])
+            realtime_offsets.append((best[2] - baseline_offset_us) / 1000.0)
+
+        calibrated_offsets = []
+        calibrated_ppm = None
+        model = self.calibrated_clock_models.get((domain, session))
+        if model is not None:
+            transform = model.transform
+            calibrated_ppm = transform.drift_ppb / 1000.0
+            scale = 1.0 + transform.drift_ppb * 1.0e-9
+            for row in rows:
+                mapped_us = transform.target_anchor_us + (
+                    row[0] - transform.source_anchor_us
+                ) * scale
+                calibrated_offsets.append(
+                    (mapped_us - row[0] - baseline_offset_us) / 1000.0
+                )
+
+        return {
+            "domain": domain,
+            "host_clock": ALIGNMENT_CLOCK,
+            "session": session,
+            "count": len(rows),
+            "has_interval": has_interval,
+            "elapsed_s": elapsed_s,
+            "lower_delta_ms": lower_delta_ms,
+            "midpoint_delta_ms": midpoint_delta_ms,
+            "upper_delta_ms": upper_delta_ms,
+            "realtime_delta_ms": realtime_offsets,
+            "calibrated_delta_ms": calibrated_offsets,
+            "calibrated_ppm": calibrated_ppm,
+            "absolute_midpoint_ms": [row[2] / 1000.0 for row in rows],
+            "rtt_ms": [row[4] / 1000.0 for row in rows],
+            "baseline_offset_ms": baseline_offset_us / 1000.0,
+        }
+
+    def fit_all_clock_observations(self):
+        """Fit every retained domain/session for a reproducible export."""
+        models = {}
+        errors = {}
+        fitters = (
+            (
+                NEUROFLAP_CLOCK_DOMAIN,
+                self.clock_observations.neuroflap_snapshot,
+                fit_neuroflap,
+            ),
+            (
+                FT_CLOCK_DOMAIN,
+                self.clock_observations.ft_snapshot,
+                fit_ft,
+            ),
+        )
+        for domain, snapshot, fitter in fitters:
+            for session in self.clock_observations.sessions(domain):
+                key = f"{domain}:session:{int(session)}"
+                observations = snapshot(session)
+                try:
+                    models[(domain, int(session))] = fitter(
+                        int(session), observations
+                    )
+                except (TypeError, ValueError, ArithmeticError) as exc:
+                    errors[key] = str(exc)
+        return models, errors
+
+    def get_clock_export_data(self):
+        """Return export-only full-fit models and all raw clock evidence.
+
+        The online offset tracker remains available to the live display, but
+        it is deliberately not serialized as an export model.
+        """
+        wall_offset_us = self._clock_capture_epoch_offset_us
+        models = []
+        fitted_models, fit_errors = self.fit_all_clock_observations()
+        for model in fitted_models.values():
+            row = model.to_dict(target_epoch_offset_us=wall_offset_us)
+            row["fit_scope"] = "all_capture_observations"
+            row["fit_algorithm"] = (
+                "neuroflap_robust_affine_v1"
+                if model.domain == NEUROFLAP_CLOCK_DOMAIN
+                else "ft_robust_affine_v1"
+            )
+            models.append(row)
+
+        fit_error_items = tuple(
+            f"{key}: {message}" for key, message in sorted(fit_errors.items())
+        )
+        fit_status = (
+            "complete"
+            if models and not fit_errors
+            else "partial" if models else "unavailable"
+        )
+        observations = self.clock_observations.export()
+        return {
+            "active_mode": (
+                AlignmentMode.CALIBRATED.value
+                if models
+                else AlignmentMode.REALTIME.value
+            ),
+            "monitor_clock": ALIGNMENT_CLOCK,
+            "monitor_alignment_anchor_us": int(
+                self._clock_alignment_anchor_us
+            ),
+            "monitor_unix_anchor_us": int(
+                self._clock_alignment_anchor_us
+                + self._clock_capture_epoch_offset_us
+            ),
+            "clock_fit_scope": "all_capture_observations",
+            "clock_fit_status": fit_status,
+            "clock_fit_model_count": len(models),
+            "clock_fit_error_count": len(fit_errors),
+            "clock_fit_errors": " | ".join(fit_error_items),
+            "models": models,
+            "observations": observations,
+        }
 
     def set_clock_estimator_strategy(self, strategy):
         strategy = ClockEstimatorStrategy.parse(strategy)
@@ -270,6 +742,8 @@ class DataReceiver:
         return self.nf_local_ip
 
     def connect_nfv3(self, target_ip=None, target_port=None):
+        self.set_alignment_mode(AlignmentMode.REALTIME)
+        self._nf_realtime_clock.clear()
         if target_ip:
             self.udp_target_ip = target_ip
         if target_port:
@@ -297,11 +771,16 @@ class DataReceiver:
         self.nf_last_error = ""
         self.nf_protocol = 0
         self.nf_session_id = 0
+        self.nf_client_nonce = self._new_nf_client_nonce_()
         self.nf_accepted_features = 0
         self.nf_aux_port = 0
         self.nf_tcp_port = 0
         self.nf_v4_clock.stop_session()
         self._start_connect_attempt_(now_ms)
+
+    @staticmethod
+    def _new_nf_client_nonce_():
+        return secrets.randbits(32) or 1
 
     def disconnect_nfv3(self):
         closing_protocol = self.nf_protocol
@@ -588,6 +1067,11 @@ class DataReceiver:
             return "no reliable baseline clock sample for 5 seconds"
         if snapshot.state.value == "Degraded":
             return "candidate model rejected; holding the last good transform"
+        if (
+            snapshot.model_name == "rolling_min_rtt_offset_v1"
+            and snapshot.usable
+        ):
+            return ""
         if not snapshot.consensus_accepted:
             return (
                 "compatible interval consensus is insufficient "
@@ -744,6 +1228,8 @@ class DataReceiver:
         self.mocap_state = "Disconnect"
 
     def connect_ft(self, port=None):
+        self.set_alignment_mode(AlignmentMode.REALTIME)
+        self._ft_realtime_clock.clear()
         if port:
             self.bota_port = port
         if self.bota_thread and self.bota_thread.is_alive():
@@ -835,7 +1321,10 @@ class DataReceiver:
 
     def ingest_data(self, data_source, data, meta=None):
         timestamp_unix = time.time() * 1000.0
-        self.pending_queue.append((data_source, data, timestamp_unix, meta or {}))
+        metadata = dict(meta or {})
+        captured = capture_host_clocks_us()
+        metadata.setdefault("receive_alignment_us", captured.alignment_us)
+        self.pending_queue.append((data_source, data, timestamp_unix, metadata))
 
     def _send_udp_packet(self, packet, target=None):
         target_ip = target[0] if target else self.udp_target_ip
@@ -889,9 +1378,9 @@ class DataReceiver:
             if diag_socket is None:
                 return 0
             try:
-                t1_us = time.monotonic_ns() // 1000
+                sent_at = capture_host_clocks_us()
                 diag_socket.sendto(packet, (destination[0], int(destination[1])))
-                return t1_us
+                return sent_at
             except OSError as exc:
                 self.nf_last_error = f"clock sync send failed: {exc}"
                 return 0
@@ -1233,10 +1722,11 @@ class DataReceiver:
         return True
 
     def _handle_nfv3_diag_datagram_(self, data, remote_addr):
-        received_us = time.monotonic_ns() // 1000
+        received_at = capture_host_clocks_us()
+        received_us = received_at.monotonic_us
         if self.nf_v4_codec.peek_header(data) is not None:
             return self._handle_nfv4_aux_datagram_(
-                data, remote_addr, received_us
+                data, remote_addr, received_at
             )
         packet_type = self.nf_parser.peek_packet_type(data)
         diagnostic_types = {
@@ -1278,7 +1768,7 @@ class DataReceiver:
             self._process_nfv3_clock_sample_(packet, remote_addr)
         return True
 
-    def _handle_nfv4_aux_datagram_(self, data, remote_addr, received_us):
+    def _handle_nfv4_aux_datagram_(self, data, remote_addr, received_at):
         with self._nf_diag_lock:
             self.nf_v4_aux_datagrams_rx += 1
         if (
@@ -1303,11 +1793,26 @@ class DataReceiver:
                 self.nf_v4_aux_wrong_session += 1
             return False
         if packet["type"] == "sync_response":
-            matched = self.nf_v4_clock.handle_response(data, received_us)
+            matched = self.nf_v4_clock.handle_response(
+                data,
+                received_at.alignment_us,
+                t4_monotonic_us=received_at.monotonic_us,
+                now_us=received_at.monotonic_us,
+            )
             if matched:
                 self._sync_nfv4_clock_epoch_()
                 self.nf_last_pong_ms = time.time() * 1000.0
                 measurement = self.nf_v4_clock.take_measurement()
+                if measurement and int(measurement["context"]) == 0:
+                    self.clock_observations.add_neuroflap(
+                        self.nf_clock_estimator.epoch,
+                        measurement.get("sequence", 0),
+                        measurement["t1_us"],
+                        measurement["t2_us"],
+                        measurement["t3_us"],
+                        measurement["t4_us"],
+                    )
+                    self._publish_realtime_neuroflap_(measurement)
                 if measurement and int(measurement["context"]) != 0:
                     self._send_nfv4_loaded_path_report_(
                         measurement,
@@ -1335,6 +1840,32 @@ class DataReceiver:
             self.nf_clock_estimator.epoch,
         )
 
+    def _publish_realtime_neuroflap_(self, measurement):
+        source_mid_us = (
+            int(measurement["t2_us"]) + int(measurement["t3_us"])
+        ) * 0.5
+        target_mid_us = (
+            int(measurement["t1_us"]) + int(measurement["t4_us"])
+        ) * 0.5
+        transform = self._nf_realtime_clock.add(
+            source_mid_us,
+            target_mid_us,
+            measurement.get("rtt_us", 0),
+            self.nf_clock_estimator.epoch,
+        )
+        if transform is None:
+            return
+        self.data_model.set_clock_transform(
+            self.NF_CLOCK_SOURCE,
+            replace(
+                transform,
+                target_anchor_us=(
+                    transform.target_anchor_us
+                    + self._clock_capture_epoch_offset_us
+                ),
+            ),
+        )
+
     def _publish_nfv4_clock_transform_(self, force=False):
         now_us = time.monotonic_ns() // 1000
         transform = self.nf_clock_estimator.transform
@@ -1347,23 +1878,6 @@ class DataReceiver:
             return
         if not force and now_us < self._clock_next_publish_us:
             return
-        wall_offset_us = (
-            self._clock_wall_anchor_us - self._clock_monotonic_anchor_us
-        )
-        wall_transform = ClockTransform(
-            source_anchor_us=transform.source_anchor_us,
-            target_anchor_us=transform.target_anchor_us + wall_offset_us,
-            drift_ppb=transform.drift_ppb,
-            uncertainty_us=transform.uncertainty_us,
-            usable=transform.usable,
-            locked=transform.locked,
-            epoch=transform.epoch,
-            revision=transform.revision,
-            updated_monotonic=transform.updated_monotonic,
-        )
-        self.data_model.set_clock_transform(
-            self.NF_CLOCK_SOURCE, wall_transform
-        )
         self._clock_strategy_switch_pending = False
         self._clock_strategy_holdover = False
         if self._nfv4_diagnostics_enabled_():
@@ -1504,7 +2018,7 @@ class DataReceiver:
         wall_transform = ClockTransform(
             source_anchor_us=transform.source_anchor_us,
             target_anchor_us=transform.target_anchor_us + wall_offset_us,
-            drift_ppb=transform.drift_ppb,
+            drift_ppb=0.0,
             uncertainty_us=transform.uncertainty_us,
             usable=transform.usable,
             locked=transform.locked,
@@ -2166,7 +2680,9 @@ class DataReceiver:
 
         if packet["type"] == "session_accept":
             if (
-                int(packet.get("client_nonce", 0))
+                not self.nf_want_connected
+                or not self.nf_connecting
+                or int(packet.get("client_nonce", 0))
                 != int(self.nf_client_nonce)
             ):
                 return
@@ -2209,6 +2725,8 @@ class DataReceiver:
             return
 
         if packet["type"] == "session_busy":
+            if not self.nf_want_connected or not self.nf_connecting:
+                return
             self.nf_connecting = False
             self.nf_connected = False
             self.nf_waiting_pong = False
@@ -2222,6 +2740,8 @@ class DataReceiver:
             return
 
         if packet["type"] == "connect_ack":
+            if not self.nf_want_connected or not self.nf_connecting:
+                return
             self.nf_protocol = self.nf_parser.VERSION
             self.nf_session_id = 0
             self.nf_aux_port = int(self.udp_target_port or 0) + 1
@@ -2244,6 +2764,8 @@ class DataReceiver:
             return
 
         if packet["type"] == "busy_ack":
+            if not self.nf_want_connected or not self.nf_connecting:
+                return
             self.nf_connecting = False
             self.nf_connected = False
             self.nf_waiting_pong = False
@@ -2274,6 +2796,7 @@ class DataReceiver:
             return
 
     def process_data(self):
+        self._apply_clock_calibration_results()
         self._tick_nfv3_connection()
         if self.nf_connected:
             self._tick_nfv3_schema_retry()
@@ -2305,7 +2828,37 @@ class DataReceiver:
                 for key, value in ft_data.items():
                     self.bias_buffers[key].append(value)
                     corrected_data[key] = value - self.ft_bias[key]
-                self.data_model.add_data(data_source, unix_ts, source_ts, corrected_data)
+                session = self.data_model.add_data(
+                    data_source, unix_ts, source_ts, corrected_data
+                )
+                receive_alignment_us = int(
+                    meta.get(
+                        "receive_alignment_us",
+                        meta.get("receive_raw_us", 0),
+                    )
+                )
+                self.clock_observations.add_ft(
+                    session,
+                    int(round(float(source_ts) * 1000.0)),
+                    receive_alignment_us,
+                )
+                realtime_transform = self._ft_realtime_clock.add(
+                    float(source_ts) * 1000.0,
+                    receive_alignment_us,
+                    receive_alignment_us - float(source_ts) * 1000.0,
+                    session,
+                )
+                if realtime_transform is not None:
+                    self.data_model.set_clock_transform(
+                        "ft",
+                        replace(
+                            realtime_transform,
+                            target_anchor_us=(
+                                realtime_transform.target_anchor_us
+                                + self._clock_capture_epoch_offset_us
+                            ),
+                        ),
+                    )
                 continue
 
             if data_source == "mocap":

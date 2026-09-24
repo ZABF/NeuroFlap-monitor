@@ -710,7 +710,7 @@ class FlightVisualizationWindow(QWidget):
         self._settings_changed()
 
     def _history_alignment_enabled(self):
-        return self.timeline.state != TimelineState.FOLLOW_LIVE
+        return True
 
     def _sample_at(
         self,
@@ -875,7 +875,6 @@ class FlightVisualizationWindow(QWidget):
         )
         can_append = (
             self.timeline.state == TimelineState.FOLLOW_LIVE
-            and not align_history
             and cache_key == self._trajectory_cache_key
             and self._trajectory_last_timestamp_ms is not None
             and self._trajectory_last_playhead_ms is not None
@@ -883,6 +882,12 @@ class FlightVisualizationWindow(QWidget):
             and self._trajectory_cache_revisions is not None
             and revisions[0] != self._trajectory_cache_revisions[0]
             and revisions[1:] != self._trajectory_cache_revisions[1:]
+            and all(
+                current[3] == previous[3]
+                for current, previous in zip(
+                    revisions, self._trajectory_cache_revisions
+                )
+            )
         )
 
         if can_append:
@@ -890,7 +895,7 @@ class FlightVisualizationWindow(QWidget):
                 names["x"],
                 self._trajectory_last_timestamp_ms,
                 playhead_ms,
-                align_history=False,
+                align_history=align_history,
             )
             if timestamps:
                 keep = np.asarray(timestamps, dtype=float) > (
@@ -902,7 +907,7 @@ class FlightVisualizationWindow(QWidget):
                 names,
                 timestamps,
                 x_values,
-                align_history=False,
+                align_history=align_history,
             )
             if len(points):
                 self._trajectory_cache = np.vstack(

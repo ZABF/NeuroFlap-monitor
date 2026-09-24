@@ -3,6 +3,7 @@ from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from clock_alignment import AlignmentMode
 from network_clock import ClockTransform
 
 
@@ -54,6 +55,10 @@ class DataModel:
         self.clock_transform_history: Dict[
             Tuple[str, int], ClockTransform
         ] = {}
+        self.calibrated_clock_transform_history: Dict[
+            Tuple[str, int], ClockTransform
+        ] = {}
+        self.alignment_mode = AlignmentMode.REALTIME
         self.revision = 0
         self.epoch = 0
         for var_name in variable_names:
@@ -110,7 +115,7 @@ class DataModel:
         *,
         offset_src: Optional[str] = None,
         offset_timestamp: Optional[float] = None,
-    ) -> None:
+    ) -> int:
         source_bucket = self.ensure_source(src)
         clock_src = offset_src or src
         clock_timestamp = float(src_timestamp if offset_timestamp is None else offset_timestamp)
@@ -147,6 +152,7 @@ class DataModel:
                         self._mark_alignment_changed(bucket)
             recon_timestamp = src_timestamp + self.offsets[offset_key]
         self.add_timestamp(src, src_timestamp, recon_timestamp, clock_bucket.current_session)
+        return int(clock_bucket.current_session)
 
     def set_clock_transform(
         self, src: str, transform: Optional[ClockTransform]
@@ -162,6 +168,35 @@ class DataModel:
         for bucket in self.sources.values():
             if (bucket.offset_src or bucket.src) == src:
                 self._mark_alignment_changed(bucket)
+
+    def set_calibrated_clock_transform(
+        self, src: str, transform: Optional[ClockTransform]
+    ) -> None:
+        key = None if transform is None else (src, int(transform.epoch))
+        previous = None if key is None else self.calibrated_clock_transform_history.get(key)
+        if transform is None:
+            keys = [item for item in self.calibrated_clock_transform_history if item[0] == src]
+            for item in keys:
+                del self.calibrated_clock_transform_history[item]
+        else:
+            self.calibrated_clock_transform_history[key] = transform
+        if previous == transform:
+            return
+        for bucket in self.sources.values():
+            if (bucket.offset_src or bucket.src) == src:
+                self._mark_alignment_changed(bucket)
+
+    def set_alignment_mode(self, mode) -> None:
+        mode = AlignmentMode.parse(mode)
+        if mode == self.alignment_mode:
+            return
+        self.alignment_mode = mode
+        for bucket in self.sources.values():
+            self._mark_alignment_changed(bucket)
+
+    def has_calibrated_clock_transform(self, src: str, session: int) -> bool:
+        transform = self.calibrated_clock_transform_history.get((src, int(session)))
+        return bool(transform and (transform.usable or transform.locked))
 
     def begin_clock_epoch(self, src: str, epoch: int) -> None:
         epoch = max(1, int(epoch))
@@ -185,8 +220,8 @@ class DataModel:
         *,
         offset_src: Optional[str] = None,
         offset_timestamp: Optional[float] = None,
-    ) -> None:
-        self.update_source_timestamp(
+    ) -> int:
+        session = self.update_source_timestamp(
             src,
             unix_timestamp,
             src_timestamp,
@@ -195,6 +230,7 @@ class DataModel:
         )
         for key, value in data.items():
             self.add_value(key, src, value)
+        return session
 
     def add_series(self, var: str, src: str, timestamps, values) -> None:
         count = min(len(timestamps), len(values))
@@ -225,6 +261,59 @@ class DataModel:
         source_bucket.reconstruction_revision = revision
         var_bucket.value_revision = revision
 
+    def add_raw_series(
+        self,
+        var: str,
+        src: str,
+        raw_timestamps,
+        sessions,
+        values,
+        *,
+        clock_src: str,
+        reconstructed_timestamps=None,
+    ) -> None:
+        count = min(len(raw_timestamps), len(sessions), len(values))
+        if count <= 0:
+            return
+        source_bucket = self.ensure_source(src)
+        var_bucket = self.ensure_var(var, src)
+        if source_bucket.src_timestamp or var_bucket.value:
+            self.clear_source(src, clear_offsets=False)
+            source_bucket = self.ensure_source(src)
+            var_bucket = self.ensure_var(var, src)
+
+        source_bucket.offset_src = str(clock_src or src)
+        source_bucket.current_session = int(sessions[count - 1])
+        source_bucket.last_src_timestamp = float(raw_timestamps[count - 1])
+        clock_bucket = self.ensure_source(source_bucket.offset_src)
+        clock_bucket.current_session = int(sessions[count - 1])
+        for index in range(count):
+            raw_timestamp = float(raw_timestamps[index])
+            session = int(sessions[index])
+            reconstructed = (
+                float(reconstructed_timestamps[index])
+                if reconstructed_timestamps is not None
+                and index < len(reconstructed_timestamps)
+                else raw_timestamp
+            )
+            source_bucket.src_timestamp.append(raw_timestamp)
+            source_bucket.recon_timestamp.append(reconstructed)
+            source_bucket.session.append(session)
+            var_bucket.value.append(float(values[index]))
+            if (
+                not source_bucket.session_spans
+                or source_bucket.session_spans[-1].session != session
+            ):
+                source_bucket.session_spans.append(
+                    SessionSpan(session, index, index + 1)
+                )
+            else:
+                source_bucket.session_spans[-1].end = index + 1
+        revision = self._next_revision()
+        source_bucket.timestamp_revision = revision
+        source_bucket.reconstruction_revision = revision
+        var_bucket.value_revision = revision
+
     def _series_storage(self, var: str):
         var_bucket = self.vars.get(var)
         if not var_bucket or not var_bucket.src:
@@ -245,7 +334,13 @@ class DataModel:
 
     def _alignment_parameters(self, source_bucket: SourceBucket, session: int):
         offset_src = source_bucket.offset_src or source_bucket.src
-        transform = self.clock_transform_history.get((offset_src, int(session)))
+        transform = None
+        if self.alignment_mode == AlignmentMode.CALIBRATED:
+            transform = self.calibrated_clock_transform_history.get(
+                (offset_src, int(session))
+            )
+        if transform is None:
+            transform = self.clock_transform_history.get((offset_src, int(session)))
         if transform is not None and (transform.usable or transform.locked):
             return (
                 transform.source_anchor_us / 1000.0,
@@ -399,6 +494,19 @@ class DataModel:
         else:
             timestamps = source_bucket.recon_timestamp[start_idx:end_idx].tolist()
         return timestamps, var_bucket.value[start_idx:end_idx].tolist()
+
+    def get_raw_series(self, var: str):
+        """Return immutable source-domain timestamps and their clock identity."""
+        storage = self._series_storage(var)
+        if storage is None:
+            return [], [], [], ""
+        var_bucket, source_bucket, count = storage
+        return (
+            source_bucket.src_timestamp[:count].tolist(),
+            source_bucket.session[:count].tolist(),
+            var_bucket.value[:count].tolist(),
+            source_bucket.offset_src or source_bucket.src,
+        )
 
     def get_series(
         self,
@@ -641,15 +749,17 @@ class DataModel:
         self.offsets.clear()
         self.clock_transforms.clear()
         self.clock_transform_history.clear()
+        self.calibrated_clock_transform_history.clear()
+        self.alignment_mode = AlignmentMode.REALTIME
         self.epoch += 1
         self._next_revision()
 
     def clear_source(self, src: str, *, clear_offsets: bool = True) -> None:
         source_bucket = self.sources.get(src)
         if source_bucket is not None:
-            source_bucket.src_timestamp.clear()
-            source_bucket.recon_timestamp.clear()
-            source_bucket.session.clear()
+            del source_bucket.src_timestamp[:]
+            del source_bucket.recon_timestamp[:]
+            del source_bucket.session[:]
             source_bucket.session_spans.clear()
             source_bucket.offset_src = None
             source_bucket.last_src_timestamp = None
@@ -668,11 +778,16 @@ class DataModel:
             ]
             for key in transform_keys:
                 del self.clock_transform_history[key]
+            calibrated_keys = [
+                key for key in self.calibrated_clock_transform_history if key[0] == src
+            ]
+            for key in calibrated_keys:
+                del self.calibrated_clock_transform_history[key]
             self.clock_transforms.pop(src, None)
 
         for var_bucket in self.vars.values():
             if var_bucket.src == src:
-                var_bucket.value.clear()
+                del var_bucket.value[:]
                 var_bucket.value_revision = self._next_revision()
 
     def clear_sources_with_prefix(self, prefix: str, *, clear_offsets: bool = True) -> None:
@@ -683,5 +798,5 @@ class DataModel:
     def clear_var(self, var: str) -> None:
         var_bucket = self.vars.get(var)
         if var_bucket is not None:
-            var_bucket.value.clear()
+            del var_bucket.value[:]
             var_bucket.value_revision = self._next_revision()

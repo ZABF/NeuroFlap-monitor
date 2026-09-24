@@ -3,6 +3,9 @@ import sys
 import types
 import unittest
 
+from clock_alignment import AlignmentMode
+from host_clock import ALIGNMENT_CLOCK
+from data_model import DataModel
 from nfv3_parser import NFv3Parser
 
 
@@ -68,6 +71,7 @@ class _DummyMainWindow:
         self.activate_live = True
         self.live_descriptors = []
         self.latency_updates = []
+        self.clock_calibration_updates = 0
 
     def register_dataflow_export_variables(self, _names):
         return None
@@ -79,11 +83,16 @@ class _DummyMainWindow:
     def update_task_latency(self, task_id, latency_us):
         self.latency_updates.append((int(task_id), int(latency_us)))
 
+    def clock_calibration_updated(self):
+        self.clock_calibration_updates += 1
+
 
 class _DummyDataModel:
     def __init__(self):
         self.records = []
         self.clock_transforms = {}
+        self.clock_epochs = {}
+        self.alignment_mode = AlignmentMode.REALTIME
 
     def add_data(self, src, unix_timestamp, src_timestamp, data, **kwargs):
         self.records.append((src, unix_timestamp, src_timestamp, dict(data), dict(kwargs)))
@@ -93,6 +102,9 @@ class _DummyDataModel:
             self.clock_transforms.pop(src, None)
         else:
             self.clock_transforms[src] = transform
+
+    def begin_clock_epoch(self, src, epoch):
+        self.clock_epochs[src] = int(epoch)
 
 
 class DataReceiverNFv3DecodeTest(unittest.TestCase):
@@ -142,7 +154,113 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
             },
         ]
 
-    def test_clock_strategy_switch_keeps_epoch_and_existing_holdover(self):
+    def _build_session_accept(self, client_nonce, session_id=0x11223344):
+        codec = self.receiver.nf_v4_codec
+        return struct.pack(
+            codec.SESSION_ACCEPT_FMT,
+            codec.MAGIC,
+            codec.VERSION,
+            codec.TYPE_SESSION_ACCEPT,
+            client_nonce,
+            session_id,
+            codec.FEATURE_CLOCK_SYNC,
+            28081,
+            28082,
+            6000,
+        )
+
+    def test_new_user_connection_uses_a_new_client_nonce(self):
+        generated = iter((0x11111111, 0x22222222))
+        self.receiver._new_nf_client_nonce_ = lambda: next(generated)
+        self.receiver.running = True
+        self.receiver._start_connect_attempt_ = lambda _now_ms: None
+
+        self.receiver.connect_nfv3()
+        first_nonce = self.receiver.nf_client_nonce
+        self.receiver.disconnect_nfv3()
+        self.receiver.connect_nfv3()
+
+        self.assertEqual(first_nonce, 0x11111111)
+        self.assertEqual(self.receiver.nf_client_nonce, 0x22222222)
+
+    def test_stale_session_accept_is_ignored_during_reconnect(self):
+        self.receiver.nf_want_connected = True
+        self.receiver.nf_connecting = True
+        self.receiver.nf_connected = False
+        self.receiver.nf_client_nonce = 0x22222222
+
+        self.receiver._process_udp_packet(
+            self._build_session_accept(0x11111111),
+            unix_ts=1000.0,
+            meta={"remote_addr": ("127.0.0.1", 19001)},
+        )
+
+        self.assertTrue(self.receiver.nf_connecting)
+        self.assertFalse(self.receiver.nf_connected)
+        self.assertEqual(self.receiver.nf_session_id, 0)
+
+    def test_session_accept_is_ignored_after_explicit_disconnect(self):
+        self.receiver.nf_want_connected = False
+        self.receiver.nf_connecting = False
+        self.receiver.nf_connected = False
+        self.receiver.nf_client_nonce = 0x22222222
+
+        self.receiver._process_udp_packet(
+            self._build_session_accept(0x22222222),
+            unix_ts=1000.0,
+            meta={"remote_addr": ("127.0.0.1", 19001)},
+        )
+
+        self.assertFalse(self.receiver.nf_connected)
+        self.assertEqual(self.receiver.nf_session_id, 0)
+
+    def test_current_session_accept_starts_clock_sync(self):
+        self.receiver.nf_want_connected = True
+        self.receiver.nf_connecting = True
+        self.receiver.nf_connected = False
+        self.receiver.nf_client_nonce = 0x22222222
+
+        self.receiver._process_udp_packet(
+            self._build_session_accept(0x22222222),
+            unix_ts=1000.0,
+            meta={"remote_addr": ("127.0.0.1", 19001)},
+        )
+
+        self.assertFalse(self.receiver.nf_connecting)
+        self.assertTrue(self.receiver.nf_connected)
+        self.assertEqual(self.receiver.nf_session_id, 0x11223344)
+        self.assertTrue(self.receiver.nf_v4_clock.active)
+
+    def test_export_fits_all_observations_and_omits_realtime_model(self):
+        for session, start in ((1, 10_000_000), (2, 30_000_000)):
+            for index in range(20):
+                t1 = start + index * 1_000_000
+                t2 = t1 - 500_000 + 1_000
+                t3 = t2 + 100
+                t4 = t1 + 1_600
+                self.receiver.clock_observations.add_neuroflap(
+                    session, index, t1, t2, t3, t4
+                )
+
+        clock_data = self.receiver.get_clock_export_data()
+
+        self.assertEqual(clock_data["active_mode"], "calibrated")
+        self.assertEqual(clock_data["clock_fit_status"], "complete")
+        self.assertEqual(clock_data["clock_fit_model_count"], 2)
+        self.assertEqual(clock_data["clock_fit_error_count"], 0)
+        self.assertEqual(
+            {(row["domain"], row["session"]) for row in clock_data["models"]},
+            {("neuroflap", 1), ("neuroflap", 2)},
+        )
+        self.assertTrue(
+            all(row["mode"] == "calibrated" for row in clock_data["models"])
+        )
+        self.assertTrue(
+            all(row["fit_scope"] == "all_capture_observations" for row in clock_data["models"])
+        )
+        self.assertEqual(len(clock_data["observations"]), 40)
+
+    def test_realtime_clock_strategy_is_not_switchable(self):
         epoch = self.receiver.nf_clock_estimator.epoch
         self.model.clock_transforms[self.receiver.NF_CLOCK_SOURCE] = ClockTransform(
             usable=True, epoch=epoch
@@ -152,11 +270,50 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
             ClockEstimatorStrategy.V3
         )
 
-        self.assertTrue(changed)
+        self.assertFalse(changed)
         self.assertEqual(self.receiver.nf_clock_estimator.epoch, epoch)
         self.assertIn(self.receiver.NF_CLOCK_SOURCE, self.model.clock_transforms)
-        self.assertTrue(self.receiver._clock_strategy_switch_pending)
-        self.assertTrue(self.receiver._clock_strategy_holdover)
+        self.assertFalse(self.receiver._clock_strategy_switch_pending)
+        self.assertFalse(self.receiver._clock_strategy_holdover)
+
+    def test_background_calibration_is_installed_atomically(self):
+        model = DataModel([])
+        window = _DummyMainWindow()
+        receiver = DataReceiver(
+            model,
+            window,
+            udp_target_ip="127.0.0.1",
+            udp_target_port=19001,
+        )
+        scale = 1.0 + 60.0e-6
+        offset_us = 400_000.0
+        for index in range(40):
+            t1 = 10_000_000 + index * 1_000_000
+            t2 = int((t1 + 1_000 - offset_us) / scale)
+            t3 = t2 + 100
+            t4 = int(t3 * scale + offset_us + 1_200)
+            receiver.clock_observations.add_neuroflap(
+                1, index, t1, t2, t3, t4
+            )
+
+        self.assertTrue(receiver.request_clock_calibration())
+        receiver._clock_calibration_thread.join(timeout=2.0)
+        receiver._apply_clock_calibration_results()
+
+        self.assertEqual(model.alignment_mode, AlignmentMode.CALIBRATED)
+        self.assertTrue(
+            model.has_calibrated_clock_transform(receiver.NF_CLOCK_SOURCE, 1)
+        )
+        self.assertEqual(window.clock_calibration_updates, 1)
+        self.assertEqual(
+            receiver.calibrated_clock_models[("neuroflap", 1)].host_clock,
+            ALIGNMENT_CLOCK,
+        )
+        plot_data = receiver.get_clock_offset_plot_data("neuroflap")
+        self.assertEqual(plot_data["count"], 40)
+        self.assertEqual(len(plot_data["lower_delta_ms"]), 40)
+        self.assertEqual(len(plot_data["realtime_delta_ms"]), 40)
+        self.assertEqual(len(plot_data["calibrated_delta_ms"]), 40)
 
     def _install_schema(self, generation=1, chunks=1):
         entries = self._entries()

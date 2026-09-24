@@ -16,7 +16,10 @@ import os
 import serial.tools.list_ports
 
 from data_transporter import DataTransporter
+from clock_alignment import AlignmentMode
+from host_clock import alignment_clock_label
 from ui.RelativeTimeAxis import RelativeTimeAxis
+from ui.clock_offset_plot import ClockOffsetPlot
 from data_model import DataModel
 from data_receiver import DataReceiver
 from data_transporter_thread import DataTransporterThread
@@ -48,7 +51,12 @@ from ui.curve_expression import (
     resolve_clip_bounds,
 )
 from ui.curve_state import ActiveDataSource, expression_refs, resolve_derived_health
-from ui.curve_data_engine import min_max_downsample
+from ui.curve_data_engine import (
+    hampel_filter,
+    min_max_downsample,
+    moving_average,
+    moving_median,
+)
 
 '''
 CURRENT STATE  |    start           stop            clear
@@ -93,11 +101,10 @@ class _CompactDoubleSpinBox(QDoubleSpinBox):
 
 class PlotWindow(QWidget):
     SECTION_ORDER_SETTINGS_KEY = "dataflow/section_order_v1"
-    CLOCK_STRATEGY_SETTINGS_KEY = "network/clock_estimator_strategy"
 
     def __init__(self, persist_layout=True):
         super().__init__()
-        self.setWindowTitle("Monitor v3.4.0")
+        self.setWindowTitle("Monitor v3.5.0")
         self._layout_settings = QSettings("NeuroFlap", "Monitor") if persist_layout else None
         self.timeline = TimelineController(parent=self)
         self._timeline_data_revision = -1
@@ -112,18 +119,6 @@ class PlotWindow(QWidget):
         if isinstance(saved_section_order, str):
             saved_section_order = [saved_section_order]
         self._custom_section_order = [str(section) for section in saved_section_order]
-        saved_clock_strategy = (
-            self._layout_settings.value(
-                self.CLOCK_STRATEGY_SETTINGS_KEY,
-                ClockEstimatorStrategy.V4_V3.value,
-            )
-            if self._layout_settings is not None
-            else ClockEstimatorStrategy.V4_V3.value
-        )
-        self.clock_estimator_strategy = ClockEstimatorStrategy.parse(
-            saved_clock_strategy
-        )
-
         self.tf_variables = ["F_X", "F_Y", "F_Z", "T_X", "T_Y", "T_Z"]
         self.mocap_variable_templates = [
             ("Mocap_pitch", True), ("Mocap_roll", True), ("Mocap_yaw", True),
@@ -216,7 +211,6 @@ class PlotWindow(QWidget):
         self.data_receiver = DataReceiver(
             self.data_model,
             self,
-            clock_strategy=self.clock_estimator_strategy,
         )
         self.data_receiver.start()
         # 瀛愮獥鍙?
@@ -293,24 +287,26 @@ class PlotWindow(QWidget):
         set_semantic_state(self.nf_clock_label, "muted")
         self.nf_clock_settings_btn = QPushButton("Clock...")
         self.nf_clock_settings_btn.clicked.connect(self._show_clock_settings)
-        self.nf_clock_strategy_combo = QComboBox()
-        self.nf_clock_strategy_combo.setMinimumWidth(120)
-        for strategy in ClockEstimatorStrategy:
-            self.nf_clock_strategy_combo.addItem(
-                strategy.display_name, strategy.value
-            )
-        strategy_index = self.nf_clock_strategy_combo.findData(
-            self.clock_estimator_strategy.value
+        self.alignment_mode_combo = QComboBox()
+        self.alignment_mode_combo.addItem("Realtime", AlignmentMode.REALTIME.value)
+        self.alignment_mode_combo.addItem(
+            "Calibrated", AlignmentMode.CALIBRATED.value
         )
-        self.nf_clock_strategy_combo.setCurrentIndex(max(0, strategy_index))
-        self.nf_clock_strategy_combo.setToolTip(
-            "V3: fast robust regression\n"
-            "V4: physical feasible interval\n"
-            "V4+V3: V4 bounds with a constrained V3 point estimate"
+        self.alignment_mode_combo.currentIndexChanged.connect(
+            self.set_alignment_mode
         )
-        self.nf_clock_strategy_combo.currentIndexChanged.connect(
-            self.set_clock_estimator_strategy
+        self.clock_align_btn = QPushButton("Align")
+        self.clock_align_btn.clicked.connect(self.request_clock_alignment)
+        self.clock_alignment_status_label = QLabel("No calibration")
+        set_semantic_state(self.clock_alignment_status_label, "muted")
+        self.clock_domain_combo = QComboBox()
+        self.clock_domain_combo.addItem("NeuroFlap", "neuroflap")
+        self.clock_domain_combo.addItem("FT", "ft")
+        self.clock_domain_combo.currentIndexChanged.connect(
+            lambda _index: self._refresh_clock_offset_plot(force=True)
         )
+        self.clock_offset_plot = None
+        self._clock_offset_plot_signature = None
         self.clock_settings_dialog = None
         self.nf_snapshot_contention_label = _ClickableLabel("Snapshot contention: 0")
         self.nf_snapshot_contention_label.setCursor(Qt.PointingHandCursor)
@@ -849,7 +845,12 @@ class PlotWindow(QWidget):
         dialog.setWindowTitle("Time Alignment")
 
         form = QFormLayout()
-        form.addRow("Estimator:", self.nf_clock_strategy_combo)
+        form.addRow("Mode:", self.alignment_mode_combo)
+        form.addRow("Calibration:", self.clock_align_btn)
+        form.addRow("Status:", self.clock_alignment_status_label)
+        form.addRow("Domain:", self.clock_domain_combo)
+
+        self.clock_offset_plot = ClockOffsetPlot(dialog)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(dialog.hide)
@@ -857,27 +858,100 @@ class PlotWindow(QWidget):
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.addLayout(form)
+        layout.addWidget(self.clock_offset_plot, 1)
         layout.addWidget(buttons)
 
         self.clock_settings_dialog = dialog
+        dialog.resize(840, 560)
 
     def _show_clock_settings(self):
         self._ensure_clock_settings_dialog()
+        self._refresh_clock_offset_plot(force=True)
         self.clock_settings_dialog.show()
         self.clock_settings_dialog.raise_()
         self.clock_settings_dialog.activateWindow()
 
-    def set_clock_estimator_strategy(self):
-        strategy = ClockEstimatorStrategy.parse(
-            self.nf_clock_strategy_combo.currentData()
+    def set_alignment_mode(self):
+        mode = AlignmentMode.parse(self.alignment_mode_combo.currentData())
+        self.data_receiver.set_alignment_mode(mode)
+        self._timeline_data_revision = -1
+        self._invalidate_curve_render_state()
+        self._refresh_timeline_bounds(force=True)
+        self.refresh_all_curves(visible_only=True)
+        self._refresh_clock_alignment_dialog()
+
+    def request_clock_alignment(self):
+        if not self.data_receiver.request_clock_calibration():
+            self._refresh_clock_alignment_dialog()
+            return
+        self.clock_align_btn.setText("Aligning...")
+        self.clock_align_btn.setEnabled(False)
+        set_semantic_state(self.clock_alignment_status_label, "warning")
+        self.clock_alignment_status_label.setText("Fitting current session")
+
+    def clock_calibration_updated(self):
+        index = self.alignment_mode_combo.findData(
+            AlignmentMode.CALIBRATED.value
         )
-        self.clock_estimator_strategy = strategy
-        if self._layout_settings is not None:
-            self._layout_settings.setValue(
-                self.CLOCK_STRATEGY_SETTINGS_KEY, strategy.value
-            )
-        self.data_receiver.set_clock_estimator_strategy(strategy)
-        self.update_nfv3_status()
+        self.alignment_mode_combo.blockSignals(True)
+        self.alignment_mode_combo.setCurrentIndex(index)
+        self.alignment_mode_combo.blockSignals(False)
+        self._timeline_data_revision = -1
+        self._invalidate_curve_render_state()
+        self._refresh_timeline_bounds(force=True)
+        self.refresh_all_curves(visible_only=True)
+        self._refresh_clock_alignment_dialog()
+
+    def _refresh_clock_alignment_dialog(self):
+        status = self.data_receiver.get_clock_alignment_status()
+        mode_index = self.alignment_mode_combo.findData(status["mode"])
+        if mode_index >= 0 and mode_index != self.alignment_mode_combo.currentIndex():
+            self.alignment_mode_combo.blockSignals(True)
+            self.alignment_mode_combo.setCurrentIndex(mode_index)
+            self.alignment_mode_combo.blockSignals(False)
+        fitting = bool(status["fitting"])
+        self.clock_align_btn.setEnabled(not fitting)
+        self.clock_align_btn.setText("Aligning..." if fitting else "Update" if any(
+            item["calibrated"] for item in status["domains"].values()
+        ) else "Align")
+        if status["error"]:
+            self.clock_alignment_status_label.setText(status["error"])
+            set_semantic_state(self.clock_alignment_status_label, "error")
+            self._refresh_clock_offset_plot()
+            return
+        calibrated = []
+        for domain, item in status["domains"].items():
+            model = item.get("model")
+            if model:
+                calibrated.append(
+                    f"{domain} {alignment_clock_label(model.get('host_clock'))} "
+                    f"{model['rating']} "
+                    f"{float(model['drift_ppm']):+.2f} ppm"
+                )
+        self.clock_alignment_status_label.setText(
+            " | ".join(calibrated) if calibrated else "No calibration"
+        )
+        set_semantic_state(
+            self.clock_alignment_status_label,
+            "success" if calibrated else "muted",
+        )
+        self._refresh_clock_offset_plot()
+
+    def _refresh_clock_offset_plot(self, force=False):
+        if (
+            self.clock_settings_dialog is None
+            or self.clock_offset_plot is None
+            or (not force and not self.clock_settings_dialog.isVisible())
+        ):
+            return
+        domain = str(self.clock_domain_combo.currentData() or "neuroflap")
+        signature = self.data_receiver.get_clock_offset_plot_signature(domain)
+        if not force and signature == self._clock_offset_plot_signature:
+            return
+        self._clock_offset_plot_signature = signature
+        self.clock_offset_plot.set_data(
+            self.data_receiver.get_clock_offset_plot_data(domain)
+        )
 
     @staticmethod
     def _snapshot_contention_tooltip(diagnostics):
@@ -1030,14 +1104,6 @@ class PlotWindow(QWidget):
 
         clock = status.get("clock", {})
         strategy = ClockEstimatorStrategy.parse(clock.get("strategy"))
-        strategy_index = self.nf_clock_strategy_combo.findData(strategy.value)
-        if (
-            strategy_index >= 0
-            and strategy_index != self.nf_clock_strategy_combo.currentIndex()
-        ):
-            self.nf_clock_strategy_combo.blockSignals(True)
-            self.nf_clock_strategy_combo.setCurrentIndex(strategy_index)
-            self.nf_clock_strategy_combo.blockSignals(False)
         strategy_display = str(
             clock.get("strategy_display", strategy.display_name)
         )
@@ -1121,6 +1187,19 @@ class PlotWindow(QWidget):
                 f" | {representative_span_s:.0f} s"
             )
             clock_semantic = "muted"
+        alignment = self.data_receiver.get_clock_alignment_status()
+        calibrated = alignment["domains"]["neuroflap"].get("model")
+        if state == "connected" and alignment["mode"] == "calibrated" and calibrated:
+            clock_text = (
+                f"Sync: Calibrated {calibrated['rating']}"
+                f" | {float(calibrated['drift_ppm']):+.2f} ppm"
+            )
+            clock_semantic = "success"
+        elif state == "connected" and sample_count:
+            clock_text = (
+                f"Sync: Realtime offset +/-{uncertainty_us / 1000.0:.2f} ms"
+            )
+            clock_semantic = "success" if sample_count else "warning"
         self.nf_clock_label.setText(clock_text)
         set_semantic_state(self.nf_clock_label, clock_semantic)
 
@@ -1232,6 +1311,7 @@ class PlotWindow(QWidget):
     def update_misc_tasks(self):
         self.update_bota_status_label()
         self.update_nfv3_status()
+        self._refresh_clock_alignment_dialog()
         self.refresh_serial_ports()
 
     def update_bota_status_label(self):
@@ -1323,16 +1403,24 @@ class PlotWindow(QWidget):
         for var_name in self.signal_variables:
             if self._is_derived_curve(var_name):
                 continue
-            ts, vs = self._curve_source_data(var_name)
-            count = min(len(ts), len(vs))
+            raw_ts, sessions, vs, clock_source = self.data_model.get_raw_series(
+                var_name
+            )
+            count = min(len(raw_ts), len(sessions), len(vs))
             if count <= 0:
                 continue
             section = self._csv_group_for_var(var_name)
             desc = dict(self.dynamic_signal_descriptors.get(var_name, {}))
             desc.update({
                 "name": var_name,
-                "timestamps": list(ts)[:count],
+                "raw_timestamps": list(raw_ts)[:count],
+                "sessions": list(sessions)[:count],
                 "values": list(vs)[:count],
+                "clock_domain": (
+                    "neuroflap"
+                    if clock_source == self.data_receiver.NF_CLOCK_SOURCE
+                    else "ft" if clock_source == "ft" else "monitor"
+                ),
                 "section": section,
                 "unit": desc.get("unit", ""),
                 "category": desc.get("category", "external"),
@@ -1351,8 +1439,15 @@ class PlotWindow(QWidget):
             generation = getattr(self.data_receiver, "nf_schema_generation", None)
             if generation is not None:
                 metadata["schema_generation"] = generation
-            metadata.update(self.data_receiver.get_nfv3_clock_metadata())
-        return write_monitor_csv(final_path, series, metadata)
+            # Export computes and serializes a fresh full-capture clock fit.
+            # The online offset-only tracker is intentionally not exported as
+            # a formal clock model.
+        return write_monitor_csv(
+            final_path,
+            series,
+            metadata,
+            clock_data=self.data_receiver.get_clock_export_data(),
+        )
 
     def import_csv(self):
         path, _selected_filter = QFileDialog.getOpenFileName(
@@ -1375,7 +1470,13 @@ class PlotWindow(QWidget):
             QMessageBox.warning(self, "Import failed", "No plottable variable series found in CSV.")
             return
 
-        self._load_imported_series(path, series, document.metadata)
+        self._load_imported_series(
+            path,
+            series,
+            document.metadata,
+            document.clock_models,
+            document.clock_observations,
+        )
         QMessageBox.information(self, "Import successful", f"CSV imported:\n{path}\nvariables: {len(series)}")
 
     def _set_active_data_source(self, source):
@@ -1414,6 +1515,7 @@ class PlotWindow(QWidget):
         source = ActiveDataSource.live(host, port)
         source_changed = source != self.active_data_source
         if source_changed:
+            self.data_receiver.clear_clock_capture()
             self.data_model.clear()
             self._reset_live_time_window()
 
@@ -1431,12 +1533,20 @@ class PlotWindow(QWidget):
         self.refresh_all_curves(visible_only=True)
         return True
 
-    def _load_imported_series(self, path, series, metadata=None):
+    def _load_imported_series(
+        self,
+        path,
+        series,
+        metadata=None,
+        clock_models=(),
+        clock_observations=(),
+    ):
         if self.plot_state == PlotState.RUNNING:
             self.toggle_reception()
 
         self._live_activation_requested = False
         self.data_receiver.set_data_ingestion_enabled(False)
+        self.data_receiver.clear_clock_capture()
         self.data_model.clear()
         self.timeline.reset()
         self._timeline_data_revision = -1
@@ -1464,6 +1574,7 @@ class PlotWindow(QWidget):
                 "slot",
                 "group_order",
                 "hidden_control",
+                "clock_domain",
             ):
                 value = data.get(key)
                 if value not in (None, ""):
@@ -1476,12 +1587,31 @@ class PlotWindow(QWidget):
         source_prefix = f"csv:{os.path.basename(path)}:"
         for var_name, data in series.items():
             timestamps = data["timestamps"]
-            self.data_model.add_series(
-                var=var_name,
-                src=source_prefix + var_name,
-                timestamps=timestamps,
-                values=data["values"],
-            )
+            raw_timestamps = data.get("raw_timestamps", ())
+            sessions = data.get("sessions", ())
+            if raw_timestamps and sessions:
+                domain = data.get("clock_domain", "monitor")
+                clock_source = (
+                    self.data_receiver.NF_CLOCK_SOURCE
+                    if domain == "neuroflap"
+                    else "ft" if domain == "ft" else source_prefix + domain
+                )
+                self.data_model.add_raw_series(
+                    var=var_name,
+                    src=source_prefix + var_name,
+                    raw_timestamps=raw_timestamps,
+                    sessions=sessions,
+                    values=data["values"],
+                    clock_src=clock_source,
+                    reconstructed_timestamps=timestamps,
+                )
+            else:
+                self.data_model.add_series(
+                    var=var_name,
+                    src=source_prefix + var_name,
+                    timestamps=timestamps,
+                    values=data["values"],
+                )
             if timestamps:
                 series_start = min(timestamps)
                 series_end = max(timestamps)
@@ -1498,6 +1628,13 @@ class PlotWindow(QWidget):
             desc = self.dynamic_signal_descriptors.get(var_name, {})
             if desc.get("descriptor_kind") == "task_latency" and data["values"]:
                 self.update_task_latency(desc["task_id"], data["values"][-1])
+
+        if clock_models or clock_observations:
+            self.data_receiver.load_clock_capture(
+                self.active_capture_metadata,
+                clock_models,
+                clock_observations,
+            )
 
         if earliest_timestamp is not None and latest_timestamp is not None:
             self.reception_start_time = earliest_timestamp
@@ -1556,7 +1693,7 @@ class PlotWindow(QWidget):
         self.timeline.update_bounds(start_ms, latest_ms)
 
     def _history_alignment_enabled(self):
-        return self.timeline.state != TimelineState.FOLLOW_LIVE
+        return True
 
     def _playhead_line_changed(self):
         if self._updating_playhead_line or not self.timeline.has_range:
@@ -1745,6 +1882,7 @@ class PlotWindow(QWidget):
         if self.plot_state == PlotState.IDLE:
             self.data_receiver.first_ft_received_flag = False
             self.data_receiver.first_udp_received_flag = False
+            self.data_receiver.clear_clock_capture()
             self.data_model.clear()
             self._invalidate_curve_render_state()
             self._timeline_data_revision = -1
@@ -1877,7 +2015,14 @@ class PlotWindow(QWidget):
         args = node[2]
         nested = max((self._expr_context_ms(arg, stack) for arg in args), default=0.0)
         window_arg = None
-        if name in ("smooth", "sg", "joint_tau") and len(args) > 1:
+        if name in (
+            "smooth",
+            "moving_average",
+            "moving_median",
+            "hampel",
+            "sg",
+            "joint_tau",
+        ) and len(args) > 1:
             window_arg = args[1]
         if window_arg is not None:
             try:
@@ -1984,45 +2129,7 @@ class PlotWindow(QWidget):
 
     @staticmethod
     def _smooth_curve_data(ts, vs, window_ms):
-        count = min(len(ts), len(vs))
-        if count == 0:
-            return [], []
-        window_ms = max(float(window_ms), 0.0)
-        if window_ms <= 0.0:
-            return list(ts)[:count], list(vs)[:count]
-
-        times = []
-        values = []
-        for i in range(count):
-            try:
-                t = float(ts[i])
-                v = float(vs[i])
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(t) and math.isfinite(v):
-                times.append(t)
-                values.append(v)
-
-        out_ts = []
-        out_vs = []
-        left = 0
-        right = 0
-        running_sum = 0.0
-        half_window = window_ms * 0.5
-        for i, t in enumerate(times):
-            while right < len(times) and times[right] <= t + half_window:
-                running_sum += values[right]
-                right += 1
-            while left < right and times[left] < t - half_window:
-                running_sum -= values[left]
-                left += 1
-            sample_count = right - left
-            if sample_count <= 0:
-                continue
-            out_ts.append(t)
-            out_vs.append(running_sum / sample_count)
-
-        return out_ts, out_vs
+        return moving_average(ts, vs, window_ms)
 
     @staticmethod
     def _savgol_curve_data(ts, vs, window_ms, order=3, derivative=0):
@@ -2334,6 +2441,39 @@ class PlotWindow(QWidget):
                 if not self._is_series_value(value) or not self._is_scalar_value(window):
                     return self._series_value([], [])
                 ts, vs = self._smooth_curve_data(value.get("ts", []), value.get("vs", []), window["value"])
+                return self._series_value(ts, vs)
+            if name in ("moving_average", "moving_median"):
+                if len(args) != 2:
+                    return self._series_value([], [])
+                value = self._eval_curve_expr(args[0], eval_stack, range_start, range_end)
+                window = self._eval_curve_expr(args[1], eval_stack, range_start, range_end)
+                if not self._is_series_value(value) or not self._is_scalar_value(window):
+                    return self._series_value([], [])
+                filter_fn = moving_average if name == "moving_average" else moving_median
+                ts, vs = filter_fn(
+                    value.get("ts", []),
+                    value.get("vs", []),
+                    window["value"],
+                )
+                return self._series_value(ts, vs)
+            if name == "hampel":
+                if len(args) != 3:
+                    return self._series_value([], [])
+                value = self._eval_curve_expr(args[0], eval_stack, range_start, range_end)
+                window = self._eval_curve_expr(args[1], eval_stack, range_start, range_end)
+                sigma = self._eval_curve_expr(args[2], eval_stack, range_start, range_end)
+                if (
+                    not self._is_series_value(value) or
+                    not self._is_scalar_value(window) or
+                    not self._is_scalar_value(sigma)
+                ):
+                    return self._series_value([], [])
+                ts, vs = hampel_filter(
+                    value.get("ts", []),
+                    value.get("vs", []),
+                    window["value"],
+                    sigma["value"],
+                )
                 return self._series_value(ts, vs)
             if name == "sg":
                 if len(args) != 4:
@@ -2727,6 +2867,8 @@ class PlotWindow(QWidget):
             return f"d_{ast[2][0][1]}"
         if ast[0] == "call" and ast[1].lower() in ("smooth", "soomth") and len(ast[2]) >= 1 and ast[2][0][0] == "ref":
             return f"smooth_{ast[2][0][1]}"
+        if ast[0] == "call" and ast[1].lower() in ("moving_average", "moving_median", "hampel") and len(ast[2]) >= 1 and ast[2][0][0] == "ref":
+            return f"{ast[1].lower()}_{ast[2][0][1]}"
         if ast[0] == "call" and ast[1].lower() == "sg" and len(ast[2]) >= 1 and ast[2][0][0] == "ref":
             suffix = "sg"
             if len(ast[2]) >= 4 and ast[2][3][0] == "num":
@@ -2856,6 +2998,9 @@ class PlotWindow(QWidget):
         insert_variable_btn = QPushButton("Insert")
         d_btn = QPushButton("d()")
         smooth_btn = QPushButton("smooth()")
+        moving_average_btn = QPushButton("moving_average()")
+        moving_median_btn = QPushButton("moving_median()")
+        hampel_btn = QPushButton("hampel()")
         sg0_btn = QPushButton("sg0()")
         sg1_btn = QPushButton("sg1()")
         sg2_btn = QPushButton("sg2()")
@@ -2883,6 +3028,24 @@ class PlotWindow(QWidget):
         smooth_btn.clicked.connect(
             lambda: (
                 self._insert_expr_wrapped(expr_edit, "smooth({}, 100)", current_variable_ref() or selected_ref),
+                None if editing else name_edit.setText(self._derive_name_from_expr(expr_edit.text()))
+            )
+        )
+        moving_average_btn.clicked.connect(
+            lambda: (
+                self._insert_expr_wrapped(expr_edit, "moving_average({}, 100)", current_variable_ref() or selected_ref),
+                None if editing else name_edit.setText(self._derive_name_from_expr(expr_edit.text()))
+            )
+        )
+        moving_median_btn.clicked.connect(
+            lambda: (
+                self._insert_expr_wrapped(expr_edit, "moving_median({}, 100)", current_variable_ref() or selected_ref),
+                None if editing else name_edit.setText(self._derive_name_from_expr(expr_edit.text()))
+            )
+        )
+        hampel_btn.clicked.connect(
+            lambda: (
+                self._insert_expr_wrapped(expr_edit, "hampel({}, 100, 3)", current_variable_ref() or selected_ref),
                 None if editing else name_edit.setText(self._derive_name_from_expr(expr_edit.text()))
             )
         )
@@ -2939,6 +3102,9 @@ class PlotWindow(QWidget):
         function_layout.addWidget(QLabel("Functions:"))
         function_layout.addWidget(d_btn)
         function_layout.addWidget(smooth_btn)
+        function_layout.addWidget(moving_average_btn)
+        function_layout.addWidget(moving_median_btn)
+        function_layout.addWidget(hampel_btn)
         function_layout.addWidget(sg0_btn)
         function_layout.addWidget(sg1_btn)
         function_layout.addWidget(sg2_btn)
@@ -3527,6 +3693,7 @@ class PlotWindow(QWidget):
         now = time.time() * 1000  # ms
         # CLEANING:
         self.plot_state = PlotState.CLEARING
+        self.data_receiver.clear_clock_capture()
         self.data_model.clear()
         self.timeline.reset()
         self._timeline_data_revision = -1
@@ -3536,6 +3703,7 @@ class PlotWindow(QWidget):
 
         # IDLE:
         self.plot_state = PlotState.IDLE
+        self.data_receiver.clear_clock_capture()
         self.data_model.clear()
         for group in self.task_variable_groups.values():
             group.reset_latency()
