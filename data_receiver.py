@@ -2,6 +2,7 @@
 import threading
 import time
 import math
+import secrets
 from collections import defaultdict, deque
 from dataclasses import replace
 import queue
@@ -193,7 +194,7 @@ class DataReceiver:
         self.nf_connected = False
         self.nf_connecting = False
         self.nf_protocol = 0
-        self.nf_client_nonce = time.monotonic_ns() & 0xFFFFFFFF
+        self.nf_client_nonce = self._new_nf_client_nonce_()
         self.nf_session_id = 0
         self.nf_accepted_features = 0
         self.nf_aux_port = 0
@@ -581,72 +582,68 @@ class DataReceiver:
             "baseline_offset_ms": baseline_offset_us / 1000.0,
         }
 
+    def fit_all_clock_observations(self):
+        """Fit every retained domain/session for a reproducible export."""
+        models = {}
+        errors = {}
+        fitters = (
+            (
+                NEUROFLAP_CLOCK_DOMAIN,
+                self.clock_observations.neuroflap_snapshot,
+                fit_neuroflap,
+            ),
+            (
+                FT_CLOCK_DOMAIN,
+                self.clock_observations.ft_snapshot,
+                fit_ft,
+            ),
+        )
+        for domain, snapshot, fitter in fitters:
+            for session in self.clock_observations.sessions(domain):
+                key = f"{domain}:session:{int(session)}"
+                observations = snapshot(session)
+                try:
+                    models[(domain, int(session))] = fitter(
+                        int(session), observations
+                    )
+                except (TypeError, ValueError, ArithmeticError) as exc:
+                    errors[key] = str(exc)
+        return models, errors
+
     def get_clock_export_data(self):
+        """Return export-only full-fit models and all raw clock evidence.
+
+        The online offset tracker remains available to the live display, but
+        it is deliberately not serialized as an export model.
+        """
         wall_offset_us = self._clock_capture_epoch_offset_us
         models = []
-        realtime_keys = set()
-        for (clock_source, session), transform in (
-            self.data_model.clock_transform_history.items()
-        ):
-            domain = (
-                NEUROFLAP_CLOCK_DOMAIN
-                if clock_source == self.NF_CLOCK_SOURCE
-                else FT_CLOCK_DOMAIN if clock_source == "ft" else ""
+        fitted_models, fit_errors = self.fit_all_clock_observations()
+        for model in fitted_models.values():
+            row = model.to_dict(target_epoch_offset_us=wall_offset_us)
+            row["fit_scope"] = "all_capture_observations"
+            row["fit_algorithm"] = (
+                "neuroflap_robust_affine_v1"
+                if model.domain == NEUROFLAP_CLOCK_DOMAIN
+                else "ft_robust_affine_v1"
             )
-            if not domain:
-                continue
-            realtime_keys.add((clock_source, int(session)))
-            models.append(
-                {
-                    "domain": domain,
-                    "session": int(session),
-                    "mode": AlignmentMode.REALTIME.value,
-                    "host_clock": ALIGNMENT_CLOCK,
-                    "source_anchor_us": int(round(transform.source_anchor_us)),
-                    "target_anchor_unix_us": int(
-                        round(transform.target_anchor_us)
-                    ),
-                    "offset_us": (
-                        transform.target_anchor_us - transform.source_anchor_us
-                    ),
-                    "drift_ppm": 0.0,
-                    "uncertainty_us": transform.uncertainty_us,
-                    "rating": "Realtime",
-                    "sample_count": 0,
-                    "representative_count": 0,
-                    "span_us": 0,
-                    "residual_us": "",
-                    "drift_uncertainty_ppb": "",
-                }
-            )
-        for (clock_source, session), offset_ms in self.data_model.offsets.items():
-            if clock_source != "ft" or (clock_source, int(session)) in realtime_keys:
-                continue
-            models.append(
-                {
-                    "domain": FT_CLOCK_DOMAIN,
-                    "session": int(session),
-                    "mode": AlignmentMode.REALTIME.value,
-                    "host_clock": ALIGNMENT_CLOCK,
-                    "source_anchor_us": 0,
-                    "target_anchor_unix_us": int(round(offset_ms * 1000.0)),
-                    "offset_us": offset_ms * 1000.0,
-                    "drift_ppm": 0.0,
-                    "uncertainty_us": "",
-                    "rating": "Realtime",
-                    "sample_count": 0,
-                    "representative_count": 0,
-                    "span_us": 0,
-                    "residual_us": "",
-                    "drift_uncertainty_ppb": "",
-                }
-            )
-        models.extend(
-            model.to_dict(target_epoch_offset_us=wall_offset_us)
-            for model in self.calibrated_clock_models.values()
+            models.append(row)
+
+        fit_error_items = tuple(
+            f"{key}: {message}" for key, message in sorted(fit_errors.items())
         )
+        fit_status = (
+            "complete"
+            if models and not fit_errors
+            else "partial" if models else "unavailable"
+        )
+        observations = self.clock_observations.export()
         return {
-            "active_mode": self.data_model.alignment_mode.value,
+            "active_mode": (
+                AlignmentMode.CALIBRATED.value
+                if models
+                else AlignmentMode.REALTIME.value
+            ),
             "monitor_clock": ALIGNMENT_CLOCK,
             "monitor_alignment_anchor_us": int(
                 self._clock_alignment_anchor_us
@@ -655,8 +652,13 @@ class DataReceiver:
                 self._clock_alignment_anchor_us
                 + self._clock_capture_epoch_offset_us
             ),
+            "clock_fit_scope": "all_capture_observations",
+            "clock_fit_status": fit_status,
+            "clock_fit_model_count": len(models),
+            "clock_fit_error_count": len(fit_errors),
+            "clock_fit_errors": " | ".join(fit_error_items),
             "models": models,
-            "observations": self.clock_observations.export(),
+            "observations": observations,
         }
 
     def set_clock_estimator_strategy(self, strategy):
@@ -769,11 +771,16 @@ class DataReceiver:
         self.nf_last_error = ""
         self.nf_protocol = 0
         self.nf_session_id = 0
+        self.nf_client_nonce = self._new_nf_client_nonce_()
         self.nf_accepted_features = 0
         self.nf_aux_port = 0
         self.nf_tcp_port = 0
         self.nf_v4_clock.stop_session()
         self._start_connect_attempt_(now_ms)
+
+    @staticmethod
+    def _new_nf_client_nonce_():
+        return secrets.randbits(32) or 1
 
     def disconnect_nfv3(self):
         closing_protocol = self.nf_protocol
@@ -2673,7 +2680,9 @@ class DataReceiver:
 
         if packet["type"] == "session_accept":
             if (
-                int(packet.get("client_nonce", 0))
+                not self.nf_want_connected
+                or not self.nf_connecting
+                or int(packet.get("client_nonce", 0))
                 != int(self.nf_client_nonce)
             ):
                 return
@@ -2716,6 +2725,8 @@ class DataReceiver:
             return
 
         if packet["type"] == "session_busy":
+            if not self.nf_want_connected or not self.nf_connecting:
+                return
             self.nf_connecting = False
             self.nf_connected = False
             self.nf_waiting_pong = False
@@ -2729,6 +2740,8 @@ class DataReceiver:
             return
 
         if packet["type"] == "connect_ack":
+            if not self.nf_want_connected or not self.nf_connecting:
+                return
             self.nf_protocol = self.nf_parser.VERSION
             self.nf_session_id = 0
             self.nf_aux_port = int(self.udp_target_port or 0) + 1
@@ -2751,6 +2764,8 @@ class DataReceiver:
             return
 
         if packet["type"] == "busy_ack":
+            if not self.nf_want_connected or not self.nf_connecting:
+                return
             self.nf_connecting = False
             self.nf_connected = False
             self.nf_waiting_pong = False

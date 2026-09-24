@@ -826,7 +826,7 @@ class PlotSourceSwitchTest(unittest.TestCase):
         self.assertTrue(latency_desc["hidden_control"])
         self.assertEqual(latency_desc["unit"], "us")
 
-    def test_live_v3_export_includes_final_clock_snapshot_metadata(self):
+    def test_live_export_does_not_serialize_online_clock_snapshot(self):
         self.window._live_activation_requested = True
         self.assertTrue(
             self.window.activate_live_dataflow_export_descriptors(
@@ -841,12 +841,6 @@ class PlotSourceSwitchTest(unittest.TestCase):
             [1000.0],
             [1.0],
         )
-        self.window.data_receiver.get_nfv3_clock_metadata = lambda: {
-            "clock_model": "rolling_affine_interval_v2",
-            "clock_state": "Locked",
-            "clock_uncertainty_us": 180.0,
-        }
-
         handle = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
         handle.close()
         try:
@@ -855,12 +849,11 @@ class PlotSourceSwitchTest(unittest.TestCase):
         finally:
             os.unlink(handle.name)
 
-        self.assertEqual(
-            document.metadata["clock_model"],
-            "rolling_affine_interval_v2",
-        )
-        self.assertEqual(document.metadata["clock_state"], "Locked")
-        self.assertEqual(document.metadata["clock_uncertainty_us"], "180.0")
+        self.assertEqual(document.metadata["clock_fit_scope"], "all_capture_observations")
+        self.assertEqual(document.metadata["clock_fit_status"], "unavailable")
+        self.assertEqual(document.metadata["clock_fit_model_count"], "0")
+        self.assertEqual(document.metadata["clock_fit_error_count"], "0")
+        self.assertNotIn("clock_model", document.metadata)
 
     def test_schema_change_removes_stale_task_group_and_latency_curve(self):
         self.window.register_dataflow_export_descriptors(_task_descriptors())

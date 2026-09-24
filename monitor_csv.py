@@ -70,6 +70,8 @@ CLOCK_MODEL_FIELDS = (
     "span_us",
     "residual_us",
     "drift_uncertainty_ppb",
+    "fit_scope",
+    "fit_algorithm",
 )
 
 CLOCK_OBSERVATION_FIELDS = (
@@ -215,6 +217,11 @@ def write_monitor_csv(path, series, metadata=None, clock_data=None):
         "monitor_clock",
         "monitor_alignment_anchor_us",
         "monitor_unix_anchor_us",
+        "clock_fit_scope",
+        "clock_fit_status",
+        "clock_fit_model_count",
+        "clock_fit_error_count",
+        "clock_fit_errors",
     ):
         value = clock_data.get(key)
         if value not in (None, ""):
@@ -231,6 +238,11 @@ def write_monitor_csv(path, series, metadata=None, clock_data=None):
             "monitor_clock",
             "monitor_alignment_anchor_us",
             "monitor_unix_anchor_us",
+            "clock_fit_scope",
+            "clock_fit_status",
+            "clock_fit_model_count",
+            "clock_fit_error_count",
+            "clock_fit_errors",
             "protocol",
             "schema_generation",
         ):

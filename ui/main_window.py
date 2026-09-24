@@ -1439,7 +1439,9 @@ class PlotWindow(QWidget):
             generation = getattr(self.data_receiver, "nf_schema_generation", None)
             if generation is not None:
                 metadata["schema_generation"] = generation
-            metadata.update(self.data_receiver.get_nfv3_clock_metadata())
+            # Export computes and serializes a fresh full-capture clock fit.
+            # The online offset-only tracker is intentionally not exported as
+            # a formal clock model.
         return write_monitor_csv(
             final_path,
             series,

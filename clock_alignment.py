@@ -202,6 +202,16 @@ class ClockObservationStore:
                 if int(self._ft_session[index]) == session
             )
 
+    def sessions(self, domain):
+        """Return all capture sessions with retained clock evidence."""
+        with self._lock:
+            values = (
+                self._nf_session
+                if domain == NEUROFLAP_CLOCK_DOMAIN
+                else self._ft_session
+            )
+            return tuple(sorted({int(value) for value in values}))
+
     def export(self):
         with self._lock:
             neuroflap = [

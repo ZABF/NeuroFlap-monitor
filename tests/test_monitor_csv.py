@@ -199,6 +199,8 @@ class MonitorCsvTest(unittest.TestCase):
                     "span_us": 10_000_000,
                     "residual_us": 10.0,
                     "drift_uncertainty_ppb": 500.0,
+                    "fit_scope": "all_capture_observations",
+                    "fit_algorithm": "ft_robust_affine_v1",
                 }],
                 "observations": [{
                     "domain": "ft",
@@ -220,6 +222,10 @@ class MonitorCsvTest(unittest.TestCase):
         )
         self.assertEqual(document.clock_models[0]["domain"], "ft")
         self.assertEqual(document.clock_models[0]["host_clock"], "monotonic_raw")
+        self.assertEqual(
+            document.clock_models[0]["fit_scope"],
+            "all_capture_observations",
+        )
         self.assertEqual(document.clock_observations[0]["receive_us"], "1500000")
 
     def test_v4_clock_evidence_survives_without_data_columns(self):

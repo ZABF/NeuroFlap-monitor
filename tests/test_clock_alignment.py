@@ -62,6 +62,8 @@ class ClockAlignmentTest(unittest.TestCase):
         self.assertEqual(store.neuroflap_snapshot(2)[0].sequence, 2)
         self.assertEqual(store.ft_snapshot(1)[0].source_us, 100)
         self.assertEqual(store.ft_snapshot(2)[0].receive_us, 400)
+        self.assertEqual(store.sessions("neuroflap"), (1, 2))
+        self.assertEqual(store.sessions("ft"), (1, 2))
 
     def test_realtime_tracker_is_offset_only_and_rate_limited(self):
         tracker = RealtimeOffsetTracker()
