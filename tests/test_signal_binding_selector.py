@@ -115,6 +115,102 @@ class SignalBindingSelectorTest(unittest.TestCase):
         self.assertEqual(self.selector.signal_combo.currentText(), "armed")
         self.assertEqual(self.selector.currentData(), "Dataflow.armed")
 
+    def test_custom_categories_use_section_groups_instead_of_producer(self):
+        descriptors = {
+            "Processed.UWB.pos_x_lowpass_zero": {
+                "category": "processed",
+                "section": "Processed/Trajectory",
+                "descriptor_kind": "processed_signal",
+                "owner": "clean_ch3_segments",
+                "display_name": "UWB X low-pass zero",
+            },
+            "Analysis.output.residual": {
+                "category": "analysis",
+                "section": "Analysis/Validation/Residuals",
+                "owner": "offline_tool",
+                "display_name": "Residual",
+            },
+        }
+        choices = build_signal_choices(descriptors, descriptors)
+        by_variable = {choice.variable: choice for choice in choices}
+
+        processed = by_variable["Processed.UWB.pos_x_lowpass_zero"]
+        self.assertEqual(processed.category, "processed")
+        self.assertEqual(processed.category_label, "Processed")
+        self.assertEqual(processed.owner_label, "Trajectory")
+        analysis = by_variable["Analysis.output.residual"]
+        self.assertEqual(analysis.category, "analysis")
+        self.assertEqual(analysis.owner_label, "Validation/Residuals")
+        self.assertEqual(analysis.signal_label, "Residual")
+
+        self.selector.set_choices(choices, processed.variable)
+        self.assertEqual(self.selector.category_combo.currentText(), "Processed")
+        self.assertEqual(self.selector.owner_combo.currentText(), "Trajectory")
+        self.assertEqual(self.selector.currentData(), processed.variable)
+        self.selector.category_combo.setCurrentIndex(
+            self.selector.category_combo.findData("analysis")
+        )
+        self.assertEqual(self.selector.owner_combo.currentText(), "Validation/Residuals")
+        self.assertEqual(self.selector.currentData(), analysis.variable)
+
+    def test_section_can_declare_category_without_category_metadata(self):
+        descriptors = {
+            "opaque_signal": {
+                "section": "Experiment/Run A",
+                "owner": "tool",
+                "display_name": "Altitude",
+            },
+        }
+        choice = build_signal_choices(descriptors, descriptors)[0]
+
+        self.assertEqual(choice.category, "experiment")
+        self.assertEqual(choice.category_label, "Experiment")
+        self.assertEqual(choice.owner_label, "Run A")
+
+    def test_explicit_group_overrides_section_and_owner(self):
+        descriptors = {
+            "Estimate.x": {
+                "category": "estimation",
+                "group": "Filtered pose",
+                "section": "Estimation/Raw pose",
+                "owner": "algorithm",
+            },
+        }
+        choice = build_signal_choices(descriptors, descriptors)[0]
+
+        self.assertEqual(choice.category, "estimation")
+        self.assertEqual(choice.owner_label, "Filtered pose")
+
+    def test_custom_task_categories_and_generic_signals_sort_together(self):
+        descriptors = {
+            "Recorder.output.x": {
+                "descriptor_kind": "task_port",
+                "category": "experiment",
+                "owner": "Recorder",
+                "direction": 1,
+                "display_name": "x",
+            },
+            "custom_signal": {
+                "category": "experiment",
+                "section": "Experiment/Estimated",
+            },
+        }
+        choices = build_signal_choices(descriptors, descriptors)
+
+        self.assertEqual({choice.category for choice in choices}, {"experiment"})
+        self.assertEqual(len(choices), len(descriptors))
+        self.assertEqual(
+            choices, build_signal_choices(reversed(list(descriptors)), descriptors)
+        )
+
+    def test_metadata_free_external_signals_keep_legacy_groups(self):
+        choices = build_signal_choices(("Mocap_X", "F_X", "unclassified"))
+        by_variable = {choice.variable: choice for choice in choices}
+
+        self.assertEqual(by_variable["Mocap_X"].owner_label, "MoCap")
+        self.assertEqual(by_variable["F_X"].owner_label, "Bota FT")
+        self.assertEqual(by_variable["unclassified"].owner_label, "Other")
+
 
 if __name__ == "__main__":
     unittest.main()

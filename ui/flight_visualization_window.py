@@ -501,6 +501,7 @@ class FlightVisualizationWindow(QWidget):
 
         inputs_group = QGroupBox("Inputs")
         inputs_form = QFormLayout(inputs_group)
+        inputs_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         for key, label, _hints in BINDINGS:
             selector = SignalBindingSelector()
             selector.selectionChanged.connect(self._settings_changed)

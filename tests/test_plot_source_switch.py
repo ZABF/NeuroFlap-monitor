@@ -1,5 +1,6 @@
 import os
 import math
+import csv
 import sys
 import tempfile
 import types
@@ -62,7 +63,8 @@ _data_transporter_mod = types.ModuleType("data_transporter")
 _data_transporter_mod.DataTransporter = _DummyDataTransporter
 sys.modules.setdefault("data_transporter", _data_transporter_mod)
 
-from PyQt5.QtWidgets import QApplication, QLabel, QAbstractSpinBox
+from PyQt5.QtCore import QPoint
+from PyQt5.QtWidgets import QApplication, QLabel, QAbstractSpinBox, QScrollArea
 
 from data_receiver import DataReceiver
 from monitor_csv import read_monitor_csv
@@ -152,7 +154,7 @@ class PlotSourceSwitchTest(unittest.TestCase):
         DataReceiver.start = self.original_start
 
     def test_window_title_tracks_monitor_release(self):
-        self.assertEqual(self.window.windowTitle(), "Monitor v3.5.0")
+        self.assertEqual(self.window.windowTitle(), "Monitor v3.5.1")
 
     def test_window_minimum_width_fits_wide_desktop_viewport(self):
         self.assertLessEqual(self.window.minimumSizeHint().width(), 1600)
@@ -796,6 +798,72 @@ class PlotSourceSwitchTest(unittest.TestCase):
             ),
             0,
         )
+        visualization.close()
+
+    def test_csv_custom_group_can_bind_and_render_a_trajectory(self):
+        names = (
+            "Processed.UWB.pos_x_lowpass_zero",
+            "Processed.UWB.pos_y_lowpass_zero",
+            "Processed.Baro.height_lowpass_zero",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "trajectory.csv")
+            with open(path, "w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["#NFMonitorCSV", "3"])
+                writer.writerow(["#meta", "time_unit", "us"])
+                writer.writerow([
+                    "#var_fields", "name", "category", "section", "unit",
+                    "kind", "owner", "display_name",
+                ])
+                for index, name in enumerate(names):
+                    writer.writerow([
+                        "#var", name, "processed", "Processed/Trajectory", "m",
+                        "processed_signal", "offline_tool", f"Axis {index}",
+                    ])
+                writer.writerow([
+                    column
+                    for name in names
+                    for column in (name + "_time_us", name + "_value")
+                ])
+                for sample in range(3):
+                    writer.writerow([
+                        cell
+                        for axis in range(3)
+                        for cell in (sample * 10000, sample * (axis + 1))
+                    ])
+            document = read_monitor_csv(path)
+            self.window._load_imported_series(path, document.series, document.metadata)
+
+        self.window.open_flight_visualization()
+        visualization = self.window.flight_visualization_window
+        visualization.timer.stop()
+        for axis, name in zip("xyz", names):
+            selector = visualization.binding_combos[f"position_{axis}"]
+            selector.category_combo.setCurrentIndex(
+                selector.category_combo.findData("processed")
+            )
+            selector.owner_combo.setCurrentIndex(
+                selector.owner_combo.findData("Trajectory")
+            )
+            selector.signal_combo.setCurrentIndex(selector.signal_combo.findData(name))
+            self.assertEqual(selector.category_combo.currentText(), "Processed")
+            self.assertEqual(selector.owner_combo.currentText(), "Trajectory")
+            self.assertEqual(selector.currentData(), name)
+        self.window.timeline.seek(20.0)
+        visualization.update_scene()
+
+        self.assertEqual(visualization.canvas.sample.position, (2.0, 4.0, 6.0))
+        self.assertEqual(len(visualization.canvas.trail), 3)
+        for width, height in ((1180, 760), (1600, 1050)):
+            visualization.resize(width, height)
+            self.app.processEvents()
+            viewport = visualization.findChild(QScrollArea).viewport()
+            for selector in visualization.binding_combos.values():
+                right = selector.signal_combo.mapTo(
+                    viewport, QPoint(selector.signal_combo.width() - 1, 0)
+                ).x()
+                self.assertLess(right, viewport.width())
         visualization.close()
 
     def test_v3_export_round_trip_restores_task_port_and_latency_metadata(self):

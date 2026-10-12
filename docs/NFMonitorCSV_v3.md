@@ -40,6 +40,10 @@ MadgwickTask.input.pitch_time_us,MadgwickTask.input.pitch_value,MadgwickTask.lat
 - Empty cells pad shorter series.
 - Values are decoded source values. Derived curves and phase/scale/offset view transforms are not exported.
 - `hidden=1` restores internal curves such as task latency without adding a regular variable checkbox.
+- Signal categories are open-ended. Flight Visualization discovers non-Task groups from
+  `category` and `section`; for example, `processed` and `Processed/Trajectory` appear as
+  `Processed -> Trajectory`. `owner` identifies the producer and is a grouping fallback
+  when the section does not declare a group. New categories need no Monitor code branch.
 - Live NFv3/NFv4 exports include the final clock-model snapshot. It records anchors, offset
   bounds, applied and candidate drift, confidence states, uncertainty, window counts, rejected
   samples, and the final fitting status; it does not record the full estimator history.
