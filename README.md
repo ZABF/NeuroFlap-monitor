@@ -50,6 +50,25 @@ Notes:
 - Plot `Start/Pause/Clear` is decoupled from the firmware connection lifecycle.
 - Firmware is single-session: if occupied, monitor shows busy owner IP/port.
 
+## Continuous Angle Curves
+
+Use **Derived...** to create `unwrap([MadgwickTask.output.yaw])`, or select an angle
+curve and use the `unwrap()` button in the derived-curve editor. The default period
+is 360 degrees; `unwrap([yaw_rad], 6.283185307179586)` uses radians instead.
+
+For example, `170, 179, -179, -170` becomes `170, 179, 181, 190`. Each change larger
+than half the period is corrected by a whole number of periods. The first angle
+is retained; unwrap does not set a new zero. Consecutive true motion must be less
+than half a turn, since wrapped samples cannot reveal skipped turns.
+
+The cumulative angle is anchored to the recording rather than the visible
+window, so panning, zooming and replay seeking preserve the turn count. Raw-source
+unwrap resets across clock sessions, invalid samples, clears and source changes.
+Direct source inputs process appended samples incrementally; composite inputs
+are recalculated when dependencies change. Use `d(unwrap([yaw]))` for angular
+velocity without spikes at the wrap boundary. Original samples and CSV exports
+retain the source angle.
+
 ## Protocol
 
 Dataflow export protocol reference:

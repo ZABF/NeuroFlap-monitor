@@ -52,6 +52,7 @@ from ui.curve_expression import (
 )
 from ui.curve_state import ActiveDataSource, expression_refs, resolve_derived_health
 from ui.curve_data_engine import (
+    UnwrappedSeries,
     hampel_filter,
     min_max_downsample,
     moving_average,
@@ -172,6 +173,8 @@ class PlotWindow(QWidget):
         self.curve_visibility = {}
         self._curve_view_data = {}
         self._curve_cache = {}
+        self._unwrap_cache = {}
+        self._unwrap_cache_generation = None
         self._curve_render_signatures = {}
         self._curve_expression_revision = 0
         self.active_data_source = ActiveDataSource.none()
@@ -1940,6 +1943,10 @@ class PlotWindow(QWidget):
         return self.curve_specs.get(var_name, {}).get("kind") == "expr"
 
     def _invalidate_curve_render_state(self, var_name=None):
+        generation = (self.data_model.epoch, self._curve_expression_revision)
+        if generation != self._unwrap_cache_generation:
+            self._unwrap_cache.clear()
+            self._unwrap_cache_generation = generation
         if var_name is None:
             self._curve_cache.clear()
             self._curve_view_data.clear()
@@ -2391,6 +2398,54 @@ class PlotWindow(QWidget):
 
         return out_ts, out_vs
 
+    def _eval_unwrap(self, node, eval_stack, range_start, range_end):
+        args = node[2]
+        if len(args) not in (1, 2):
+            return self._series_value([], [])
+        period = 360.0 if len(args) == 1 else self._static_scalar_expr_value(args[1])
+        if period is None or not math.isfinite(period) or period <= 0.0:
+            return self._series_value([], [])
+
+        generation = (self.data_model.epoch, self._curve_expression_revision)
+        if generation != self._unwrap_cache_generation:
+            self._unwrap_cache.clear()
+            self._unwrap_cache_generation = generation
+        key = repr(node)
+        signature = tuple(
+            (ref, self._curve_revision_signature(ref, eval_stack))
+            for ref in sorted(expression_refs(args[0]))
+        )
+        cached = self._unwrap_cache.get(key)
+        if cached is None or cached["signature"] != signature:
+            input_node = args[0]
+            raw_ref = input_node[0] == "ref" and not self._is_derived_curve(input_node[1])
+            reset_key = None
+            if raw_ref:
+                name = input_node[1]
+                revision = self.data_model.get_series_revision(
+                    name, align_history=self._history_alignment_enabled()
+                )
+                reset_key = (revision[0], revision[3], self._curve_transform_signature(name))
+            if cached is None or not raw_ref or cached["reset_key"] != reset_key:
+                cached = {"series": UnwrappedSeries(period), "cursor": 0, "reset_key": reset_key}
+            if raw_ref:
+                ts, vs, sessions, cursor = self.data_model.get_series_chunk(
+                    name, cached["cursor"], align_history=self._history_alignment_enabled()
+                )
+                ts, vs = self._transform_curve_data(name, ts, vs)
+                cached["series"].extend(ts, vs, sessions)
+                cached["cursor"] = cursor
+            else:
+                # Composite inputs can revise older samples (e.g. centered
+                # filters), so rebuild them when their dependencies change.
+                value = self._eval_curve_expr(input_node, eval_stack)
+                if self._is_series_value(value):
+                    cached["series"].extend(value.get("ts", []), value.get("vs", []))
+            cached["signature"] = signature
+            self._unwrap_cache[key] = cached
+        ts, vs = cached["series"].between(range_start, range_end)
+        return self._series_value(ts, vs)
+
     def _eval_curve_expr(self, node, eval_stack, range_start=None, range_end=None):
         if node is None:
             return self._series_value([], [])
@@ -2438,6 +2493,8 @@ class PlotWindow(QWidget):
             args = node[2]
             if name == "soomth":
                 name = "smooth"
+            if name == "unwrap":
+                return self._eval_unwrap(node, eval_stack, range_start, range_end)
             if name == "d":
                 if len(args) != 1:
                     return self._series_value([], [])
@@ -2894,6 +2951,8 @@ class PlotWindow(QWidget):
             return f"{suffix}_{ast[2][0][1]}"
         if ast[0] == "call" and ast[1].lower() == "sign" and len(ast[2]) == 1 and ast[2][0][0] == "ref":
             return f"sign_{ast[2][0][1]}"
+        if ast[0] == "call" and ast[1].lower() == "unwrap" and len(ast[2]) >= 1 and ast[2][0][0] == "ref":
+            return f"unwrap_{ast[2][0][1]}"
         if ast[0] == "call" and ast[1].lower() == "clip" and len(ast[2]) >= 1 and ast[2][0][0] == "ref":
             return f"clip_{ast[2][0][1]}"
         if ast[0] == "call" and ast[1].lower() == "joint_tau" and len(ast[2]) >= 1 and ast[2][0][0] == "ref":
@@ -3023,6 +3082,8 @@ class PlotWindow(QWidget):
         sg1_btn = QPushButton("sg1()")
         sg2_btn = QPushButton("sg2()")
         sign_btn = QPushButton("sign()")
+        unwrap_btn = QPushButton("unwrap()")
+        unwrap_btn.setToolTip("Unwrap angle turns; default period 360 degrees. Optional second argument sets the period.")
         clip_btn = QPushButton("clip()")
         joint_tau_btn = QPushButton("joint_tau()")
         operator_buttons = []
@@ -3091,6 +3152,12 @@ class PlotWindow(QWidget):
                 None if editing else name_edit.setText(self._derive_name_from_expr(expr_edit.text()))
             )
         )
+        unwrap_btn.clicked.connect(
+            lambda: (
+                self._insert_expr_wrapped(expr_edit, "unwrap({})", current_variable_ref() or selected_ref),
+                None if editing else name_edit.setText(self._derive_name_from_expr(expr_edit.text()))
+            )
+        )
         clip_btn.clicked.connect(
             lambda: (
                 self._insert_expr_wrapped(expr_edit, "clip({}, 100)", current_variable_ref() or selected_ref),
@@ -3127,6 +3194,7 @@ class PlotWindow(QWidget):
         function_layout.addWidget(sg1_btn)
         function_layout.addWidget(sg2_btn)
         function_layout.addWidget(sign_btn)
+        function_layout.addWidget(unwrap_btn)
         function_layout.addWidget(clip_btn)
         function_layout.addWidget(joint_tau_btn)
         function_layout.addStretch(1)

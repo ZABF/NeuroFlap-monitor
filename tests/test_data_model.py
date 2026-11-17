@@ -8,6 +8,23 @@ from network_clock import ClockTransform
 
 
 class DataModelTest(unittest.TestCase):
+    def test_series_chunk_retains_missing_mapping_boundaries_and_append_cursor(self):
+        model = DataModel([])
+        model.add_raw_series(
+            "yaw", "source", [1.0, 2.0, 3.0], [1, 2, 2], [170.0, -170.0, -160.0],
+            clock_src="clock", reconstructed_timestamps=[math.nan, 1002.0, 1003.0],
+            unmapped_sessions=(1,),
+        )
+        model.set_clock_transform("clock", ClockTransform(target_anchor_us=1_000_000, usable=True, epoch=2))
+        ts, values, sessions, cursor = model.get_series_chunk("yaw")
+        self.assertTrue(math.isnan(ts[0]))
+        self.assertEqual(ts[1:], [1002.0, 1003.0])
+        self.assertEqual(values, [170.0, -170.0, -160.0])
+        self.assertEqual(sessions, [1, 2, 2])
+        model.add_data("source", 1004.0, 4.0, {"yaw": -150.0}, offset_src="clock")
+        self.assertEqual(model.get_series_chunk("yaw", cursor), ([1004.0], [-150.0], [2], 4))
+        self.assertEqual(model.get_series_chunk("missing"), ([], [], [], 0))
+
     def _import_partial_clock_history(self):
         model = DataModel([])
         model.add_raw_series(

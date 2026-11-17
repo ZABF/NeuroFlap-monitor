@@ -258,6 +258,73 @@ class PlotSourceSwitchTest(unittest.TestCase):
         self.assertEqual(len(raw_ts), 10001)
         self.assertEqual(len(raw_vs), 10001)
 
+    def test_unwrap_uses_same_turn_count_when_replay_viewport_moves(self):
+        continuous = [170.0 + index * 20.0 for index in range(100)]
+        wrapped = [(value + 180.0) % 360.0 - 180.0 for value in continuous]
+        self.window._load_imported_series("/tmp/yaw.csv", _series("yaw", wrapped))
+        expression = "unwrap([yaw])"
+        self.window.create_derived_curve("yaw_continuous", expression, CurveExpressionParser(expression).parse())
+        for start, end in ((1200.0, 1300.0), (1700.0, 1800.0), (1000.0, 1100.0)):
+            self.window.plot_widget.setXRange(start, end, padding=0)
+            self.window._curve_plot_data("yaw_continuous")
+            ts, vs = self.window._curve_view_data["yaw_continuous"]
+            self.assertEqual(vs, [continuous[int(round((timestamp - 1000.0) / 10.0))] for timestamp in ts])
+            self.assertTrue(ts)
+        self.assertEqual(self.window.data_model.get_raw_series("yaw")[2], wrapped)
+
+    def test_unwrap_live_appends_only_new_source_samples(self):
+        self.window.data_model.add_series("F_X", "yaw", [0.0, 10.0], [170.0, -170.0])
+        expression = "unwrap([F_X])"
+        self.window.create_derived_curve("yaw_continuous", expression, CurveExpressionParser(expression).parse())
+        calls = []
+        original = self.window.data_model.get_series_chunk
+        def recording_chunk(name, start_index=0, **kwargs):
+            calls.append(start_index)
+            return original(name, start_index, **kwargs)
+        self.window.data_model.get_series_chunk = recording_chunk
+        self.assertEqual(self.window._curve_full_transformed_data("yaw_continuous")[1], [170.0, 190.0])
+        self.window._curve_full_transformed_data("yaw_continuous", range_start=5.0, range_end=10.0)
+        self.window.data_model.add_data("yaw", 20.0, 20.0, {"F_X": -160.0})
+        self.window._invalidate_curve_render_state()
+        self.assertEqual(self.window._curve_full_transformed_data("yaw_continuous")[1], [170.0, 190.0, 200.0])
+        self.assertEqual(calls, [0, 2])
+
+    def test_unwrap_rebuilds_when_alignment_transform_or_source_changes(self):
+        self.window.data_model.add_series("F_X", "yaw", [0.0, 10.0], [170.0, -170.0])
+        expression = "unwrap([F_X])"
+        self.window.create_derived_curve("yaw_continuous", expression, CurveExpressionParser(expression).parse())
+        self.assertEqual(self.window._curve_full_transformed_data("yaw_continuous"), ([0.0, 10.0], [170.0, 190.0]))
+        self.window.curve_transforms["F_X"] = {"phase_ms": 0.0, "scale": -1.0, "offset": 0.0}
+        self.assertEqual(self.window._curve_full_transformed_data("yaw_continuous")[1], [-170.0, -190.0])
+        self.window.data_model.set_clock_transform("yaw", ClockTransform(target_anchor_us=1_000_000, usable=True))
+        self.assertEqual(self.window._curve_full_transformed_data("yaw_continuous")[0], [1000.0, 1010.0])
+        self.window.data_model.add_series("F_X", "yaw", [100.0], [-10.0])
+        self.assertEqual(self.window._curve_full_transformed_data("yaw_continuous"), ([100.0], [10.0]))
+        self.window._load_imported_series("/tmp/replacement.csv", _series("F_X", [20.0, 30.0]))
+        self.assertEqual(self.window._curve_full_transformed_data("yaw_continuous")[1], [-20.0, -30.0])
+
+    def test_unwrap_resets_at_clock_session_boundary(self):
+        self.window.data_model.add_raw_series(
+            "F_X", "yaw", [0.0, 10.0, 20.0, 30.0], [1, 1, 2, 2], [170.0, -170.0, -160.0, 170.0],
+            clock_src="clock", reconstructed_timestamps=[0.0, 10.0, 20.0, 30.0],
+        )
+        expression = "unwrap([F_X])"
+        self.window.create_derived_curve("yaw_continuous", expression, CurveExpressionParser(expression).parse())
+        self.assertEqual(self.window._curve_full_transformed_data("yaw_continuous")[1], [170.0, 190.0, -160.0, -190.0])
+
+    def test_unwrap_supports_period_composition_and_rejects_invalid_period(self):
+        self.window._load_imported_series("/tmp/yaw.csv", _series("yaw", [170.0, 179.0, -179.0, -170.0]))
+        for expression, expected in (
+            ("unwrap([yaw], 360)", [170.0, 179.0, 181.0, 190.0]),
+            ("unwrap(-[yaw])", [-170.0, -179.0, -181.0, -190.0]),
+            ("d(unwrap([yaw]))", [900.0, 200.0, 900.0]),
+            ("unwrap([yaw], 0)", []),
+            ("unwrap([yaw], [yaw])", []),
+        ):
+            with self.subTest(expression=expression):
+                value = self.window._eval_curve_expr(CurveExpressionParser(expression).parse(), ())
+                self.assertEqual(value["vs"], expected)
+
     def test_windowed_derivatives_match_full_history_results(self):
         timestamps = [float(index * 10) for index in range(2001)]
         values = [math.sin(index * 0.02) for index in range(2001)]

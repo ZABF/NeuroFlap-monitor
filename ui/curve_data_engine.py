@@ -1,6 +1,72 @@
 """Bounded display helpers for full-history monitor data."""
 
 import math
+from array import array
+from bisect import bisect_left, bisect_right
+
+
+class UnwrappedSeries:
+    """Accumulate angle turns once, retaining compact data for arbitrary views."""
+
+    def __init__(self, period=360.0):
+        self.period = float(period)
+        if not math.isfinite(self.period) or self.period <= 0.0:
+            raise ValueError("unwrap() period must be finite and positive")
+        self.timestamps = array("d")
+        self.values = array("d")
+        self._spans = []
+        self._previous = None
+        self._previous_time = None
+        self._session = None
+        self._correction = 0.0
+
+    def extend(self, timestamps, values, sessions=None):
+        """Append samples; invalid data, new sessions and time rollback reset turns."""
+        half = self.period * 0.5
+        for index, (timestamp, value) in enumerate(zip(timestamps, values)):
+            try:
+                timestamp, value = float(timestamp), float(value)
+            except (TypeError, ValueError):
+                timestamp, value = math.nan, math.nan
+            if not math.isfinite(timestamp) or not math.isfinite(value):
+                self._previous = None
+                continue
+            session = None if sessions is None else sessions[index]
+            reset = (
+                self._previous is None or session != self._session
+                or timestamp < self._previous_time
+            )
+            if reset:
+                self._correction = 0.0
+                self._spans.append([len(self.values), len(self.values)])
+            else:
+                delta = value - self._previous
+                if abs(delta) > half:
+                    step = (delta + half) % self.period - half
+                    # An exactly half-period change has no preferred direction.
+                    if step == -half and delta > 0.0:
+                        step = half
+                    self._correction += step - delta
+            self.timestamps.append(timestamp)
+            self.values.append(value + self._correction)
+            self._spans[-1][1] = len(self.values)
+            self._previous = value
+            self._previous_time = timestamp
+            self._session = session
+
+    def between(self, start=None, end=None, context=2):
+        """Slice already unwrapped data without changing its accumulated turns."""
+        if start is None and end is None:
+            return self.timestamps.tolist(), self.values.tolist()
+        timestamps, values = [], []
+        for lo, hi in self._spans:
+            left = lo if start is None else bisect_left(self.timestamps, start, lo, hi)
+            right = hi if end is None else bisect_right(self.timestamps, end, lo, hi)
+            left = max(lo, left - context)
+            right = min(hi, right + context)
+            timestamps.extend(self.timestamps[left:right])
+            values.extend(self.values[left:right])
+        return timestamps, values
 
 
 def min_max_downsample(timestamps, values, max_points):
