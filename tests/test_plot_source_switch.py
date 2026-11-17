@@ -598,6 +598,8 @@ class PlotSourceSwitchTest(unittest.TestCase):
                     "active": True,
                     "service_thread_alive": True,
                     "socket_ready": True,
+                    "service_error_count": 2,
+                    "service_last_error": "diagnostic service stopped: socket failed",
                     "local_ip": "192.168.0.2",
                     "local_port": 41234,
                     "target_ip": "192.168.0.119",
@@ -629,6 +631,8 @@ class PlotSourceSwitchTest(unittest.TestCase):
         )
         self.assertIn("requests: due 42, sent 42, failed 0", tooltip)
         self.assertIn("target: 192.168.0.119:28081", tooltip)
+        self.assertIn("service errors: 2", tooltip)
+        self.assertIn("last service error: diagnostic service stopped: socket failed", tooltip)
 
     def test_dynamic_layout_orders_categories_and_groups_task_ports(self):
         ast = CurveExpressionParser("1").parse()

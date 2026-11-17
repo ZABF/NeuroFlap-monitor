@@ -2,9 +2,13 @@ import struct
 import sys
 import types
 import unittest
+import queue
+import socket
+import threading
+from unittest.mock import Mock, patch
 
 from clock_alignment import AlignmentMode
-from host_clock import ALIGNMENT_CLOCK
+from host_clock import ALIGNMENT_CLOCK, HostClockSample
 from data_model import DataModel
 from nfv3_parser import NFv3Parser
 
@@ -119,6 +123,7 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
         )
         self.parser = self.receiver.nf_parser
         self.receiver.nf_connected = True
+        self.receiver.nf_protocol = self.parser.VERSION
 
     def _entries(self):
         return [
@@ -713,6 +718,414 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(actions, [("udp", 2, ("127.0.0.1", 19002))])
         self.assertEqual(len(self.receiver.pending_queue), 0)
+
+
+class _DiagnosticSocket:
+    """Blocking in-memory socket for diagnostic worker lifecycle tests."""
+
+    def __init__(self):
+        self.incoming = queue.Queue()
+        self.closed = threading.Event()
+        self.sent = []
+
+    def bind(self, _endpoint):
+        pass
+
+    def settimeout(self, _timeout):
+        pass
+
+    def getsockname(self):
+        return ("127.0.0.1", 30000)
+
+    def recvfrom(self, _size):
+        if self.closed.is_set():
+            raise OSError("socket closed")
+        try:
+            item = self.incoming.get(timeout=0.01)
+        except queue.Empty:
+            raise socket.timeout() from None
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def sendto(self, packet, endpoint):
+        self.sent.append((packet, endpoint))
+        return len(packet)
+
+    def close(self):
+        self.closed.set()
+
+
+class DataReceiverSessionLifecycleTest(unittest.TestCase):
+    def setUp(self):
+        self.receiver = DataReceiver(
+            DataModel([]), _DummyMainWindow(),
+            udp_target_ip="127.0.0.1", udp_target_port=19001,
+        )
+        self.parser = self.receiver.nf_parser
+        self.codec = self.receiver.nf_v4_codec
+        self.peer = ("127.0.0.1", 19002)
+        self.receiver._resolve_local_ip = Mock()
+        self.receiver._send_udp_packet = Mock(return_value=True)
+        self.addCleanup(self.receiver._stop_nfv3_diag_service_)
+
+    def _connected_v4(self):
+        r = self.receiver
+        r.nf_protocol = self.codec.VERSION
+        r.nf_connected = True
+        r.nf_connecting = False
+        r.nf_want_connected = True
+        r.nf_session_id = 123
+        r.nf_last_pong_ms = 1_000_000.0
+
+    def _accept(self):
+        r = self.receiver
+        packet = struct.pack(
+            self.codec.SESSION_ACCEPT_FMT,
+            self.codec.MAGIC, self.codec.VERSION, self.codec.TYPE_SESSION_ACCEPT,
+            r.nf_client_nonce, 123, self.codec.FEATURE_CLOCK_SYNC,
+            19002, 19003, 6000,
+        )
+        r._process_udp_packet(packet, 1.0, {"remote_addr": self.peer})
+
+    def test_wall_clock_steps_cannot_expire_live_v4_session(self):
+        self._connected_v4()
+        for wall_seconds in (1.0, 1_000_000_000.0):
+            with self.subTest(wall_seconds=wall_seconds), patch(
+                "data_receiver.time.time", return_value=wall_seconds
+            ), patch("data_receiver.time.monotonic", return_value=1001.0):
+                self.receiver._tick_nfv3_connection()
+                self.assertTrue(self.receiver.nf_connected)
+
+    def test_real_monotonic_timeout_still_reconnects(self):
+        self._connected_v4()
+        with patch("data_receiver.time.time", return_value=1.0), patch(
+            "data_receiver.time.monotonic", return_value=1006.0
+        ):
+            self.receiver._tick_nfv3_connection()
+        self.assertFalse(self.receiver.nf_connected)
+        self.assertEqual(self.receiver.nf_last_error, "link timeout")
+        self.assertEqual(self.receiver.nf_next_reconnect_ms, 1_006_500.0)
+
+    def test_connect_request_and_accept_share_monotonic_deadlines(self):
+        r = self.receiver
+        with patch("data_receiver.time.time", side_effect=AssertionError("wall clock used")), patch(
+            "data_receiver.time.monotonic", return_value=1000.0
+        ), patch.object(r, "start"):
+            r.connect_nfv3()
+            self.assertEqual(r.nf_connect_start_ms, 1_000_000.0)
+            self.assertEqual(r.nf_last_connect_req_ms, 1_000_000.0)
+            self._accept()
+        self.assertTrue(r.nf_connected)
+        self.assertEqual(r.nf_last_pong_ms, 1_000_000.0)
+        self.assertEqual(r.nf_last_schema_request_ms, 1_000_000.0)
+
+    def test_connect_timeout_and_backoff_use_monotonic_clock(self):
+        r = self.receiver
+        r.nf_want_connected = True
+        with patch("data_receiver.time.time", side_effect=AssertionError("wall clock used")), patch(
+            "data_receiver.time.monotonic", return_value=1000.0
+        ) as clock:
+            r._start_connect_attempt_(1_000_000.0)
+            clock.return_value = 1004.999
+            r._tick_nfv3_connection()
+            self.assertTrue(r.nf_connecting)
+            clock.return_value = 1005.0
+            r._tick_nfv3_connection()
+            self.assertFalse(r.nf_connecting)
+            self.assertEqual(r.nf_last_error, "connect timeout")
+            with patch.object(r, "_start_connect_attempt_") as start:
+                clock.return_value = 1005.499
+                r._tick_nfv3_connection()
+                start.assert_not_called()
+                clock.return_value = 1005.5
+                r._tick_nfv3_connection()
+                start.assert_called_once_with(1_005_500.0)
+
+    def test_schema_retry_and_request_throttle_use_monotonic_clock(self):
+        r = self.receiver
+        self._connected_v4()
+        with patch("data_receiver.time.time", side_effect=AssertionError("wall clock used")), patch(
+            "data_receiver.time.monotonic", return_value=1000.0
+        ) as clock:
+            self.assertTrue(r._request_nfv3_schema())
+            clock.return_value = 1000.999
+            self.assertFalse(r._request_nfv3_schema())
+            clock.return_value = 1001.0
+            self.assertTrue(r._request_nfv3_schema())
+            r.nf_schema_retry_active = True
+            r.nf_next_schema_retry_ms = 1_002_000.0
+            with patch.object(r, "_request_nfv3_schema") as request:
+                r._tick_nfv3_schema_retry()
+                request.assert_not_called()
+                clock.return_value = 1002.0
+                r._tick_nfv3_schema_retry()
+                request.assert_called_once_with(force=True)
+                self.assertEqual(r.nf_next_schema_retry_ms, 1_003_000.0)
+
+    def test_legacy_ping_and_disconnect_burst_use_monotonic_clock(self):
+        r = self.receiver
+        r.nf_protocol = self.parser.VERSION
+        r.nf_connected = True
+        pong = struct.pack(
+            "<HBB", self.parser.MAGIC, self.parser.VERSION, self.parser.TYPE_LINK_PONG
+        )
+        with patch("data_receiver.time.time", side_effect=AssertionError("wall clock used")), patch(
+            "data_receiver.time.monotonic", return_value=1000.0
+        ) as clock:
+            r._process_udp_packet(pong, 1.0, {})
+            self.assertEqual(r.nf_last_pong_ms, 1_000_000.0)
+            self.assertEqual(r.nf_next_ping_due_ms, 1_002_000.0)
+            r.disconnect_nfv3()
+            self.assertEqual(r.nf_next_disconnect_burst_ms, 1_000_120.0)
+            with patch.object(r, "_send_disconnect_request") as send:
+                clock.return_value = 1000.119
+                r._tick_nfv3_connection()
+                send.assert_not_called()
+                clock.return_value = 1000.121
+                r._tick_nfv3_connection()
+                send.assert_called_once()
+
+    def test_matched_v4_response_refreshes_monotonic_liveness_not_raw_time(self):
+        r = self.receiver
+        self._connected_v4()
+        r.nf_v4_clock.start_session(r.nf_session_id)
+        sent = []
+        r.nf_v4_clock.tick(
+            lambda data: sent.append(data) or HostClockSample(10_000_000, 20_000_000),
+            now_us=20_000_000,
+        )
+        request = struct.unpack(self.codec.SYNC_REQUEST_FMT, sent[0])
+        for expected_session, expected_sequence, expected_pong in (
+            (999, request[4], 1_000_000.0),
+            (123, request[4] + 1, 1_000_000.0),
+            (123, request[4], 20_002.0),
+        ):
+            packet = struct.pack(
+                self.codec.SYNC_RESPONSE_FMT,
+                self.codec.MAGIC, self.codec.VERSION, self.codec.TYPE_SYNC_RESPONSE,
+                expected_session, expected_sequence, 9_500_700, 9_500_740,
+                request[5], request[6], request[7], 0,
+            )
+            with patch("data_receiver.time.time", side_effect=AssertionError("wall clock used")), patch(
+                "data_receiver.time.monotonic", return_value=20.002
+            ):
+                r._handle_nfv4_aux_datagram_(
+                    packet, self.peer, HostClockSample(10_001_600, 20_001_600)
+                )
+            self.assertEqual(r.nf_last_pong_ms, expected_pong)
+        observations = r.clock_observations.neuroflap_snapshot(r.nf_clock_estimator.epoch)
+        self.assertEqual(observations[0].t1_us, 10_000_000)
+
+    def test_legacy_clock_sample_is_ignored_in_v4_session(self):
+        self._connected_v4()
+        packet = struct.pack(
+            self.parser.DIAG_CLOCK_SAMPLE_FMT,
+            self.parser.MAGIC, self.parser.VERSION, self.parser.TYPE_DIAG_CLOCK_SAMPLE,
+            0, 1, 1_000_000, 2_001_000, 2_001_100, 1_002_100, 0,
+        )
+        with patch.object(self.receiver, "_process_nfv3_clock_sample_") as handle:
+            self.assertTrue(self.receiver._handle_nfv3_diag_datagram_(packet, self.peer))
+            handle.assert_not_called()
+        self.assertEqual(self.receiver.nf_clock_estimator.snapshot().sample_count, 0)
+
+    def test_legacy_sample_and_metadata_use_scheduler_anchor(self):
+        r = self.receiver
+        r.nf_protocol = self.parser.VERSION
+        r.nf_connected = True
+        r._clock_wall_anchor_us = 100_000_000
+        r._clock_monotonic_anchor_us = 2_000_000
+        r._clock_alignment_anchor_us = 1_500_000
+        with patch.object(r, "_send_diag_udp_packet_", return_value=True) as send:
+            r._process_nfv3_clock_sample_(
+                dict(test_id=0, t1_us=1_000_000, t2_us=2_001_000,
+                     t3_us=2_001_100, t4_us=1_002_100), self.peer,
+            )
+        send.assert_called_once()
+        transform = r.nf_clock_estimator.transform
+        expected = int(transform.target_anchor_us + 98_000_000)
+        metadata = r.get_nfv3_clock_metadata()
+        self.assertEqual(metadata["clock_target_anchor_unix_us"], expected)
+        self.assertEqual(r.data_model.clock_transforms[r.NF_CLOCK_SOURCE].target_anchor_us, expected)
+
+    def test_legacy_clock_path_initializes_its_anchor_without_manual_setup(self):
+        r = self.receiver
+        r.nf_protocol = self.parser.VERSION
+        with patch.object(r, "_send_diag_udp_packet_", return_value=True):
+            r._process_nfv3_clock_sample_(
+                dict(test_id=0, t1_us=1_000_000, t2_us=2_001_000,
+                     t3_us=2_001_100, t4_us=1_002_100), self.peer,
+            )
+        self.assertEqual(r.get_nfv3_clock_metadata()["clock_sample_count"], 1)
+
+    def test_v4_metadata_uses_alignment_anchor(self):
+        r = self.receiver
+        self._connected_v4()
+        r._clock_capture_epoch_offset_us = 88_000_000
+        r.nf_clock_estimator.add_monitor_initiated(
+            2_000_000, 1_500_700, 1_500_740, 2_001_600
+        )
+        metadata = r.get_nfv3_clock_metadata()
+        self.assertEqual(
+            metadata["clock_target_anchor_unix_us"],
+            int(r.nf_clock_estimator.transform.target_anchor_us + 88_000_000),
+        )
+
+    def _run_scripted_worker(self, events, handler=None):
+        r = self.receiver
+        diag_socket = Mock()
+        diag_socket.recvfrom.side_effect = events
+        r.running = True
+        r._nf_diag_socket = diag_socket
+        if handler:
+            r._handle_nfv3_diag_datagram_ = handler
+        with self.assertLogs("data_receiver", level="WARNING"):
+            r._run_nfv3_diag_service_(diag_socket)
+        self.assertIsNone(r._nf_diag_socket)
+        diag_socket.close.assert_called_once()
+        return diag_socket
+
+    def test_bad_packet_does_not_kill_worker_or_skip_clock_tick(self):
+        self._connected_v4()
+        r = self.receiver
+        handler = Mock(side_effect=[ValueError("bad packet"), None])
+        with patch.object(r.nf_v4_clock, "tick") as tick:
+            self._run_scripted_worker(
+                [(b"bad", self.peer), (b"good", self.peer), OSError("broken socket")], handler
+            )
+        self.assertEqual(handler.call_count, 2)
+        self.assertEqual(tick.call_count, 2)
+        self.assertEqual(r._nf_diag_service_error_count, 2)
+
+    def test_maintenance_failure_is_reported_and_socket_released(self):
+        self._connected_v4()
+        r = self.receiver
+        with patch.object(r.nf_v4_clock, "tick", side_effect=RuntimeError("tick failed")):
+            self._run_scripted_worker([socket.timeout()])
+        self.assertIn("tick failed", r.nf_last_error)
+        status = r.get_nfv3_clock_status()["transport"]
+        self.assertFalse(status["socket_ready"])
+        self.assertEqual(status["service_error_count"], 1)
+        self.assertIn("tick failed", status["service_last_error"])
+
+    def test_error_logging_is_rate_limited_but_all_errors_count(self):
+        r = self.receiver
+        handler = Mock(side_effect=ValueError("bad packet"))
+        with patch("data_receiver.time.monotonic", return_value=1000.0), patch(
+            "data_receiver.logging.getLogger"
+        ) as logger:
+            diag_socket = Mock()
+            diag_socket.recvfrom.side_effect = [
+                (b"bad", self.peer), (b"bad", self.peer), OSError("broken socket")
+            ]
+            r.running = True
+            r._nf_diag_socket = diag_socket
+            r._handle_nfv3_diag_datagram_ = handler
+            r._run_nfv3_diag_service_(diag_socket)
+        self.assertEqual(r._nf_diag_service_error_count, 3)
+        logger.return_value.warning.assert_called_once()
+
+    def test_socket_failure_reconnects_with_new_worker_without_stopping_receiver(self):
+        r = self.receiver
+        first, second = _DiagnosticSocket(), _DiagnosticSocket()
+        first.incoming.put(OSError("first socket failed"))
+        r.running = True
+        r.nf_want_connected = True
+        with patch("data_receiver.socket.socket", side_effect=[first, second]), self.assertLogs(
+            "data_receiver", level="WARNING"
+        ), patch("data_receiver.time.monotonic", return_value=1000.0) as clock:
+            r._start_connect_attempt_(1_000_000.0)
+            old_thread = r._nf_diag_service_thread
+            old_thread.join(timeout=1.0)
+            self.assertFalse(old_thread.is_alive())
+            self._connected_v4()
+            r._tick_nfv3_connection()
+            self.assertFalse(r.nf_connected)
+            self.assertIn("first socket failed", r.nf_last_error)
+            clock.return_value = 1000.5
+            r._tick_nfv3_connection()
+            self.assertTrue(r.nf_connecting)
+            self.assertTrue(r._nf_diag_service_thread.is_alive())
+            self.assertIsNot(r._nf_diag_service_thread, old_thread)
+            self.assertIs(r._nf_diag_socket, second)
+            self._accept()
+            self.assertTrue(r.nf_connected)
+            self.assertTrue(r.running)
+            status = r.get_nfv3_clock_status()["transport"]
+            self.assertEqual(status["service_error_count"], 1)
+
+    def test_start_failure_uses_backoff_and_does_not_open_session(self):
+        r = self.receiver
+        r.running = True
+        r.nf_want_connected = True
+        diag_socket = Mock()
+        diag_socket.bind.side_effect = OSError("bind failed")
+        with patch("data_receiver.socket.socket", return_value=diag_socket), self.assertLogs(
+            "data_receiver", level="WARNING"
+        ):
+            r._start_connect_attempt_(1_000_000.0)
+        self.assertFalse(r.nf_connecting)
+        self.assertIsNone(r._nf_diag_socket)
+        self.assertIsNone(r._nf_diag_service_thread)
+        self.assertEqual(r.nf_next_reconnect_ms, 1_000_500.0)
+        self.assertIn("bind failed", r.nf_last_error)
+        r._send_udp_packet.assert_not_called()
+        diag_socket.close.assert_called_once()
+
+    def test_start_is_idempotent_and_stop_closes_and_joins_worker(self):
+        r = self.receiver
+        r.running = True
+        diag_socket = _DiagnosticSocket()
+        with patch("data_receiver.socket.socket", return_value=diag_socket) as factory:
+            self.assertTrue(r._start_nfv3_diag_service_())
+            thread = r._nf_diag_service_thread
+            self.assertTrue(r._start_nfv3_diag_service_())
+            factory.assert_called_once()
+        r._stop_nfv3_diag_service_()
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(diag_socket.closed.is_set())
+        self.assertIsNone(r._nf_diag_service_thread)
+        self.assertIsNone(r._nf_diag_socket)
+        self.assertEqual(r._nf_diag_service_error_count, 0)
+
+    def test_thread_start_failure_closes_socket_and_uses_backoff(self):
+        r = self.receiver
+        r.running = True
+        r.nf_want_connected = True
+        diag_socket = Mock()
+        with patch("data_receiver.socket.socket", return_value=diag_socket), patch(
+            "data_receiver.threading.Thread.start", side_effect=RuntimeError("thread unavailable")
+        ), self.assertLogs("data_receiver", level="WARNING"):
+            r._start_connect_attempt_(1_000_000.0)
+        self.assertFalse(r.nf_connecting)
+        self.assertIsNone(r._nf_diag_socket)
+        self.assertIsNone(r._nf_diag_service_thread)
+        self.assertEqual(r.nf_next_reconnect_ms, 1_000_500.0)
+        self.assertIn("thread unavailable", r.nf_last_error)
+        diag_socket.close.assert_called_once()
+        r._send_udp_packet.assert_not_called()
+
+    def test_start_cannot_duplicate_a_still_exiting_worker(self):
+        r = self.receiver
+        r.running = True
+        thread = Mock()
+        thread.is_alive.return_value = True
+        r._nf_diag_service_thread = thread
+        r._nf_diag_socket = None
+        with patch("data_receiver.socket.socket") as factory:
+            self.assertFalse(r._start_nfv3_diag_service_())
+        factory.assert_not_called()
+        self.assertIs(r._nf_diag_service_thread, thread)
+
+    def test_late_worker_cleanup_cannot_clear_replacement_socket(self):
+        r = self.receiver
+        old, replacement = Mock(), Mock()
+        r.running = True
+        r._nf_diag_socket = replacement
+        r._run_nfv3_diag_service_(old)
+        self.assertIs(r._nf_diag_socket, replacement)
+        old.close.assert_called_once()
+        replacement.close.assert_not_called()
 
 
 if __name__ == "__main__":
