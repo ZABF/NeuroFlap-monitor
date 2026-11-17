@@ -1,4 +1,5 @@
 import csv
+import math
 import os
 import tempfile
 import unittest
@@ -15,6 +16,111 @@ class MonitorCsvTest(unittest.TestCase):
     def tearDown(self):
         if os.path.exists(self.path):
             os.unlink(self.path)
+
+    def _device_series(self, sessions):
+        return [{
+            "name": "Task.output.value",
+            "raw_timestamps": [1000.0 + index for index in range(len(sessions))],
+            "sessions": sessions,
+            "values": [float(index) for index in range(len(sessions))],
+            "clock_domain": "neuroflap",
+        }]
+
+    def _clock_model(self, session=2, **overrides):
+        return {
+            "domain": "neuroflap",
+            "session": session,
+            "mode": "calibrated",
+            "host_clock": "monotonic_raw",
+            "source_anchor_us": 1_000_000,
+            "target_anchor_unix_us": 1_790_000_000_000_000,
+            "drift_ppm": 0.0,
+            **overrides,
+        }
+
+    def test_missing_session_model_retains_raw_samples_without_fake_unix_time(self):
+        write_monitor_csv(
+            self.path,
+            self._device_series([1, 2, 2, 3]),
+            clock_data={
+                "active_mode": "calibrated",
+                "monitor_clock": "monotonic_raw",
+                "clock_fit_status": "complete",
+                "clock_fit_error_count": 0,
+                "models": [self._clock_model()],
+            },
+        )
+
+        document = read_monitor_csv(self.path)
+        data = document.series["Task.output.value"]
+
+        self.assertEqual(data["raw_timestamps"], [1000.0, 1001.0, 1002.0, 1003.0])
+        self.assertEqual(data["sessions"], [1, 2, 2, 3])
+        self.assertEqual(data["values"], [0.0, 1.0, 2.0, 3.0])
+        self.assertEqual(data["unmapped_sessions"], (1, 3))
+        self.assertTrue(math.isnan(data["timestamps"][0]))
+        self.assertEqual(data["timestamps"][1:3], [1_790_000_000_001.0, 1_790_000_000_002.0])
+        self.assertTrue(math.isnan(data["timestamps"][3]))
+        self.assertEqual(document.metadata["clock_fit_status"], "partial")
+        self.assertEqual(document.metadata["clock_fit_error_count"], "2")
+        self.assertIn("neuroflap:session:1", document.metadata["clock_fit_errors"])
+        self.assertIn("neuroflap:session:3", document.metadata["clock_fit_errors"])
+
+    def test_device_samples_without_any_models_remain_exportable(self):
+        original = self._device_series([7, 7])
+        write_monitor_csv(self.path, original)
+        document = read_monitor_csv(self.path)
+        data = document.series["Task.output.value"]
+
+        self.assertEqual(document.metadata["clock_fit_status"], "unavailable")
+        self.assertEqual(data["unmapped_sessions"], (7,))
+        self.assertTrue(all(math.isnan(value) for value in data["timestamps"]))
+
+        write_monitor_csv(self.path, [{"name": "Task.output.value", **data}])
+        restored = read_monitor_csv(self.path).series["Task.output.value"]
+        for field in ("raw_timestamps", "sessions", "values", "unmapped_sessions"):
+            self.assertEqual(restored[field], data[field])
+
+    def test_calibrated_mode_can_use_realtime_model_from_the_same_session(self):
+        write_monitor_csv(
+            self.path,
+            self._device_series([1, 2]),
+            clock_data={
+                "active_mode": "calibrated",
+                "monitor_clock": "monotonic_raw",
+                "models": [self._clock_model(mode="realtime")],
+            },
+        )
+        data = read_monitor_csv(self.path).series["Task.output.value"]
+
+        self.assertEqual(data["unmapped_sessions"], (1,))
+        self.assertEqual(data["timestamps"][1], 1_790_000_000_001.0)
+
+    def test_invalid_or_wrong_host_clock_model_does_not_align_samples(self):
+        invalid_models = (
+            {"source_anchor_us": ""},
+            {"target_anchor_unix_us": "nan"},
+            {"drift_ppm": "inf"},
+            {"drift_ppm": -1_000_000},
+            {"host_clock": "performance_counter"},
+        )
+        for overrides in invalid_models:
+            with self.subTest(overrides=overrides):
+                write_monitor_csv(
+                    self.path,
+                    self._device_series([2]),
+                    clock_data={
+                        "active_mode": "calibrated",
+                        "monitor_clock": "monotonic_raw",
+                        "clock_fit_status": "complete",
+                        "models": [self._clock_model(**overrides)],
+                    },
+                )
+                document = read_monitor_csv(self.path)
+                data = document.series["Task.output.value"]
+                self.assertEqual(data["unmapped_sessions"], (2,))
+                self.assertTrue(math.isnan(data["timestamps"][0]))
+                self.assertNotEqual(document.metadata["clock_fit_status"], "complete")
 
     def test_v4_round_trip_preserves_raw_time_axes_and_task_metadata(self):
         series = [

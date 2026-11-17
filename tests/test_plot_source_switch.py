@@ -67,7 +67,7 @@ from PyQt5.QtCore import QPoint
 from PyQt5.QtWidgets import QApplication, QLabel, QAbstractSpinBox, QScrollArea
 
 from data_receiver import DataReceiver
-from monitor_csv import read_monitor_csv
+from monitor_csv import read_monitor_csv, write_monitor_csv
 from network_clock import ClockTransform
 from timeline_controller import TimelineState
 from ui.curve_expression import CurveExpressionParser
@@ -366,6 +366,91 @@ class PlotSourceSwitchTest(unittest.TestCase):
         self.window.timeline_bar.slider.setValue(750000)
 
         self.assertEqual(self.window.timeline.playhead_ms, 1015.0)
+
+    def test_partial_clock_replay_keeps_raw_samples_and_uses_only_aligned_bounds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "partial-clock.csv")
+            raw_timestamps = [215829.057, 215838.705, 215848.831, 215860.791]
+            sessions = [1, 2, 2, 3]
+            values = [1.0, 2.0, 3.0, 4.0]
+            write_monitor_csv(
+                path,
+                [{
+                    "name": "RlPolicyTask.output.amp_l",
+                    "raw_timestamps": raw_timestamps,
+                    "sessions": sessions,
+                    "values": values,
+                    "clock_domain": "neuroflap",
+                }],
+                clock_data={
+                    "active_mode": "calibrated",
+                    "monitor_clock": "monotonic_raw",
+                    "models": [{
+                        "domain": "neuroflap",
+                        "session": 2,
+                        "mode": "calibrated",
+                        "host_clock": "monotonic_raw",
+                        "source_anchor_us": 215_838_705,
+                        "target_anchor_unix_us": 1_794_923_467_265_781,
+                        "drift_ppm": 0.0,
+                    }],
+                },
+            )
+            document = read_monitor_csv(path)
+            self.window._load_imported_series(
+                path, document.series, document.metadata, document.clock_models,
+            )
+
+            self.assertEqual(self.window.replay_unmapped_sample_count, 2)
+            self.assertIn("2 samples unaligned", self.window.active_source_label.text())
+            self.assertEqual(self.window.timeline.state, TimelineState.PAUSED)
+            self.assertAlmostEqual(self.window.timeline.start_ms, 1_794_923_467_265.781)
+            self.assertAlmostEqual(
+                self.window.timeline.latest_ms - self.window.timeline.start_ms,
+                10.126, places=3,
+            )
+            x_min, x_max = self.window.plot_widget.viewRange()[0]
+            self.assertLess(x_max - x_min, 20.0)
+            self.window.set_curve_visibility("RlPolicyTask.output.amp_l", True)
+            self.assertEqual(
+                self.window.curves["RlPolicyTask.output.amp_l"].yData.tolist(), [2.0, 3.0]
+            )
+            raw = self.window.data_model.get_raw_series("RlPolicyTask.output.amp_l")
+            self.assertEqual(raw[:3], (raw_timestamps, sessions, values))
+
+            exported_path = os.path.join(directory, "exported.csv")
+            self.window._write_monitor_csv(exported_path)
+            exported = read_monitor_csv(exported_path).series["RlPolicyTask.output.amp_l"]
+            for field, expected in (
+                ("raw_timestamps", raw_timestamps), ("sessions", sessions), ("values", values),
+            ):
+                self.assertEqual(exported[field], expected)
+
+    def test_replay_without_usable_model_has_empty_timeline_and_finite_viewport(self):
+        self.window._load_imported_series("/tmp/previous.csv", _series("a", [1.0, 2.0]))
+        for drift in (None, -1_000_000.0, math.inf):
+            with self.subTest(drift=drift):
+                models = () if drift is None else ({
+                    "domain": "neuroflap", "session": 1, "mode": "realtime",
+                    "source_anchor_us": 0, "target_anchor_unix_us": 1_790_000_000_000_000,
+                    "drift_ppm": drift,
+                },)
+                self.window._load_imported_series(
+                    "/tmp/no-clock.csv",
+                    {"a": {
+                        "timestamps": [math.nan, math.nan],
+                        "raw_timestamps": [100.0, 110.0],
+                        "sessions": [1, 1], "values": [1.0, 2.0],
+                        "clock_domain": "neuroflap", "unmapped_sessions": (1,),
+                    }},
+                    clock_models=models,
+                )
+                self.assertFalse(self.window.timeline.has_range)
+                self.assertEqual(self.window.timeline.state, TimelineState.EMPTY)
+                self.assertEqual(self.window.data_model.get_time_bounds(), (None, None))
+                self.assertEqual(self.window.data_model.get_series("a"), ([], []))
+                self.assertEqual(self.window.replay_unmapped_sample_count, 2)
+                self.assertTrue(all(math.isfinite(value) for value in self.window.plot_widget.viewRange()[0]))
 
     def test_live_pause_keeps_receiving_bounds_without_moving_playhead(self):
         self.window.timeline.begin_live()

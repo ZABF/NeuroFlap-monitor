@@ -412,6 +412,33 @@ class DataReceiverNFv3DecodeTest(unittest.TestCase):
         self.assertEqual(records["MadgwickTask.output.yaw"][4]["offset_timestamp"], 1000.0)
         self.assertEqual(self.window.latency_updates, [(5, 50)])
 
+    def test_first_nfv4_data_after_capture_clear_uses_active_clock_epoch(self):
+        self.receiver.data_model = model = DataModel([])
+        self.receiver.nf_protocol = self.receiver.nf_v4_codec.VERSION
+        self.receiver.nf_clock_estimator.reset("new_connection")
+        epoch = self.receiver.nf_clock_estimator.epoch
+        self.assertGreater(epoch, 1)
+        self._install_schema()
+
+        for packet_seq in (10, 11):
+            with self.subTest(packet_seq=packet_seq):
+                model.begin_clock_epoch(self.receiver.NF_CLOCK_SOURCE, epoch)
+                model.clear()
+                self.receiver._process_nfv3_data(
+                    self._build_data_packet(packet_seq=packet_seq), unix_ts=2000.0
+                )
+
+                self.assertEqual(
+                    model.ensure_source(self.receiver.NF_CLOCK_SOURCE).current_session,
+                    epoch,
+                )
+                for name in (
+                    "MadgwickTask.latency_us",
+                    "MadgwickTask.input.roll",
+                    "MadgwickTask.output.yaw",
+                ):
+                    self.assertEqual(model.get_raw_series(name)[1], [epoch])
+
     def test_invalid_or_reversed_task_times_do_not_publish_latency(self):
         self._install_schema()
         invalid = self._build_data_packet()
