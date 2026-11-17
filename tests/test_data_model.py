@@ -1,4 +1,5 @@
 import unittest
+import math
 from array import array
 
 from clock_alignment import AlignmentMode
@@ -7,6 +8,101 @@ from network_clock import ClockTransform
 
 
 class DataModelTest(unittest.TestCase):
+    def _import_partial_clock_history(self):
+        model = DataModel([])
+        model.add_raw_series(
+            "value", "csv:source",
+            raw_timestamps=[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+            sessions=[1, 2, 2, 3, 3, 4, 4, 5],
+            values=[float(index) for index in range(8)],
+            clock_src="clock",
+            reconstructed_timestamps=[math.nan, 1001.0, 1002.0, math.nan, math.nan, 1005.0, 1006.0, math.nan],
+            unmapped_sessions=(1, 3, 5),
+        )
+        for session in (2, 4):
+            model.set_clock_transform(
+                "clock", ClockTransform(target_anchor_us=1_000_000, usable=True, epoch=session)
+            )
+        return model
+
+    def test_partial_import_excludes_unmapped_sessions_from_queries_and_bounds(self):
+        model = self._import_partial_clock_history()
+        for align_history in (False, True):
+            with self.subTest(align_history=align_history):
+                self.assertEqual(
+                    model.get_series("value", align_history=align_history),
+                    ([1001.0, 1002.0, 1005.0, 1006.0], [1.0, 2.0, 5.0, 6.0]),
+                )
+                self.assertEqual(
+                    model.get_time_bounds(align_history=align_history),
+                    (1001.0, 1006.0),
+                )
+                self.assertEqual(
+                    model.get_series_between("value", 1002.0, 1005.0, align_history=align_history),
+                    ([1002.0, 1005.0], [2.0, 5.0]),
+                )
+                self.assertEqual(
+                    model.get_bracketing_samples("value", 1004.0, align_history=align_history),
+                    ((1002.0, 2.0), (1005.0, 5.0)),
+                )
+                self.assertEqual(
+                    model.get_nearest_sample("value", 1007.0, align_history=align_history),
+                    (1006.0, 6.0),
+                )
+                self.assertEqual(
+                    model.get_series("value", 2.0, align_history=align_history),
+                    ([1005.0, 1006.0], [5.0, 6.0]),
+                )
+        raw, sessions, values, clock_source = model.get_raw_series("value")
+        self.assertEqual(raw, [float(index) for index in range(8)])
+        self.assertEqual(sessions, [1, 2, 2, 3, 3, 4, 4, 5])
+        self.assertEqual(values, raw)
+        self.assertEqual(clock_source, "clock")
+
+    def test_partial_import_tail_and_filter_context_skip_unmapped_spans(self):
+        model = self._import_partial_clock_history()
+        for align_history in (False, True):
+            with self.subTest(align_history=align_history):
+                self.assertEqual(
+                    model.get_series_tail("value", 3, align_history=align_history),
+                    ([1002.0, 1005.0, 1006.0], [2.0, 5.0, 6.0]),
+                )
+                self.assertEqual(
+                    model.get_series_window_ending_at("value", 1005.0, 2, align_history=align_history),
+                    ([1002.0, 1005.0], [2.0, 5.0]),
+                )
+                self.assertEqual(
+                    model.get_series_between(
+                        "value", 1005.0, 1005.0, before_samples=1, after_samples=1,
+                        align_history=align_history,
+                    ),
+                    ([1002.0, 1005.0, 1006.0], [2.0, 5.0, 6.0]),
+                )
+
+    def test_history_can_be_recovered_when_missing_session_model_is_supplied(self):
+        model = self._import_partial_clock_history()
+        model.set_clock_transform(
+            "clock", ClockTransform(target_anchor_us=1_000_000, usable=True, epoch=3)
+        )
+        self.assertEqual(
+            model.get_series("value"),
+            ([1001.0, 1002.0, 1003.0, 1004.0, 1005.0, 1006.0], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        )
+
+    def test_import_without_usable_clock_mapping_has_no_aligned_range(self):
+        model = DataModel([])
+        model.add_raw_series(
+            "value", "source", [1.0, 2.0], [1, 1], [3.0, 4.0],
+            clock_src="clock", reconstructed_timestamps=[math.nan, math.nan],
+            unmapped_sessions=(1,),
+        )
+        for align_history in (False, True):
+            with self.subTest(align_history=align_history):
+                self.assertEqual(model.get_time_bounds(align_history=align_history), (None, None))
+                self.assertEqual(model.get_series("value", align_history=align_history), ([], []))
+                self.assertEqual(model.get_bracketing_samples("value", 100.0, align_history=align_history), (None, None))
+        self.assertEqual(model.get_raw_series("value")[:3], ([1.0, 2.0], [1, 1], [3.0, 4.0]))
+
     def test_alignment_mode_switches_complete_history_between_models(self):
         model = DataModel([])
         model.add_data(

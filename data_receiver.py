@@ -287,6 +287,13 @@ class DataReceiver:
                     epoch=session,
                     revision=int(item.get("revision", 1) or 1),
                 )
+                if (
+                    not all(math.isfinite(value) for value in (
+                        transform.source_anchor_us, target_unix_us, transform.drift_ppb
+                    ))
+                    or 1.0 + transform.drift_ppb * 1.0e-9 <= 0.0
+                ):
+                    continue
             except (KeyError, TypeError, ValueError):
                 continue
             clock_source = (
@@ -2593,6 +2600,11 @@ class DataReceiver:
 
         if not self.data_ingestion_enabled:
             return
+
+        # Clearing a capture resets DataModel, not the active NFv4 clock epoch.
+        # Stamp the first DATA packet correctly even before the next SYNC reply.
+        if self.nf_protocol == self.nf_v4_codec.VERSION:
+            self._sync_nfv4_clock_epoch_()
 
         packet_time_us = int(packet["packet_time_us"])
         packet_timestamp_ms = packet_time_us / 1000.0

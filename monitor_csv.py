@@ -227,6 +227,31 @@ def write_monitor_csv(path, series, metadata=None, clock_data=None):
         if value not in (None, ""):
             file_metadata[key] = value
 
+    models = tuple(clock_data.get("models", ()))
+    model_index = _index_clock_models(models, file_metadata)
+    required_sessions = {
+        (item.get("clock_domain", "monitor"), session)
+        for _name, item, samples in prepared
+        if item.get("clock_domain", "monitor") != "monitor"
+        for session in {sample[1] for sample in samples}
+    }
+    missing = sorted(
+        (domain, session)
+        for domain, session in required_sessions
+        if _resolve_clock_model(model_index, file_metadata, domain, session) is None
+    )
+    if missing:
+        errors = [file_metadata.get("clock_fit_errors", "")]
+        errors.extend(
+            f"{domain}:session:{session}: sampled data has no usable clock model"
+            for domain, session in missing
+        )
+        file_metadata["clock_fit_status"] = "partial" if models else "unavailable"
+        file_metadata["clock_fit_error_count"] = (
+            int(file_metadata.get("clock_fit_error_count", 0) or 0) + len(missing)
+        )
+        file_metadata["clock_fit_errors"] = " | ".join(filter(None, errors))
+
     with open(path, "w", newline="", encoding="utf-8") as fp:
         writer = csv.writer(fp)
         writer.writerow([FORMAT_TAG, CURRENT_VERSION])
@@ -260,7 +285,7 @@ def write_monitor_csv(path, series, metadata=None, clock_data=None):
             writer.writerow(["#var", *(_descriptor_value(descriptor, field) for field in VAR_FIELDS)])
 
         writer.writerow(["#clock_model_fields", *CLOCK_MODEL_FIELDS])
-        for model in clock_data.get("models", ()):
+        for model in models:
             writer.writerow(
                 ["#clock_model", *(model.get(field, "") for field in CLOCK_MODEL_FIELDS)]
             )
@@ -448,12 +473,39 @@ def _parse_tagged_record(fields, values):
 def _clock_model_transform(model, raw_us):
     source_anchor = _finite_number(model.get("source_anchor_us"))
     target_anchor = _finite_number(model.get("target_anchor_unix_us"))
-    drift_ppm = _finite_number(model.get("drift_ppm"))
-    if source_anchor is None or target_anchor is None or drift_ppm is None:
-        return float(raw_us)
+    drift_ppm = _finite_number(model.get("drift_ppm", 0.0))
+    if (
+        source_anchor is None or target_anchor is None or drift_ppm is None
+        or 1.0 + drift_ppm * 1.0e-6 <= 0.0
+    ):
+        return math.nan
     return target_anchor + (float(raw_us) - source_anchor) * (
         1.0 + drift_ppm * 1.0e-6
     )
+
+
+def _index_clock_models(models, metadata):
+    primary_host_clock = metadata.get("monitor_clock", "monotonic")
+    return {
+        (
+            model.get("domain", ""),
+            _optional_int(model.get("session", "")) or 1,
+            model.get("mode", ""),
+            model.get("host_clock", "") or primary_host_clock,
+        ): model
+        for model in models
+    }
+
+
+def _resolve_clock_model(model_index, metadata, domain, session):
+    mode = metadata.get("active_alignment_mode", "realtime")
+    host_clock = metadata.get("monitor_clock", "monotonic")
+    modes = ("calibrated", "realtime") if mode == "calibrated" else (mode,)
+    for candidate_mode in modes:
+        model = model_index.get((domain, session, candidate_mode, host_clock))
+        if model is not None and math.isfinite(_clock_model_transform(model, 0)):
+            return model
+    return None
 
 
 def read_monitor_csv(path):
@@ -543,22 +595,13 @@ def read_monitor_csv(path):
                 "raw_timestamps": [],
                 "sessions": [],
                 "values": [],
+                "unmapped_sessions": set(),
                 **descriptors.get(name, {"section": "Ungrouped", "unit": ""}),
             }
             for name, _time_index, _session_index, _value_index, _unit in pairs
         }
 
-        active_mode = metadata.get("active_alignment_mode", "realtime")
-        primary_host_clock = metadata.get("monitor_clock", "monotonic")
-        model_index = {
-            (
-                model.get("domain", ""),
-                _optional_int(model.get("session", "")) or 1,
-                model.get("mode", ""),
-                model.get("host_clock", "") or primary_host_clock,
-            ): model
-            for model in clock_models
-        }
+        model_index = _index_clock_models(clock_models, metadata)
 
         for row in reader:
             for name, time_index, session_index, value_index, unit in pairs:
@@ -576,18 +619,14 @@ def read_monitor_csv(path):
                 if unit == "raw_us":
                     raw_us = int(round(timestamp))
                     domain = series[name].get("clock_domain", "monitor")
-                    model = model_index.get(
-                        (domain, session, active_mode, primary_host_clock)
-                    )
-                    if model is None and active_mode == "calibrated":
-                        model = model_index.get(
-                            (domain, session, "realtime", primary_host_clock)
-                        )
+                    model = _resolve_clock_model(model_index, metadata, domain, session)
                     aligned_us = (
                         _clock_model_transform(model, raw_us)
                         if model is not None
-                        else float(raw_us)
+                        else float(raw_us) if domain == "monitor" else math.nan
                     )
+                    if not math.isfinite(aligned_us):
+                        series[name]["unmapped_sessions"].add(session)
                     timestamp_ms = aligned_us / 1000.0
                     series[name]["raw_timestamps"].append(raw_us / 1000.0)
                     series[name]["sessions"].append(session)
@@ -598,6 +637,8 @@ def read_monitor_csv(path):
                 series[name]["timestamps"].append(timestamp_ms)
                 series[name]["values"].append(value)
 
+    for data in series.values():
+        data["unmapped_sessions"] = tuple(sorted(data["unmapped_sessions"]))
     valid_series = {
         name: data
         for name, data in series.items()

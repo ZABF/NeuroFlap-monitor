@@ -176,6 +176,7 @@ class PlotWindow(QWidget):
         self._curve_expression_revision = 0
         self.active_data_source = ActiveDataSource.none()
         self.active_capture_metadata = {}
+        self.replay_unmapped_sample_count = 0
         self.available_raw_variables = set()
         self.derived_health = {}
         self._live_activation_requested = False
@@ -1477,7 +1478,13 @@ class PlotWindow(QWidget):
             document.clock_models,
             document.clock_observations,
         )
-        QMessageBox.information(self, "Import successful", f"CSV imported:\n{path}\nvariables: {len(series)}")
+        details = f"CSV imported:\n{path}\nvariables: {len(series)}"
+        if self.replay_unmapped_sample_count:
+            details += (
+                f"\n{self.replay_unmapped_sample_count} samples have no clock mapping."
+                "\nTheir raw data is retained; they are excluded from the aligned plot."
+            )
+        QMessageBox.information(self, "Import successful", details)
 
     def _set_active_data_source(self, source):
         self.active_data_source = source
@@ -1582,8 +1589,7 @@ class PlotWindow(QWidget):
             descriptors.append(desc)
         self.register_dataflow_export_descriptors(descriptors)
 
-        earliest_timestamp = None
-        latest_timestamp = None
+        self.replay_unmapped_sample_count = 0
         source_prefix = f"csv:{os.path.basename(path)}:"
         for var_name, data in series.items():
             timestamps = data["timestamps"]
@@ -1604,26 +1610,19 @@ class PlotWindow(QWidget):
                     values=data["values"],
                     clock_src=clock_source,
                     reconstructed_timestamps=timestamps,
+                    unmapped_sessions=data.get("unmapped_sessions", ()),
                 )
+                unmapped = set(data.get("unmapped_sessions", ()))
+                if unmapped:
+                    self.replay_unmapped_sample_count += sum(
+                        session in unmapped for session in sessions
+                    )
             else:
                 self.data_model.add_series(
                     var=var_name,
                     src=source_prefix + var_name,
                     timestamps=timestamps,
                     values=data["values"],
-                )
-            if timestamps:
-                series_start = min(timestamps)
-                series_end = max(timestamps)
-                earliest_timestamp = (
-                    series_start
-                    if earliest_timestamp is None
-                    else min(earliest_timestamp, series_start)
-                )
-                latest_timestamp = (
-                    series_end
-                    if latest_timestamp is None
-                    else max(latest_timestamp, series_end)
                 )
             desc = self.dynamic_signal_descriptors.get(var_name, {})
             if desc.get("descriptor_kind") == "task_latency" and data["values"]:
@@ -1636,6 +1635,17 @@ class PlotWindow(QWidget):
                 clock_observations,
             )
 
+        if self.replay_unmapped_sample_count:
+            self.active_source_label.setText(
+                f"{self.active_data_source.label} · "
+                f"{self.replay_unmapped_sample_count} samples unaligned"
+            )
+            self.active_source_label.setToolTip(
+                f"{path}\nSamples without a clock mapping are retained for export "
+                "and excluded from the aligned plot."
+            )
+
+        earliest_timestamp, latest_timestamp = self.data_model.get_time_bounds()
         if earliest_timestamp is not None and latest_timestamp is not None:
             self.reception_start_time = earliest_timestamp
             self.window_now = self.reception_start_time
@@ -1650,6 +1660,12 @@ class PlotWindow(QWidget):
                 latest_timestamp,
                 padding=0,
             )
+        else:
+            self.reception_start_time = 0.0
+            self.window_now = 0.0
+            self.window_start = 0.0
+            self.x_axis.set_start_time(0.0)
+            self.plot_widget.setXRange(0, self.fixed_window_seconds * 1000.0, padding=0)
 
         self.auto_scroll_enabled = False
         self.auto_y_enabled = True

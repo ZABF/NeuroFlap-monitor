@@ -1,6 +1,7 @@
 ﻿from array import array
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
+import math
 from typing import Dict, List, Optional, Tuple
 
 from clock_alignment import AlignmentMode
@@ -35,6 +36,9 @@ class SourceBucket:
     timestamp_revision: int = 0
     reconstruction_revision: int = 0
     session_spans: List[SessionSpan] = field(default_factory=list)
+    # Imported samples remain available through get_raw_series when no clock
+    # mapping exists. They cannot join an aligned timeline until one is supplied.
+    unmapped_sessions: frozenset = field(default_factory=frozenset)
 
 
 @dataclass
@@ -271,6 +275,7 @@ class DataModel:
         *,
         clock_src: str,
         reconstructed_timestamps=None,
+        unmapped_sessions=(),
     ) -> None:
         count = min(len(raw_timestamps), len(sessions), len(values))
         if count <= 0:
@@ -283,6 +288,7 @@ class DataModel:
             var_bucket = self.ensure_var(var, src)
 
         source_bucket.offset_src = str(clock_src or src)
+        source_bucket.unmapped_sessions = frozenset(unmapped_sessions)
         source_bucket.current_session = int(sessions[count - 1])
         source_bucket.last_src_timestamp = float(raw_timestamps[count - 1])
         clock_bucket = self.ensure_source(source_bucket.offset_src)
@@ -347,6 +353,8 @@ class DataModel:
                 transform.target_anchor_us / 1000.0,
                 1.0 + transform.drift_ppb * 1.0e-9,
             )
+        if int(session) in source_bucket.unmapped_sessions:
+            return 0.0, math.nan, 1.0
         return 0.0, self.offsets.get((offset_src, int(session)), 0.0), 1.0
 
     def _map_timestamp(
@@ -394,13 +402,14 @@ class DataModel:
         source_bucket.session_spans = spans
         return spans
 
-    def _aligned_insertion_index(
+    def _timestamp_insertion_index(
         self,
         source_bucket: SourceBucket,
         count: int,
         target_timestamp: float,
         *,
         right: bool,
+        align_history: bool,
     ) -> int:
         target = float(target_timestamp)
         for span in self._session_spans(source_bucket, count):
@@ -408,25 +417,29 @@ class DataModel:
             end = min(count, max(start, span.end))
             if start >= end:
                 continue
-            first = self._map_timestamp(
-                source_bucket,
-                span.session,
-                source_bucket.src_timestamp[start],
-            )
-            last = self._map_timestamp(
-                source_bucket,
-                span.session,
-                source_bucket.src_timestamp[end - 1],
-            )
+            if align_history:
+                first = self._map_timestamp(
+                    source_bucket, span.session, source_bucket.src_timestamp[start]
+                )
+                last = self._map_timestamp(
+                    source_bucket, span.session, source_bucket.src_timestamp[end - 1]
+                )
+            else:
+                first = source_bucket.recon_timestamp[start]
+                last = source_bucket.recon_timestamp[end - 1]
+            if not math.isfinite(first) or not math.isfinite(last):
+                continue
             if target < first or (not right and target == first):
                 return start
             if target <= last:
-                raw_target = self._unmap_timestamp(
-                    source_bucket, span.session, target
+                raw_target = (
+                    self._unmap_timestamp(source_bucket, span.session, target)
+                    if align_history else target
                 )
                 search = bisect_right if right else bisect_left
                 return search(
-                    source_bucket.src_timestamp,
+                    source_bucket.src_timestamp if align_history
+                    else source_bucket.recon_timestamp,
                     raw_target,
                     start,
                     end,
@@ -444,34 +457,56 @@ class DataModel:
         after_samples: int = 0,
         align_history: bool,
     ):
-        timestamps = (
-            source_bucket.src_timestamp
-            if align_history
-            else source_bucket.recon_timestamp
-        )
         if start_ms is None:
             start_idx = 0
-        elif align_history:
-            start_idx = self._aligned_insertion_index(
-                source_bucket, count, start_ms, right=False
-            )
         else:
-            start_idx = bisect_left(timestamps, float(start_ms), 0, count)
+            start_idx = self._timestamp_insertion_index(
+                source_bucket, count, start_ms, right=False,
+                align_history=align_history,
+            )
 
         if end_ms is None:
             end_idx = count
-        elif align_history:
-            end_idx = self._aligned_insertion_index(
-                source_bucket, count, end_ms, right=True
-            )
         else:
-            end_idx = bisect_right(
-                timestamps, float(end_ms), start_idx, count
+            end_idx = self._timestamp_insertion_index(
+                source_bucket, count, end_ms, right=True,
+                align_history=align_history,
             )
 
-        start_idx = max(0, start_idx - max(0, int(before_samples)))
-        end_idx = min(count, end_idx + max(0, int(after_samples)))
+        start_idx = self._shift_sample_index(
+            source_bucket, count, start_idx, -max(0, int(before_samples)),
+            align_history=align_history,
+        )
+        end_idx = self._shift_sample_index(
+            source_bucket, count, end_idx, max(0, int(after_samples)),
+            align_history=align_history,
+        )
         return start_idx, max(start_idx, end_idx)
+
+    def _shift_sample_index(
+        self, source_bucket, count, index, samples, *, align_history
+    ):
+        """Count plot samples across gaps without scanning all raw samples."""
+        if not samples or not source_bucket.unmapped_sessions:
+            return max(0, min(count, index + samples))
+        spans = self._session_spans(source_bucket, count)
+        remaining = abs(samples)
+        for span in (spans if samples > 0 else reversed(spans)):
+            start = max(index, span.start) if samples > 0 else span.start
+            end = min(count, span.end, index) if samples < 0 else min(count, span.end)
+            if start >= end:
+                continue
+            timestamp = (
+                self._map_timestamp(
+                    source_bucket, span.session, source_bucket.src_timestamp[start]
+                ) if align_history else source_bucket.recon_timestamp[start]
+            )
+            if not math.isfinite(timestamp):
+                continue
+            if remaining <= end - start:
+                return start + remaining if samples > 0 else end - remaining
+            remaining -= end - start
+        return count if samples > 0 else 0
 
     def _series_slice(
         self,
@@ -493,7 +528,11 @@ class DataModel:
             ]
         else:
             timestamps = source_bucket.recon_timestamp[start_idx:end_idx].tolist()
-        return timestamps, var_bucket.value[start_idx:end_idx].tolist()
+        values = var_bucket.value[start_idx:end_idx].tolist()
+        if source_bucket.unmapped_sessions:
+            samples = [(t, v) for t, v in zip(timestamps, values) if math.isfinite(t)]
+            return [t for t, _v in samples], [v for _t, v in samples]
+        return timestamps, values
 
     def get_raw_series(self, var: str):
         """Return immutable source-domain timestamps and their clock identity."""
@@ -530,6 +569,10 @@ class DataModel:
                 if align_history
                 else source_bucket.recon_timestamp[count - 1]
             )
+            if not math.isfinite(latest):
+                _first, latest = self.get_time_bounds([var], align_history=align_history)
+                if latest is None:
+                    return [], []
             start_idx, _end_idx = self._query_range(
                 source_bucket,
                 count,
@@ -618,14 +661,8 @@ class DataModel:
             return None, None
         var_bucket, source_bucket, count = storage
         target = float(timestamp_ms)
-        next_idx = (
-            self._aligned_insertion_index(
-                source_bucket, count, target, right=True
-            )
-            if align_history
-            else bisect_right(
-                source_bucket.recon_timestamp, target, 0, count
-            )
+        next_idx = self._timestamp_insertion_index(
+            source_bucket, count, target, right=True, align_history=align_history
         )
 
         def sample_at(index):
@@ -638,14 +675,26 @@ class DataModel:
                 if align_history
                 else float(source_bucket.recon_timestamp[index])
             )
-            return timestamp, float(var_bucket.value[index])
+            return (
+                (timestamp, float(var_bucket.value[index]))
+                if math.isfinite(timestamp) else None
+            )
 
         previous = None
         following = None
-        if next_idx > 0:
-            previous = sample_at(next_idx - 1)
-        if next_idx < count:
-            following = sample_at(next_idx)
+        spans = self._session_spans(source_bucket, count)
+        for span in reversed(spans):
+            index = min(count, next_idx, span.end) - 1
+            if index >= span.start:
+                previous = sample_at(index)
+                if previous is not None:
+                    break
+        for span in spans:
+            index = max(next_idx, span.start)
+            if index < min(count, span.end):
+                following = sample_at(index)
+                if following is not None:
+                    break
         return previous, following
 
     def get_series_window_ending_at(
@@ -668,7 +717,10 @@ class DataModel:
             end_ms,
             align_history=align_history,
         )
-        start_idx = max(0, end_idx - int(max_samples))
+        start_idx = self._shift_sample_index(
+            source_bucket, count, end_idx, -int(max_samples),
+            align_history=align_history,
+        )
         return self._series_slice(
             var_bucket,
             source_bucket,
@@ -698,22 +750,24 @@ class DataModel:
             if count <= 0:
                 continue
             seen_sources.add(var_bucket.src)
-            if align_history:
-                first = self._map_timestamp(
-                    source_bucket,
-                    int(source_bucket.session[0]),
-                    source_bucket.src_timestamp[0],
-                )
-                last = self._map_timestamp(
-                    source_bucket,
-                    int(source_bucket.session[count - 1]),
-                    source_bucket.src_timestamp[count - 1],
-                )
-            else:
-                first = float(source_bucket.recon_timestamp[0])
-                last = float(source_bucket.recon_timestamp[count - 1])
-            earliest = first if earliest is None else min(earliest, first)
-            latest = last if latest is None else max(latest, last)
+            for span in self._session_spans(source_bucket, count):
+                if span.start >= count:
+                    break
+                end = min(count, span.end) - 1
+                if align_history:
+                    first = self._map_timestamp(
+                        source_bucket, span.session, source_bucket.src_timestamp[span.start]
+                    )
+                    last = self._map_timestamp(
+                        source_bucket, span.session, source_bucket.src_timestamp[end]
+                    )
+                else:
+                    first = float(source_bucket.recon_timestamp[span.start])
+                    last = float(source_bucket.recon_timestamp[end])
+                if not math.isfinite(first) or not math.isfinite(last):
+                    continue
+                earliest = first if earliest is None else min(earliest, first)
+                latest = last if latest is None else max(latest, last)
         return earliest, latest
 
     def get_series_tail(
@@ -724,7 +778,10 @@ class DataModel:
         if storage is None or max_samples <= 0:
             return [], []
         var_bucket, source_bucket, count = storage
-        start_idx = max(0, count - int(max_samples))
+        start_idx = self._shift_sample_index(
+            source_bucket, count, count, -int(max_samples),
+            align_history=align_history,
+        )
         return self._series_slice(
             var_bucket,
             source_bucket,
@@ -761,6 +818,7 @@ class DataModel:
             del source_bucket.recon_timestamp[:]
             del source_bucket.session[:]
             source_bucket.session_spans.clear()
+            source_bucket.unmapped_sessions = frozenset()
             source_bucket.offset_src = None
             source_bucket.last_src_timestamp = None
             source_bucket.current_session = 1
