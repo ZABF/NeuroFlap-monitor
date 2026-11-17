@@ -1232,6 +1232,8 @@ class PlotWindow(QWidget):
                     "transport",
                     f"service thread: {'running' if transport.get('service_thread_alive') else 'stopped'}",
                     f"UDP socket: {'ready' if transport.get('socket_ready') else 'unavailable'}",
+                    f"service errors: {int(transport.get('service_error_count', 0))}",
+                    f"last service error: {transport.get('service_last_error', '') or '--'}",
                     f"local: {local_ip}:{local_port}",
                     f"target: {target_ip}:{target_port}",
                     "requests: "

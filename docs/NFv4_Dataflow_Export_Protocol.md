@@ -40,6 +40,35 @@ All integer fields are little-endian. The common header is `<HBB>` with magic
 NFv4 has no Ping/Pong, Echo, ClockSample, or ClockModel packet types. A valid matching
 SYNC_RESPONSE is the NFv4 liveness proof.
 
+### Monitor Connection Timing And Recovery
+
+Connection deadlines, reconnect backoff, schema retries, and liveness ages use
+`time.monotonic()`. They do not use the adjustable wall clock or the RAW alignment
+clock. Wall time remains available for Unix timestamps, and clock measurements
+retain their existing alignment timebase and wire format.
+
+A matching, unexpired SYNC_RESPONSE refreshes liveness even if the clock estimator
+rejects its measurement. DATA packets alone do not refresh the session: six seconds
+without a matching synchronization response still cause a link timeout. This remains
+an auxiliary-channel liveness requirement, not an estimator-lock requirement.
+
+The Monitor isolates diagnostic packet-processing exceptions, counts them, and logs
+at most one exception per second while continuing clock maintenance. A socket or
+maintenance failure terminates the affected diagnostic worker and closes its socket.
+The connection loop detects an unavailable NFv4 diagnostic service and schedules a
+reconnect using the normal backoff; a connection attempt recreates a dead worker
+before sending SESSION_OPEN. Persistent local failures remain visible and continue
+to use backoff rather than retrying in a tight loop.
+
+The existing clock-status tooltip exposes the worker/socket state, cumulative
+`service_error_count`, and `service_last_error`. These error details survive session
+reconnects for the lifetime of the DataReceiver. Successful reconnection is not proof
+that the original network or local processing fault can never recur.
+
+NFv3 diagnostic packets are ignored during an NFv4 session. NFv3 fallback still uses
+its original scheduler-clock echo timestamps and a separate scheduler-to-Unix anchor;
+these must not be converted with the NFv4 RAW-clock anchor.
+
 ## Session
 
 `SESSION_OPEN` is `<HBBIIHH>`: client nonce, requested features, maximum UDP payload,

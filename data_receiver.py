@@ -3,6 +3,7 @@ import threading
 import time
 import math
 import secrets
+import logging
 from collections import defaultdict, deque
 from dataclasses import replace
 import queue
@@ -118,6 +119,8 @@ class DataReceiver:
         host_anchor = capture_host_clocks_us()
         self._clock_wall_anchor_us = time.time_ns() // 1000
         self._clock_alignment_anchor_us = host_anchor.alignment_us
+        # NFv3 echo timestamps use the scheduler clock, not the NFv4 RAW clock.
+        self._clock_monotonic_anchor_us = host_anchor.monotonic_us
         self._clock_capture_epoch_offset_us = (
             self._clock_wall_anchor_us - self._clock_alignment_anchor_us
         )
@@ -176,6 +179,10 @@ class DataReceiver:
         self._nf_diag_socket = None
         self._nf_diag_socket_lock = threading.Lock()
         self._nf_diag_service_thread = None
+        self._nf_diag_service_lock = threading.Lock()
+        self._nf_diag_service_error_count = 0
+        self._nf_diag_service_last_error = ""
+        self._nf_diag_next_error_log_ms = 0.0
         self._nf_diag_udp_thread = None
         self._nf_diag_udp_stop = None
         self._nf_diag_tcp_thread = None
@@ -756,7 +763,7 @@ class DataReceiver:
         self.nf_schema_retry_active = False
         self.nf_next_schema_retry_ms = 0.0
 
-        now_ms = time.time() * 1000.0
+        now_ms = time.monotonic() * 1000.0
         self.nf_want_connected = True
         self.nf_reconnect_backoff_ms = float(self.NF_RECONNECT_MIN_MS)
         self.nf_next_reconnect_ms = 0.0
@@ -809,7 +816,7 @@ class DataReceiver:
         if self.nf_disconnect_burst_left > 0:
             self._send_disconnect_request()
             self.nf_disconnect_burst_left -= 1
-            self.nf_next_disconnect_burst_ms = time.time() * 1000.0 + self.NF_DISCONNECT_BURST_INTERVAL_MS
+            self.nf_next_disconnect_burst_ms = time.monotonic() * 1000.0 + self.NF_DISCONNECT_BURST_INTERVAL_MS
 
     def _start_connect_attempt_(self, now_ms):
         self.nf_connecting = True
@@ -825,6 +832,13 @@ class DataReceiver:
         self.nf_v4_open_attempts = 0
         self.nf_v4_fallback = False
         self.nf_v4_clock.stop_session()
+        if self.running and not self._start_nfv3_diag_service_():
+            self.nf_connecting = False
+            self._schedule_reconnect_(
+                now_ms, reason=self._nf_diag_service_last_error
+                or "diagnostic service unavailable",
+            )
+            return
         self._resolve_local_ip()
         self._send_connect_request()
 
@@ -971,6 +985,8 @@ class DataReceiver:
                     "aux_invalid_packets": self.nf_v4_aux_invalid_packets,
                     "aux_wrong_peer": self.nf_v4_aux_wrong_peer,
                     "aux_wrong_session": self.nf_v4_aux_wrong_session,
+                    "service_error_count": self._nf_diag_service_error_count,
+                    "service_last_error": self._nf_diag_service_last_error,
                 }
             )
         blocker = self._clock_alignment_blocker_(snapshot, transport)
@@ -1105,7 +1121,11 @@ class DataReceiver:
         snapshot = self.nf_clock_estimator.snapshot(
             stale_after_s=self.NF_CLOCK_MODEL_STALE_S
         )
-        wall_offset_us = self._clock_wall_anchor_us - self._clock_monotonic_anchor_us
+        wall_offset_us = (
+            self._clock_wall_anchor_us - self._clock_monotonic_anchor_us
+            if self.nf_protocol == self.nf_parser.VERSION
+            else self._clock_capture_epoch_offset_us
+        )
         if snapshot.updated_monotonic > 0.0:
             age_us = max(
                 0,
@@ -1157,7 +1177,7 @@ class DataReceiver:
         if not self.nf_schema_retry_active:
             return
 
-        now_ms = time.time() * 1000.0
+        now_ms = time.monotonic() * 1000.0
         if now_ms < self.nf_next_schema_retry_ms:
             return
 
@@ -1386,69 +1406,138 @@ class DataReceiver:
                 return 0
 
     def _start_nfv3_diag_service_(self):
-        if self._nf_diag_service_thread and self._nf_diag_service_thread.is_alive():
-            return
-        diag_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        diag_socket.bind((self.udp_ip, 0))
-        diag_socket.settimeout(0.05)
-        with self._nf_diag_socket_lock:
-            self._nf_diag_socket = diag_socket
-        self._nf_diag_service_thread = threading.Thread(
-            target=self._run_nfv3_diag_service_,
-            daemon=True,
-            name="NFv3 diagnostic service",
-        )
-        self._nf_diag_service_thread.start()
+        with self._nf_diag_service_lock:
+            thread = self._nf_diag_service_thread
+            if thread and thread.is_alive():
+                with self._nf_diag_socket_lock:
+                    return self._nf_diag_socket is not None
+            if not self.running:
+                return False
+            with self._nf_diag_socket_lock:
+                stale_socket = self._nf_diag_socket
+                self._nf_diag_socket = None
+            if stale_socket:
+                try:
+                    stale_socket.close()
+                except OSError:
+                    pass
+            diag_socket = None
+            try:
+                diag_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                diag_socket.bind((self.udp_ip, 0))
+                diag_socket.settimeout(0.05)
+                thread = threading.Thread(
+                    target=self._run_nfv3_diag_service_,
+                    args=(diag_socket,),
+                    daemon=True,
+                    name="NF diagnostic service",
+                )
+                with self._nf_diag_socket_lock:
+                    self._nf_diag_socket = diag_socket
+                self._nf_diag_service_thread = thread
+                thread.start()
+                return True
+            except (OSError, RuntimeError) as exc:
+                with self._nf_diag_socket_lock:
+                    self._nf_diag_socket = None
+                self._nf_diag_service_thread = None
+                if diag_socket:
+                    try:
+                        diag_socket.close()
+                    except OSError:
+                        pass
+                self._record_nfv3_diag_error_("diagnostic service start failed", exc)
+                self.nf_last_error = self._nf_diag_service_last_error
+                return False
 
     def _stop_nfv3_diag_service_(self):
-        with self._nf_diag_socket_lock:
-            diag_socket = self._nf_diag_socket
-            self._nf_diag_socket = None
-        if diag_socket:
+        with self._nf_diag_service_lock:
+            with self._nf_diag_socket_lock:
+                diag_socket = self._nf_diag_socket
+                self._nf_diag_socket = None
+            if diag_socket:
+                try:
+                    diag_socket.close()
+                except OSError:
+                    pass
+            thread = self._nf_diag_service_thread
+            if thread and thread.is_alive() and thread is not threading.current_thread():
+                thread.join(timeout=1.0)
+            # Keep a still-exiting thread visible so start cannot duplicate it.
+            if not thread or not thread.is_alive():
+                self._nf_diag_service_thread = None
+
+    def _record_nfv3_diag_error_(self, reason, exc):
+        now_ms = time.monotonic() * 1000.0
+        with self._nf_diag_lock:
+            self.nf_diag_receiver_errors += 1
+            self._nf_diag_service_error_count += 1
+            self._nf_diag_service_last_error = f"{reason}: {exc}"
+            report = now_ms >= self._nf_diag_next_error_log_ms
+            if report:
+                self._nf_diag_next_error_log_ms = now_ms + 1000.0
+        if report:
+            logging.getLogger(__name__).warning(
+                "%s: %s", reason, exc, exc_info=True
+            )
+
+    def _run_nfv3_diag_service_(self, diag_socket):
+        try:
+            while self.running:
+                with self._nf_diag_socket_lock:
+                    if self._nf_diag_socket is not diag_socket:
+                        return
+                try:
+                    data, remote_addr = diag_socket.recvfrom(2048)
+                except socket.timeout:
+                    pass
+                else:
+                    with self._nf_diag_socket_lock:
+                        if not self.running or self._nf_diag_socket is not diag_socket:
+                            return
+                    try:
+                        self._handle_nfv3_diag_datagram_(data, remote_addr)
+                    except Exception as exc:
+                        # Isolate one bad packet without dropping clock maintenance.
+                        self._record_nfv3_diag_error_(
+                            "diagnostic packet processing failed", exc
+                        )
+                if (
+                    self.nf_connected
+                    and self.nf_protocol == self.nf_v4_codec.VERSION
+                ):
+                    with self._nf_diag_lock:
+                        context = self._nf_v4_diag_context
+                        stage = self._nf_v4_diag_stage
+                    self.nf_v4_clock.tick(
+                        self._send_v4_sync_packet_,
+                        context=0,
+                    )
+                    if context != 0:
+                        self.nf_v4_clock.tick(
+                            self._send_v4_sync_packet_,
+                            context=context,
+                            stage=stage,
+                        )
+                    self._publish_nfv4_clock_transform_()
+                    self._tick_nfv4_diag_feedback_()
+                else:
+                    self._tick_nfv3_diag_feedback_()
+                    self._tick_nfv3_clock_model_()
+        except Exception as exc:
+            with self._nf_diag_socket_lock:
+                unexpected = self.running and self._nf_diag_socket is diag_socket
+            if unexpected:
+                self._record_nfv3_diag_error_("diagnostic service stopped", exc)
+                self.nf_last_error = self._nf_diag_service_last_error
+        finally:
+            with self._nf_diag_socket_lock:
+                if self._nf_diag_socket is diag_socket:
+                    self._nf_diag_socket = None
             try:
                 diag_socket.close()
             except OSError:
                 pass
-        thread = self._nf_diag_service_thread
-        self._nf_diag_service_thread = None
-        if thread and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=1.0)
-
-    def _run_nfv3_diag_service_(self):
-        while self.running:
-            with self._nf_diag_socket_lock:
-                diag_socket = self._nf_diag_socket
-            if diag_socket is None:
-                return
-            try:
-                data, remote_addr = diag_socket.recvfrom(2048)
-                self._handle_nfv3_diag_datagram_(data, remote_addr)
-            except socket.timeout:
-                pass
-            except OSError:
-                return
-            if (
-                self.nf_connected
-                and self.nf_protocol == self.nf_v4_codec.VERSION
-            ):
-                with self._nf_diag_lock:
-                    context = self._nf_v4_diag_context
-                    stage = self._nf_v4_diag_stage
-                self.nf_v4_clock.tick(
-                    self._send_v4_sync_packet_,
-                    context=0,
-                )
-                if context != 0:
-                    self.nf_v4_clock.tick(
-                        self._send_v4_sync_packet_,
-                        context=context,
-                        stage=stage,
-                    )
-                self._publish_nfv4_clock_transform_()
-                self._tick_nfv4_diag_feedback_()
-            else:
-                self._tick_nfv3_diag_feedback_()
-                self._tick_nfv3_clock_model_()
 
     def _send_connect_request(self):
         if not self.nf_v4_fallback:
@@ -1463,7 +1552,7 @@ class DataReceiver:
         else:
             packet = self.nf_parser.build_connect_request()
         if self._send_udp_packet(packet):
-            self.nf_last_connect_req_ms = time.time() * 1000.0
+            self.nf_last_connect_req_ms = time.monotonic() * 1000.0
             return True
         return False
 
@@ -1740,6 +1829,8 @@ class DataReceiver:
         }
         if packet_type not in diagnostic_types:
             return False
+        if self.nf_protocol != self.nf_parser.VERSION:
+            return True
         if not self._is_nfv3_diag_peer_(remote_addr):
             return True
 
@@ -1801,7 +1892,7 @@ class DataReceiver:
             )
             if matched:
                 self._sync_nfv4_clock_epoch_()
-                self.nf_last_pong_ms = time.time() * 1000.0
+                self.nf_last_pong_ms = time.monotonic() * 1000.0
                 measurement = self.nf_v4_clock.take_measurement()
                 if measurement and int(measurement["context"]) == 0:
                     self.clock_observations.add_neuroflap(
@@ -2321,7 +2412,28 @@ class DataReceiver:
         self._stop_nfv3_tcp_worker_()
 
     def _tick_nfv3_connection(self):
-        now_ms = time.time() * 1000.0
+        now_ms = time.monotonic() * 1000.0
+
+        if (
+            self.running
+            and self.nf_connected
+            and self.nf_protocol == self.nf_v4_codec.VERSION
+        ):
+            with self._nf_diag_socket_lock:
+                service_ready = self._nf_diag_socket is not None
+            thread = self._nf_diag_service_thread
+            if not service_ready or not thread or not thread.is_alive():
+                self.nf_connected = False
+                self.nf_connecting = False
+                self.nf_waiting_pong = False
+                self.nf_schema_retry_active = False
+                self.nf_next_schema_retry_ms = 0.0
+                self.nf_v4_clock.stop_session()
+                self._schedule_reconnect_(
+                    now_ms, reason=self._nf_diag_service_last_error
+                    or "diagnostic service stopped",
+                )
+                return
 
         if self.nf_disconnect_burst_left > 0 and now_ms >= self.nf_next_disconnect_burst_ms:
             self._send_disconnect_request()
@@ -2380,7 +2492,7 @@ class DataReceiver:
         if not self.nf_connected:
             return False
 
-        now_ms = time.time() * 1000.0
+        now_ms = time.monotonic() * 1000.0
         if not force and (now_ms - self.nf_last_schema_request_ms) < self.NF_SCHEMA_RETRY_MS:
             return False
 
@@ -2548,7 +2660,7 @@ class DataReceiver:
         self.nf_schema_chunk_entry_total = 0
         self.nf_schema_retry_active = False
         self.nf_next_schema_retry_ms = 0.0
-        self.nf_last_schema_sync_ok_ms = time.time() * 1000.0
+        self.nf_last_schema_sync_ok_ms = time.monotonic() * 1000.0
         if hasattr(self.main_window, "activate_live_dataflow_export_descriptors"):
             activated = self.main_window.activate_live_dataflow_export_descriptors(
                 ordered_descriptors,
@@ -2676,7 +2788,7 @@ class DataReceiver:
         if packet is None:
             return
 
-        now_ms = time.time() * 1000.0
+        now_ms = time.monotonic() * 1000.0
 
         if packet["type"] == "session_accept":
             if (
