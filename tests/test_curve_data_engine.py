@@ -1,6 +1,10 @@
 import unittest
+import math
+
+import numpy as np
 
 from ui.curve_data_engine import (
+    UnwrappedSeries,
     hampel_filter,
     min_max_downsample,
     moving_average,
@@ -9,6 +13,43 @@ from ui.curve_data_engine import (
 
 
 class CurveDataEngineTest(unittest.TestCase):
+    def test_unwrap_crosses_angle_boundaries_in_both_directions(self):
+        for wrapped, expected in (
+            ([170, 179, -179, -170], [170, 179, 181, 190]),
+            ([-170, -179, 179, 170], [-170, -179, -181, -190]),
+            ([350, 359, 1, 10], [350, 359, 361, 370]),
+            ([0, 180, 0, -180], [0, 180, 0, -180]),
+        ):
+            with self.subTest(wrapped=wrapped):
+                series = UnwrappedSeries()
+                series.extend(range(len(wrapped)), wrapped)
+                self.assertEqual(series.between(), ([float(i) for i in range(len(wrapped))], expected))
+
+    def test_incremental_unwrap_matches_numpy_over_many_turns(self):
+        continuous = np.linspace(-5.0, 35.0, 2000) + 0.25 * np.sin(np.linspace(0.0, 70.0, 2000))
+        wrapped = (continuous + math.pi) % (2.0 * math.pi) - math.pi
+        series = UnwrappedSeries(2.0 * math.pi)
+        for start in range(0, len(wrapped), 17):
+            series.extend(range(start, min(start + 17, len(wrapped))), wrapped[start:start + 17])
+        np.testing.assert_allclose(series.values, np.unwrap(wrapped), atol=1.0e-12)
+        ts, vs = series.between(1200, 1205, context=0)
+        self.assertEqual(ts, [1200, 1201, 1202, 1203, 1204, 1205])
+        np.testing.assert_allclose(vs, np.unwrap(wrapped)[1200:1206], atol=1.0e-12)
+
+    def test_unwrap_resets_at_invalid_samples_new_sessions_and_time_rollback(self):
+        series = UnwrappedSeries()
+        series.extend([0, 1, 2, 3, 4, 5, 6, 0, 1], [170, -170, math.nan, -160, 170, -170, -160, 170, -170], [1, 1, 1, 1, 2, 2, 2, 3, 3])
+        self.assertEqual(series.between()[1], [170, 190, -160, 170, 190, 200, 170, 190])
+        ts, values = series.between(4, 6, context=0)
+        self.assertEqual(ts, [4, 5, 6])
+        self.assertEqual(values, [170, 190, 200])
+
+    def test_unwrap_rejects_invalid_periods(self):
+        for period in (0, -360, math.inf, math.nan):
+            with self.subTest(period=period):
+                with self.assertRaises(ValueError):
+                    UnwrappedSeries(period)
+
     def test_small_series_is_not_changed(self):
         timestamps = [0.0, 1.0, 2.0]
         values = [3.0, 4.0, 5.0]

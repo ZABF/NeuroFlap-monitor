@@ -165,6 +165,7 @@ def expression_validation_errors(node):
         "hampel": (3,),
         "sg": (4,),
         "sign": (1,),
+        "unwrap": (1, 2),
         "clip": (2, 3),
         "joint_tau": (7,),
     }

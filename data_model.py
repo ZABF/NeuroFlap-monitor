@@ -547,6 +547,27 @@ class DataModel:
             source_bucket.offset_src or source_bucket.src,
         )
 
+    def get_series_chunk(self, var: str, start_index=0, *, align_history=True):
+        """Read an append batch with session IDs and the next source index.
+
+        Stateful display operations can consume only new samples. Unlike plot
+        slices, this includes unmapped/invalid timestamps so consumers can reset
+        at those boundaries. A clear or alignment revision invalidates cursors;
+        callers must track get_series_revision alongside the index.
+        """
+        storage = self._series_storage(var)
+        if storage is None:
+            return [], [], [], 0
+        var_bucket, source_bucket, count = storage
+        start = max(0, min(int(start_index), count))
+        sessions = source_bucket.session[start:count].tolist()
+        timestamps = (
+            [self._map_timestamp(source_bucket, session, source_bucket.src_timestamp[index])
+             for index, session in enumerate(sessions, start)]
+            if align_history else source_bucket.recon_timestamp[start:count].tolist()
+        )
+        return timestamps, var_bucket.value[start:count].tolist(), sessions, count
+
     def get_series(
         self,
         var: str,

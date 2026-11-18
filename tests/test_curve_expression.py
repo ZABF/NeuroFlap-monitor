@@ -39,6 +39,17 @@ class CurveExpressionClipTest(unittest.TestCase):
                 ast = CurveExpressionParser(expression).parse()
                 self.assertEqual(expression_validation_errors(ast), [])
 
+    def test_validation_accepts_unwrap_with_optional_period(self):
+        for expression in ("unwrap([yaw])", "unwrap([yaw], 360)", "unwrap([yaw_rad], 6.283185307179586)"):
+            with self.subTest(expression=expression):
+                self.assertEqual(expression_validation_errors(CurveExpressionParser(expression).parse()), [])
+        for expression in ("unwrap()", "unwrap([yaw], 360, 180)"):
+            with self.subTest(expression=expression):
+                self.assertEqual(
+                    expression_validation_errors(CurveExpressionParser(expression).parse()),
+                    ["unwrap() expects 1 or 2 arguments"],
+                )
+
     def test_validation_rejects_wrong_filter_arity(self):
         cases = (
             ("moving_average([AttRoll])", "moving_average() expects 2 arguments"),
